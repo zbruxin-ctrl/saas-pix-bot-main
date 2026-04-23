@@ -1,38 +1,25 @@
-// CRUD de produtos no painel admin
-import { Router, Request, Response } from 'express';
+import { Router, Response } from 'express';
 import { z } from 'zod';
-import { requireRole } from '../../middleware/auth';
-import { AuthenticatedRequest } from '../../middleware/auth';
-import { PrismaClient, Prisma } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import { prisma } from '@prisma/client';
+import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
 
 export const adminProductsRouter = Router();
-import { PrismaClient, Prisma } from '@prisma/client';
-import { requireRole } from '../../middleware/auth';
-import { AuthenticatedRequest } from '../../middleware/auth';
-
-export const adminProductsRouter = Router();
-const prisma = new PrismaClient();
 
 const productSchema = z.object({
-  name: z.string().min(2, 'Nome deve ter pelo menos 2 caracteres').max(100),
+  name: z.string().min(2).max(100),
   description: z.string().min(5).max(500),
-  price: z.number().positive('Preço deve ser positivo').max(99999),
+  price: z.number().positive().max(99999),
   deliveryType: z.enum(['TEXT', 'LINK', 'TOKEN', 'ACCOUNT']),
-  deliveryContent: z.string().min(1, 'Conteúdo de entrega é obrigatório'),
+  deliveryContent: z.string().min(1),
   isActive: z.boolean().default(true),
   stock: z.number().int().positive().nullable().optional(),
   metadata: z.record(z.unknown()).nullable().optional(),
 });
 
-// GET /api/admin/products
-adminProductsRouter.get('/', async (_req: Request, res: Response) => {
+// GET
+adminProductsRouter.get('/', async (_req, res: Response) => {
   const products = await prisma.product.findMany({
     orderBy: { createdAt: 'desc' },
-    include: {
-      _count: { select: { payments: true, orders: true } },
-    },
   });
 
   res.json({
@@ -44,7 +31,7 @@ adminProductsRouter.get('/', async (_req: Request, res: Response) => {
   });
 });
 
-// POST /api/admin/products - Requer ADMIN ou superior
+// POST
 adminProductsRouter.post(
   '/',
   requireRole('ADMIN', 'SUPER_ADMIN'),
@@ -54,17 +41,9 @@ adminProductsRouter.post(
     const product = await prisma.product.create({
       data: {
         ...data,
-        metadata:
-          data.metadata === undefined
-            ? undefined
-            : (data.metadata ?? Prisma.JsonNull) as Prisma.InputJsonValue,
+        metadata: data.metadata ?? undefined,
       },
     });
-  data: {
-    ...data,
-    metadata: data.metadata ?? Prisma.JsonNull,
-  },
-});
 
     res.status(201).json({
       success: true,
@@ -73,7 +52,7 @@ adminProductsRouter.post(
   }
 );
 
-// PUT /api/admin/products/:id
+// PUT
 adminProductsRouter.put(
   '/:id',
   requireRole('ADMIN', 'SUPER_ADMIN'),
@@ -83,17 +62,8 @@ adminProductsRouter.put(
     const product = await prisma.product.update({
       where: { id: req.params.id },
       data: {
-  	...data,
-  	metadata:
-    	  data.metadata === undefined
-      	    ? undefined
-      	    : (data.metadata ?? Prisma.JsonNull) as unknown as Prisma.InputJsonValue,
-	},
         ...data,
-        metadata:
-          data.metadata === undefined
-            ? undefined
-            : data.metadata ?? Prisma.JsonNull,
+        metadata: data.metadata ?? undefined,
       },
     });
 
@@ -104,17 +74,16 @@ adminProductsRouter.put(
   }
 );
 
-// DELETE /api/admin/products/:id - Apenas SUPER_ADMIN
+// DELETE
 adminProductsRouter.delete(
   '/:id',
   requireRole('SUPER_ADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    // Soft delete: desativa em vez de apagar
     await prisma.product.update({
       where: { id: req.params.id },
       data: { isActive: false },
     });
 
-    res.json({ success: true, message: 'Produto desativado' });
+    res.json({ success: true });
   }
 );
