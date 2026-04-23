@@ -1,0 +1,198 @@
+// Schema principal do banco de dados
+// Todos os modelos do sistema SaaS PIX Bot
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Usuário Admin do Painel ───────────────────────────────────────────────
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         AdminRole @default(OPERATOR)
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("admin_users")
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  ADMIN
+  OPERATOR
+}
+
+// ─── Usuário do Telegram ───────────────────────────────────────────────────
+
+model TelegramUser {
+  id           String    @id @default(cuid())
+  telegramId   String    @unique
+  username     String?
+  firstName    String?
+  lastName     String?
+  languageCode String?
+  isBlocked    Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  payments     Payment[]
+  orders       Order[]
+
+  @@map("telegram_users")
+}
+
+// ─── Produto / Plano ───────────────────────────────────────────────────────
+
+model Product {
+  id              String        @id @default(cuid())
+  name            String
+  description     String
+  price           Decimal       @db.Decimal(10, 2)
+  deliveryType    DeliveryType
+  deliveryContent String        // texto, link, token ou JSON para múltiplos
+  isActive        Boolean       @default(true)
+  stock           Int?          // null = ilimitado
+  metadata        Json?         // dados extras (ex: dias de acesso)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  payments        Payment[]
+  orders          Order[]
+
+  @@map("products")
+}
+
+enum DeliveryType {
+  TEXT
+  LINK
+  TOKEN
+  ACCOUNT
+}
+
+// ─── Pagamento PIX ────────────────────────────────────────────────────────
+
+model Payment {
+  id                   String        @id @default(cuid())
+  telegramUserId       String
+  productId            String
+  mercadoPagoId        String?       @unique
+  amount               Decimal       @db.Decimal(10, 2)
+  status               PaymentStatus @default(PENDING)
+  pixQrCode            String?       @db.Text // base64
+  pixQrCodeText        String?       @db.Text // copia e cola
+  pixExpiresAt         DateTime?
+  approvedAt           DateTime?
+  metadata             Json?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  telegramUser         TelegramUser  @relation(fields: [telegramUserId], references: [id])
+  product              Product       @relation(fields: [productId], references: [id])
+  order                Order?
+  webhookEvents        WebhookEvent[]
+
+  @@index([telegramUserId])
+  @@index([status])
+  @@index([mercadoPagoId])
+  @@map("payments")
+}
+
+enum PaymentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+// ─── Pedido (gerado após pagamento aprovado) ───────────────────────────────
+
+model Order {
+  id             String      @id @default(cuid())
+  paymentId      String      @unique
+  telegramUserId String
+  productId      String
+  status         OrderStatus @default(PROCESSING)
+  deliveredAt    DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  payment        Payment      @relation(fields: [paymentId], references: [id])
+  telegramUser   TelegramUser @relation(fields: [telegramUserId], references: [id])
+  product        Product      @relation(fields: [productId], references: [id])
+  deliveryLogs   DeliveryLog[]
+
+  @@index([telegramUserId])
+  @@map("orders")
+}
+
+enum OrderStatus {
+  PROCESSING
+  DELIVERED
+  FAILED
+}
+
+// ─── Log de Entrega ────────────────────────────────────────────────────────
+
+model DeliveryLog {
+  id        String            @id @default(cuid())
+  orderId   String
+  attempt   Int               @default(1)
+  status    DeliveryLogStatus
+  message   String?           @db.Text
+  error     String?           @db.Text
+  metadata  Json?
+  createdAt DateTime          @default(now())
+
+  order     Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("delivery_logs")
+}
+
+enum DeliveryLogStatus {
+  SUCCESS
+  FAILED
+  RETRYING
+}
+
+// ─── Evento de Webhook ────────────────────────────────────────────────────
+
+model WebhookEvent {
+  id              String              @id @default(cuid())
+  provider        String              @default("mercado_pago")
+  eventType       String
+  externalId      String              // ID do pagamento no MP
+  paymentId       String?
+  rawPayload      Json
+  status          WebhookEventStatus  @default(RECEIVED)
+  processedAt     DateTime?
+  error           String?             @db.Text
+  createdAt       DateTime            @default(now())
+
+  payment         Payment?  @relation(fields: [paymentId], references: [id])
+
+  // Previne processamento duplicado
+  @@unique([provider, externalId, eventType])
+  @@index([externalId])
+  @@map("webhook_events")
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}

@@ -1,0 +1,37 @@
+version: '3.8'
+
+# Docker Compose para desenvolvimento local
+# Sobe apenas o PostgreSQL e Redis
+# A API, Bot e Web rodam direto na sua máquina com npm run dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: saas_pix_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: suasenha
+      POSTGRES_DB: saas_pix_bot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: saas_pix_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
