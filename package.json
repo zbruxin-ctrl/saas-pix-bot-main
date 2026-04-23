@@ -34,8 +34,7 @@
   "node": ">=18.0.0"x
   },   
   "dependencies": {
-    "@prisma/client": "^5.8.0",
-    "@saas-pix/shared": "git+https://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@github.com/saas-pix/shared.git"
+    "@prisma/client": "^5.8.0"
 }   
   }
 }
