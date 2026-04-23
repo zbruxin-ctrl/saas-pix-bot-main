@@ -2,7 +2,7 @@
 // Recebe notificações de pagamentos aprovados/rejeitados
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
-import { prisma } from '../lib/prisma';
+import { Prisma } from '@prisma/client';
 import { paymentService } from '../services/paymentService';
 import { mercadoPagoService } from '../services/mercadoPagoService';
 import { webhookRateLimit } from '../middleware/rateLimit';
