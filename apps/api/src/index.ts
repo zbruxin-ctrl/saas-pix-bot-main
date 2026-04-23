@@ -13,11 +13,16 @@ import { errorHandler } from './middleware/errorHandler';
 import { authRouter } from './routes/auth';
 import { paymentsRouter } from './routes/payments';
 import { webhooksRouter } from './routes/webhooks';
+<<<<<<< HEAD
 import adminRouter from './routes/admin';
+=======
+import { adminRouter } from './routes/admin';
+>>>>>>> a4ba2a08fda8eebc6f3ab2989f5f9326189aee05
 
 const app = express();
 
 // ─── Segurança ─────────────────────────────────────────────────────────────
+<<<<<<< HEAD
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -37,10 +42,27 @@ app.use(
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
   })
 );
+=======
+app.use(helmet({
+  contentSecurityPolicy: false, // Desabilitado para uso com painel admin
+}));
+
+// Em desenvolvimento permite sempre localhost:3000; em produção só as URLs configuradas
+const allowedOrigins = env.NODE_ENV === 'development'
+  ? ['http://localhost:3000', env.ADMIN_URL]
+  : [env.ADMIN_URL, env.BOT_WEBHOOK_URL].filter(Boolean) as string[];
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
+}));
+>>>>>>> a4ba2a08fda8eebc6f3ab2989f5f9326189aee05
 
 // ─── Middlewares gerais ────────────────────────────────────────────────────
 app.use(compression());
 app.use(cookieParser(env.COOKIE_SECRET));
+<<<<<<< HEAD
 app.use(
   morgan('combined', {
     stream: { write: (message) => logger.info(message.trim()) },
@@ -48,6 +70,13 @@ app.use(
 );
 
 // Body parser (webhooks precisam raw)
+=======
+app.use(morgan('combined', {
+  stream: { write: (message) => logger.info(message.trim()) },
+}));
+
+// Body parser com limite para webhooks (precisam de raw body)
+>>>>>>> a4ba2a08fda8eebc6f3ab2989f5f9326189aee05
 app.use('/api/webhooks', express.raw({ type: 'application/json', limit: '1mb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));

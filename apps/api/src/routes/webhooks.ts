@@ -2,14 +2,21 @@
 // Recebe notificações de pagamentos aprovados/rejeitados
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
+<<<<<<< HEAD
+=======
+import { Prisma } from '@prisma/client';
+>>>>>>> a4ba2a08fda8eebc6f3ab2989f5f9326189aee05
 import { paymentService } from '../services/paymentService';
 import { mercadoPagoService } from '../services/mercadoPagoService';
 import { webhookRateLimit } from '../middleware/rateLimit';
 import { logger } from '../lib/logger';
 import { env } from '../config/env';
+<<<<<<< HEAD
 import { PrismaClient, Prisma } from '@prisma/client';
 
 const prisma = new PrismaClient();
+=======
+>>>>>>> a4ba2a08fda8eebc6f3ab2989f5f9326189aee05
 
 export const webhooksRouter = Router();
 
@@ -112,7 +119,11 @@ async function processWebhookAsync(
       provider: 'mercado_pago',
       eventType,
       externalId,
+<<<<<<< HEAD
       rawPayload: rawPayload as unknown as Prisma.InputJsonValue,
+=======
+      rawPayload,
+>>>>>>> a4ba2a08fda8eebc6f3ab2989f5f9326189aee05
       status: 'PROCESSING',
     },
   });
