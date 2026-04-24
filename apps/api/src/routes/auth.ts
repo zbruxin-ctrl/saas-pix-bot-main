@@ -58,10 +58,9 @@ authRouter.post('/login', loginRateLimit, async (req: Request, res: Response) =>
   // Cookie httpOnly com JWT real (protegido contra XSS)
   // Em desenvolvimento usa 'lax' para funcionar entre portas diferentes (3000 -> 3001)
   res.cookie('auth_token', token, {
-  httpOnly: true,
-  secure: true,
-  sameSite: 'none' as const,
-  ...
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none' as const,
     maxAge: 7 * 24 * 60 * 60 * 1000,
     signed: true,
   });
