@@ -60,7 +60,7 @@ authRouter.post('/login', loginRateLimit, async (req: Request, res: Response) =>
   res.cookie('auth_token', token, {
   httpOnly: true,
   secure: true,
-  sameSite: 'none' as const,,
+  sameSite: 'none' as const,
   ...
     maxAge: 7 * 24 * 60 * 60 * 1000,
     signed: true,
@@ -70,7 +70,7 @@ authRouter.post('/login', loginRateLimit, async (req: Request, res: Response) =>
   res.cookie('auth_presence', '1', {
     httpOnly: false,
     secure: true,
-    sameSite: 'none' as const,,
+    sameSite: 'none' as const,
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 
