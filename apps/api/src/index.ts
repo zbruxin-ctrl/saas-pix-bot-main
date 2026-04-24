@@ -17,6 +17,7 @@ import adminRouter from './routes/admin';
 
 const app = express();
 
+app.set('trust proxy', 1);
 // ─── Segurança ─────────────────────────────────────────────────────────────
 app.use(
   helmet({
