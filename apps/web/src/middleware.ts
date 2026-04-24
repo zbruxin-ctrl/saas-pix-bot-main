@@ -10,7 +10,7 @@ export function middleware(request: NextRequest) {
   // Cookie definido pela API no login (httpOnly, então não acessível aqui)
   // Usamos um cookie de "presença" não-httpOnly apenas para sinalizar ao middleware
   // O cookie real auth_token é validado pelo backend
-  const hasSession = true;
+  const hasSession = request.cookies.has('auth_presence');
 
   if (isAdminRoute && !hasSession) {
     const loginUrl = new URL('/login', request.url);
