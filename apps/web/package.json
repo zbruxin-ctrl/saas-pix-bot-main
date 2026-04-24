@@ -21,7 +21,6 @@
     "recharts": "^2.10.4"
   },
   "devDependencies": {
-    "@next/swc-win32-x64-msvc": "^14.2.33",
     "@types/js-cookie": "^3.0.6",
     "@types/node": "^20.11.5",
     "@types/react": "^18.2.48",
