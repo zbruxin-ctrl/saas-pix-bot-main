@@ -1,5 +1,6 @@
 import { Router, Response } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
 
@@ -41,7 +42,7 @@ adminProductsRouter.post(
     const product = await prisma.product.create({
       data: {
         ...data,
-        metadata: data.metadata ?? undefined,
+        metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined,
       },
     });
 
@@ -63,7 +64,7 @@ adminProductsRouter.put(
       where: { id: req.params.id },
       data: {
         ...data,
-        metadata: data.metadata ?? undefined,
+        metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined,
       },
     });
 
