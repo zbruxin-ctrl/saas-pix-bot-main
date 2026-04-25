@@ -28,64 +28,61 @@ export default api;
 
 export async function login(email: string, password: string) {
   const res = await axios.post('/api/auth/login', { email, password }, { withCredentials: true });
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
 export async function getDashboard() {
   const res = await api.get('/admin/dashboard');
-  return res.data;
+  // A API envolve em { success: true, data: {...} }
+  return res.data?.data ?? res.data;
 }
 
 // ─── Products ────────────────────────────────────────────────────────────────
 
 export async function getProducts() {
   const res = await api.get('/admin/products');
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 export async function createProduct(data: Record<string, unknown>) {
   const res = await api.post('/admin/products', data);
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 export async function updateProduct(id: string, data: Record<string, unknown>) {
   const res = await api.put(`/admin/products/${id}`, data);
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 export async function deleteProduct(id: string) {
   const res = await api.delete(`/admin/products/${id}`);
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 // ─── Payments ────────────────────────────────────────────────────────────────
 
-export async function getPayments(
-  params?: Record<string, string | number | undefined>
-) {
+export async function getPayments(params?: Record<string, string | number>) {
   const res = await api.get('/admin/payments', { params });
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 export async function getPayment(id: string) {
   const res = await api.get(`/admin/payments/${id}`);
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 // ─── Users ───────────────────────────────────────────────────────────────────
 
-export async function getUsers(
-  params?: Record<string, string | number | undefined>
-) {
+export async function getUsers(params?: Record<string, string | number>) {
   const res = await api.get('/admin/users', { params });
-  return res.data;
+  return res.data?.data ?? res.data;
 }
 
 // ─── Me (perfil do admin logado) ─────────────────────────────────────────────
 
 export async function getMe() {
   const res = await api.get('/admin/me');
-  return res.data;
+  return res.data?.data ?? res.data;
 }
