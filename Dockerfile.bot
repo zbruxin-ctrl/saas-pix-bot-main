@@ -1,0 +1,14 @@
+FROM node:20-alpine
+RUN apk add --no-cache openssl1.1-compat
+WORKDIR /app
+COPY package*.json ./
+COPY packages/shared/package*.json ./packages/shared/
+COPY apps/bot/package*.json ./apps/bot/
+RUN npm install
+COPY packages/shared ./packages/shared
+COPY apps/bot ./apps/bot
+COPY tsconfig.json ./
+RUN npm run build -w packages/shared
+RUN npm run build -w apps/bot
+EXPOSE 8080
+CMD ["node", "apps/bot/dist/index.js"]z
