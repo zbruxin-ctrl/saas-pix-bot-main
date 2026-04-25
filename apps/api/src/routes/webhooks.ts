@@ -178,7 +178,17 @@ function validateWebhookSignature(req: Request, body: string): boolean {
     const ts = tsPart.split('=')[1];
     const signature = v1Part.split('=')[1];
 
-    const dataId = (req.query['data.id'] as string) || (req.query.id as string) || '';
+    // Pega o ID do query param OU do body (MP pode mandar nos dois)
+    let dataId = req.query['data.id'] as string || req.query['id'] as string;
+    if (!dataId) {
+      try {
+        const parsed = JSON.parse(body);
+        dataId = parsed?.data?.id || '';
+      } catch {
+        dataId = '';
+      }
+    }
+
     const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
 
     const expectedSignature = crypto
