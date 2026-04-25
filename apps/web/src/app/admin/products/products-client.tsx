@@ -374,11 +374,21 @@ export default function ProductsClient() {
       }
 
       if (savedId) {
-        const validMedias = medias.filter((m) => m.url.trim());
-        await updateProductMedias(savedId, validMedias).catch(() =>
-          toast('Produto salvo, mas erro ao salvar mídias extras.', 'error')
-        );
-      }
+  const validMedias = medias.filter((m) => m.url.trim());
+
+  await updateProductMedias(savedId, validMedias, {
+    name: payload.name,
+    description: payload.description,
+    price: Number(payload.price),
+    deliveryType: payload.deliveryType,
+    deliveryContent: payload.deliveryContent,
+    isActive: payload.isActive,
+    stock: payload.stock,
+    metadata: {},
+  }).catch(() =>
+    toast('Produto salvo, mas erro ao salvar mídias extras.', 'error')
+  );
+}
 
       setShowModal(false);
       loadProducts();
