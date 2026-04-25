@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireAuth } from '../../middleware/auth';
-import { adminProductsRouter } from './products';
+import { adminProductsRouter } from './adminProducts';
 import { adminDashboardRouter } from './dashboard';
 import { adminPaymentsRouter } from './payments';
 import { adminUsersRouter } from './users';
