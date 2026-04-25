@@ -1,16 +1,17 @@
 FROM node:20-alpine
 RUN apk add --no-cache openssl
 WORKDIR /app
-COPY package*.json ./
-COPY packages/*/package*.json ./packages/
-COPY apps/*/package*.json ./apps/
+
+# 1. Copia TUDO de uma vez
+COPY . .
+
+# 2. Instala tudo (cria os symlinks de workspace corretamente)
 RUN npm install
-COPY packages ./packages
-COPY apps ./apps
-COPY prisma ./prisma
-COPY tsconfig.json ./
-RUN npx prisma generate --schema=./prisma/schema.prisma
+
+# 3. Build na ordem certa
 RUN npm run build -w packages/shared
+RUN npx prisma generate --schema=./prisma/schema.prisma
 RUN npm run build -w apps/api
+
 EXPOSE 3001
 CMD ["node", "apps/api/dist/index.js"]
