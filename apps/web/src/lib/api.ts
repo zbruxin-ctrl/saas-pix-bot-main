@@ -122,16 +122,21 @@ export async function updateProductMedias(id: string, medias: ProductMedia[]) {
 }
 
 // ─── Upload local → base64 data URL ──────────────────────────────────────────
-export async function uploadMediaFile(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const MAX_MB = 10;
-    if (file.size > MAX_MB * 1024 * 1024) {
-      reject(new Error(`Arquivo muito grande. Máximo: ${MAX_MB}MB`));
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error('Erro ao ler o arquivo'));
-    reader.readAsDataURL(file);
+export async function uploadMediaFile(file: File, mediaType: 'IMAGE' | 'VIDEO' | 'FILE'): Promise<string> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('mediaType', mediaType);
+
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    body: form,
   });
+
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error(data?.error || 'Erro ao fazer upload do arquivo');
+  }
+
+  return data.url as string;
 }
