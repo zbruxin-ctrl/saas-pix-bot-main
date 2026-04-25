@@ -139,11 +139,25 @@ export async function uploadMediaFile(
     body: form,
   });
 
-  const data = await res.json();
+  const rawText = await res.text();
+
+  let data: any = null;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    throw new Error(rawText || 'Resposta inválida do servidor de upload');
+  }
 
   if (!res.ok) {
     throw new Error(data?.error || 'Erro ao fazer upload do arquivo');
   }
+
+  if (!data?.url) {
+    throw new Error('Upload concluído sem URL retornada');
+  }
+
+  return data.url as string;
+}
 
   return data.url as string;
 }
