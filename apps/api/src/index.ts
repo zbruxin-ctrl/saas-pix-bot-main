@@ -42,7 +42,7 @@ function isOriginAllowed(origin: string | undefined): boolean {
 app.use(cors({
   origin: (origin, callback) => {
     if (isOriginAllowed(origin)) {
-      callback(null, origin); // reflete a origin exata (obrigatório com credentials)
+      callback(null, origin ?? '*'); // reflete a origin exata (obrigatório com credentials)
     } else {
       callback(new Error(`CORS: origem não permitida: ${origin}`));
     }
