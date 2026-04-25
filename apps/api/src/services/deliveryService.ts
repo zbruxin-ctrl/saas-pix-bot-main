@@ -88,6 +88,9 @@ class DeliveryService {
         throw new Error(`Tipo de entrega desconhecido: ${product.deliveryType}`);
     }
 
+    // Envia mídias extras configuradas no produto (imagens/vídeos do painel admin)
+    await this.sendProductMedias(telegramId, product);
+
     // Envia mídias extras anexadas ao pedido (se existirem)
     await this.sendOrderMedias(telegramId, orderId);
   }
@@ -107,23 +110,19 @@ class DeliveryService {
   }
 
   private async deliverFileMedia(telegramId: string, url: string, productName: string): Promise<void> {
-    // Envia mensagem de confirmação primeiro
     const message =
       `🎉 *Pagamento confirmado!*\n\n` +
       `📦 *Produto:* ${productName}\n\n` +
       `📎 Seu conteúdo está disponível abaixo:`;
     await telegramService.sendMessage(telegramId, message);
 
-    // Detecta se é vídeo ou imagem pela extensão da URL
     const isVideo = /\.(mp4|mov|avi|mkv|webm)(\?|$)/i.test(url) ||
                     url.includes('youtube.com') ||
                     url.includes('youtu.be');
 
     if (isVideo) {
-      // Envia como vídeo (Telegram faz player embutido para links diretos de MP4)
       await telegramService.sendVideo(telegramId, url);
     } else {
-      // Envia como foto/documento
       await telegramService.sendPhoto(telegramId, url);
     }
   }
@@ -147,6 +146,35 @@ class DeliveryService {
     await telegramService.sendMessage(telegramId, message);
   }
 
+  // Envia mídias extras configuradas no produto via painel admin (salvas em product.metadata)
+  private async sendProductMedias(telegramId: string, product: Product): Promise<void> {
+    const meta = product.metadata as Record<string, unknown> | null;
+    if (!meta?.medias || !Array.isArray(meta.medias)) return;
+
+    const medias = meta.medias as Array<{
+      url: string;
+      mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
+      caption?: string;
+    }>;
+
+    for (const media of medias) {
+      try {
+        if (media.mediaType === 'VIDEO') {
+          await telegramService.sendVideo(telegramId, media.url, media.caption);
+        } else if (media.mediaType === 'IMAGE') {
+          await telegramService.sendPhoto(telegramId, media.url, media.caption);
+        } else {
+          const msg = media.caption
+            ? `📎 ${media.caption}\n${media.url}`
+            : `📎 Arquivo: ${media.url}`;
+          await telegramService.sendMessage(telegramId, msg);
+        }
+      } catch (err) {
+        logger.error(`Erro ao enviar mídia extra do produto ${product.id}:`, err);
+      }
+    }
+  }
+
   // Envia mídias extras anexadas ao pedido no painel admin
   private async sendOrderMedias(telegramId: string, orderId: string): Promise<void> {
     const medias = await prisma.deliveryMedia.findMany({
@@ -161,7 +189,6 @@ class DeliveryService {
         } else if (media.mediaType === 'IMAGE') {
           await telegramService.sendPhoto(telegramId, media.url, media.caption ?? undefined);
         } else {
-          // FILE genérico — envia como link
           const msg = media.caption
             ? `📎 ${media.caption}\n${media.url}`
             : `📎 Arquivo: ${media.url}`;
