@@ -62,7 +62,9 @@ export async function deleteProduct(id: string) {
 
 // ─── Payments ────────────────────────────────────────────────────────────────
 
-export async function getPayments(params?: Record<string, string | number>) {
+export async function getPayments(
+  params?: Record<string, string | number | undefined>
+) {
   const res = await api.get('/admin/payments', { params });
   return res.data;
 }
@@ -74,7 +76,9 @@ export async function getPayment(id: string) {
 
 // ─── Users ───────────────────────────────────────────────────────────────────
 
-export async function getUsers(params?: Record<string, string | number>) {
+export async function getUsers(
+  params?: Record<string, string | number | undefined>
+) {
   const res = await api.get('/admin/users', { params });
   return res.data;
 }
