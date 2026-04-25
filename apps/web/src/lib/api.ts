@@ -101,10 +101,21 @@ export async function getProductMedias(id: string): Promise<ProductMedia[]> {
   return Array.isArray(meta?.medias) ? (meta.medias as ProductMedia[]) : [];
 }
 
+// ✅ CÓDIGO CORRIGIDO
 export async function updateProductMedias(id: string, medias: ProductMedia[]) {
-  const product = await api.get(`/admin/products/${id}`).then((r) => r.data?.data ?? r.data);
+  // Busca o produto completo para reenviar TODOS os campos no PUT
+  const productRes = await api.get(`/admin/products/${id}`);
+  const product = productRes.data?.data ?? productRes.data;
   const currentMeta = (product?.metadata as Record<string, unknown> | null) ?? {};
+
   const res = await api.put(`/admin/products/${id}`, {
+    name: product.name,
+    description: product.description,
+    price: Number(product.price),
+    deliveryType: product.deliveryType,
+    deliveryContent: product.deliveryContent,
+    isActive: product.isActive,
+    stock: product.stock ?? null,
     metadata: { ...currentMeta, medias },
   });
   return res.data?.data ?? res.data;
