@@ -105,25 +105,35 @@ export async function getProductMedias(id: string): Promise<ProductMedia[]> {
   }
 }
 
-export async function updateProductMedias(id: string, medias: ProductMedia[]) {
-  const productRes = await api.get(`/admin/products/${id}`);
-  const product = productRes.data?.data ?? productRes.data;
-  const currentMeta = (product?.metadata as Record<string, unknown> | null) ?? {};
+export async function updateProductMedias(
+  id: string,
+  medias: ProductMedia[],
+  baseProduct: {
+    name: string;
+    description: string;
+    price: number;
+    deliveryType: string;
+    deliveryContent: string;
+    isActive: boolean;
+    stock: number | null;
+    metadata?: Record<string, unknown> | null;
+  }
+) {
+  const currentMeta = (baseProduct.metadata as Record<string, unknown> | null) ?? {};
 
   const res = await api.put(`/admin/products/${id}`, {
-    name: product.name,
-    description: product.description,
-    price: Number(product.price),
-    deliveryType: product.deliveryType,
-    deliveryContent: product.deliveryContent,
-    isActive: product.isActive,
-    stock: product.stock ?? null,
+    name: baseProduct.name,
+    description: baseProduct.description,
+    price: Number(baseProduct.price),
+    deliveryType: baseProduct.deliveryType,
+    deliveryContent: baseProduct.deliveryContent,
+    isActive: baseProduct.isActive,
+    stock: baseProduct.stock ?? null,
     metadata: { ...currentMeta, medias },
   });
 
   return res.data?.data ?? res.data;
 }
-
 // ─── Upload para storage (Cloudinary via rota do Next) ──────────────────────
 
 export async function uploadMediaFile(
