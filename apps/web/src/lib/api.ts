@@ -85,3 +85,27 @@ export async function getMe() {
   const res = await api.get('/admin/me');
   return res.data?.data ?? res.data;
 }
+
+// ─── Product Medias (mídias extras enviadas após pagamento aprovado) ──────────
+
+export type ProductMedia = {
+  url: string;
+  mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
+  caption?: string;
+};
+
+export async function getProductMedias(id: string): Promise<ProductMedia[]> {
+  const res = await api.get(`/admin/products/${id}`);
+  const product = res.data?.data ?? res.data;
+  const meta = product?.metadata as Record<string, unknown> | null;
+  return Array.isArray(meta?.medias) ? (meta.medias as ProductMedia[]) : [];
+}
+
+export async function updateProductMedias(id: string, medias: ProductMedia[]) {
+  const product = await api.get(`/admin/products/${id}`).then((r) => r.data?.data ?? r.data);
+  const currentMeta = (product?.metadata as Record<string, unknown> | null) ?? {};
+  const res = await api.put(`/admin/products/${id}`, {
+    metadata: { ...currentMeta, medias },
+  });
+  return res.data?.data ?? res.data;
+}
