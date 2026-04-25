@@ -13,7 +13,9 @@ export default function Header() {
   const [admin, setAdmin] = useState<AdminUser | null>(null);
 
   useEffect(() => {
-    getMe().then(setAdmin).catch(() => {});
+    getMe()
+      .then((res) => setAdmin(res?.data ?? res))
+      .catch(() => {});
   }, []);
 
   return (
@@ -34,7 +36,7 @@ export default function Header() {
             <div className="text-xs text-gray-400">{admin.role}</div>
           </div>
           <div className="w-8 h-8 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-semibold text-sm">
-            {admin.name[0].toUpperCase()}
+            {(admin.name?.[0] ?? '?').toUpperCase()}
           </div>
         </div>
       )}
