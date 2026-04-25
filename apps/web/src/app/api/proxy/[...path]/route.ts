@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 const API_URL = (process.env.API_URL || process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '');
-const ADMIN_ORIGIN = process.env.NEXT_PUBLIC_APP_URL || 'https://saas-pix-bot.vercel.app'; // ← nova linha
+const ADMIN_ORIGIN = process.env.NEXT_PUBLIC_APP_URL || 'https://saas-pix-bot.vercel.app'; // ← ADD
+
 
 async function handler(
   request: NextRequest,
@@ -24,7 +25,7 @@ async function handler(
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Cookie': cookieHeader,
-      'Origin': ADMIN_ORIGIN, // ← linha adicionada
+      'Origin': ADMIN_ORIGIN, // ← ADD
     };
 
     const auth = request.headers.get('authorization');
