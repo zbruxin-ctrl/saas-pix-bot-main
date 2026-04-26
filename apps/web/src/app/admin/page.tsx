@@ -2,28 +2,13 @@
 
 import { useEffect, useState } from 'react';
 import { getDashboard } from '@/lib/api';
+import type { DashboardStats, RecentPaymentItem } from '@saas-pix/shared';
 import StatsCard from '@/components/admin/StatsCard';
 import RecentPaymentsTable from '@/components/admin/RecentPaymentsTable';
 
 interface DashboardData {
-  stats: {
-    totalRevenue: number;
-    totalApproved: number;
-    totalPending: number;
-    totalRejected: number;
-    revenueToday: number;
-    paymentsToday: number;
-    revenueThisMonth: number;
-    paymentsThisMonth: number;
-  };
-  recentPayments: {
-    id: string;
-    amount: number;
-    status: string;
-    approvedAt: string;
-    productName: string;
-    userName: string;
-  }[];
+  stats: DashboardStats;
+  recentPayments: RecentPaymentItem[];
 }
 
 export default function DashboardPage() {

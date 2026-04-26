@@ -1,12 +1,28 @@
-// apps/web/src/lib/api.ts
-import axios from 'axios';
+// api.ts — cliente HTTP tipado para o painel admin
+import axios, { AxiosResponse } from 'axios';
+import type {
+  ApiResponse,
+  PaginatedResponse,
+  PaymentDTO,
+  ProductDTO,
+  TelegramUserDTO,
+  DashboardStats,
+  RecentPaymentItem,
+  StockItemDTO,
+  DeliveryMediaDTO,
+} from '@saas-pix/shared';
+
+// ─── Tipo local para mídias de produto (usado em products-client.tsx) ─────────
+export interface ProductMedia {
+  url: string;
+  mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
+  caption?: string;
+}
 
 const api = axios.create({
   baseURL: '/api/proxy',
   withCredentials: true,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+  headers: { 'Content-Type': 'application/json' },
 });
 
 api.interceptors.response.use(
@@ -14,7 +30,7 @@ api.interceptors.response.use(
   (error) => {
     if (error.response?.status === 401) {
       document.cookie = 'auth_presence=; Max-Age=0; path=/';
-      if (typeof window !== 'undefined' && !window.location.pathname.includes('/login')) {
+      if (typeof window !== 'undefined' && !window.location.pathname.includes('login')) {
         window.location.href = '/login';
       }
     }
@@ -24,156 +40,195 @@ api.interceptors.response.use(
 
 export default api;
 
-// ─── Auth ────────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function data<T>(res: AxiosResponse<ApiResponse<T>>): T {
+  return res.data.data as T;
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
 
 export async function login(email: string, password: string) {
-  const res = await api.post('/auth/login', { email, password });
+  const res = await axios.post('/api/auth/login', { email, password }, { withCredentials: true });
   return res.data;
 }
 
-// ─── Dashboard ───────────────────────────────────────────────────────────────
+// ─── Dashboard ────────────────────────────────────────────────────────────────
 
-export async function getDashboard() {
-  const res = await api.get('/admin/dashboard');
-  return res.data?.data ?? res.data;
+export async function getDashboard(): Promise<{
+  stats: DashboardStats;
+  recentPayments: RecentPaymentItem[];
+}> {
+  const res = await api.get<ApiResponse<{ stats: DashboardStats; recentPayments: RecentPaymentItem[] }>>(
+    '/admin/dashboard'
+  );
+  return data(res);
 }
 
-// ─── Products ────────────────────────────────────────────────────────────────
+// ─── Products ─────────────────────────────────────────────────────────────────
 
-export async function getProducts() {
-  const res = await api.get('/admin/products');
-  return res.data?.data ?? res.data;
+export async function getProducts(): Promise<ProductDTO[]> {
+  const res = await api.get<ApiResponse<{ data: ProductDTO[]; total: number }>>('/admin/products');
+  const payload = res.data.data;
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray((payload as any).data)) return (payload as any).data;
+  return [];
 }
 
-export async function createProduct(data: Record<string, unknown>) {
-  const res = await api.post('/admin/products', data);
-  return res.data?.data ?? res.data;
+export async function getProduct(id: string): Promise<ProductDTO> {
+  const res = await api.get<ApiResponse<ProductDTO>>(`/admin/products/${id}`);
+  return data(res);
 }
 
-export async function updateProduct(id: string, data: Record<string, unknown>) {
-  const res = await api.put(`/admin/products/${id}`, data);
-  return res.data?.data ?? res.data;
+export async function createProduct(productData: Partial<ProductDTO>): Promise<ProductDTO> {
+  const res = await api.post<ApiResponse<ProductDTO>>('/admin/products', productData);
+  return data(res);
 }
 
-export async function deleteProduct(id: string) {
-  const res = await api.delete(`/admin/products/${id}`);
-  return res.data?.data ?? res.data;
+export async function updateProduct(id: string, productData: Partial<ProductDTO>): Promise<ProductDTO> {
+  const res = await api.put<ApiResponse<ProductDTO>>(`/admin/products/${id}`, productData);
+  return data(res);
 }
 
-// ─── Payments ────────────────────────────────────────────────────────────────
-
-export async function getPayments(params?: Record<string, string | number | undefined>) {
-  const res = await api.get('/admin/payments', { params });
-  return res.data?.data ?? res.data;
+export async function deleteProduct(id: string): Promise<void> {
+  await api.delete(`/admin/products/${id}`);
 }
 
-export async function getPayment(id: string) {
-  const res = await api.get(`/admin/payments/${id}`);
-  return res.data?.data ?? res.data;
+// ─── Reorder Products (drag-and-drop no painel admin) ────────────────────────
+
+export async function reorderProducts(
+  items: Array<{ id: string; sortOrder: number }>
+): Promise<void> {
+  await api.patch('/admin/products/reorder', { items });
 }
 
-// ─── Users ───────────────────────────────────────────────────────────────────
+// ─── Product Medias (usado em products-client.tsx) ────────────────────────────
 
-export async function getUsers(params?: Record<string, string | number | undefined>) {
-  const res = await api.get('/admin/users', { params });
-  return res.data?.data ?? res.data;
-}
-
-// ─── Me (perfil do admin logado) ─────────────────────────────────────────────
-
-export async function getMe() {
-  const res = await api.get('/admin/me');
-  return res.data?.data ?? res.data;
-}
-
-// ─── Product Medias ──────────────────────────────────────────────────────────
-
-export type ProductMedia = {
-  url: string;
-  mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
-  caption?: string;
-};
-
-export async function getProductMedias(id: string): Promise<ProductMedia[]> {
+export async function getProductMedias(productId: string): Promise<ProductMedia[]> {
   try {
-    const res = await api.get(`/admin/products/${id}`);
-    const product = res.data?.data ?? res.data;
-    const meta = product?.metadata as Record<string, unknown> | null;
-    return Array.isArray(meta?.medias) ? (meta.medias as ProductMedia[]) : [];
+    const res = await api.get<ApiResponse<ProductMedia[]>>(
+      `/admin/products/${productId}/medias-config`
+    );
+    return res.data.data ?? [];
   } catch {
     return [];
   }
 }
 
 export async function updateProductMedias(
-  id: string,
-  medias: ProductMedia[],
-  baseProduct: {
-    name: string;
-    description: string;
-    price: number;
-    deliveryType: string;
-    deliveryContent: string;
-    isActive: boolean;
-    stock: number | null;
-    metadata?: Record<string, unknown> | null;
+  productId: string,
+  medias: ProductMedia[]
+): Promise<void> {
+  try {
+    await api.put(`/admin/products/${productId}/medias-config`, { medias });
+  } catch {
+    // não bloqueia o salvamento se a rota não estiver disponível
   }
-) {
-  const currentMeta = (baseProduct.metadata as Record<string, unknown> | null) ?? {};
-
-  const res = await api.put(`/admin/products/${id}`, {
-    name: baseProduct.name,
-    description: baseProduct.description,
-    price: Number(baseProduct.price),
-    deliveryType: baseProduct.deliveryType,
-    deliveryContent: baseProduct.deliveryContent,
-    isActive: baseProduct.isActive,
-    stock: baseProduct.stock ?? null,
-    metadata: { ...currentMeta, medias },
-  });
-
-  return res.data?.data ?? res.data;
 }
-
-// ─── Upload direto para Cloudinary ───────────────────────────────────────────
 
 export async function uploadMediaFile(
   file: File,
-  mediaType: 'IMAGE' | 'VIDEO' | 'FILE'
+  mediaType: ProductMedia['mediaType']
 ): Promise<string> {
-  const cloudName = process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME;
-  const uploadPreset = process.env.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET;
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('mediaType', mediaType);
 
-  if (!cloudName || !uploadPreset) {
-    throw new Error('Cloudinary não configurado no frontend.');
-  }
+  const res = await api.post<ApiResponse<{ url: string }>>('/admin/products/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
 
-  let resourceType = 'image';
-  if (mediaType === 'VIDEO') resourceType = 'video';
-  if (mediaType === 'FILE') resourceType = 'raw';
+  const url = res.data.data?.url;
+  if (!url) throw new Error('Upload falhou: URL não retornada pelo servidor.');
+  return url;
+}
 
-  const form = new FormData();
-  form.append('file', file);
-  form.append('upload_preset', uploadPreset);
-  form.append('folder', 'saas-pix-bot/products');
+// ─── Stock Items ──────────────────────────────────────────────────────────────
 
-  const res = await fetch(
-    `https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`,
-    {
-      method: 'POST',
-      body: form,
-    }
+export async function getStockItems(productId: string): Promise<StockItemDTO[]> {
+  const res = await api.get<ApiResponse<StockItemDTO[]>>(`/admin/products/${productId}/stock-items`);
+  return data(res);
+}
+
+export async function createStockItem(productId: string, content: string): Promise<StockItemDTO> {
+  const res = await api.post<ApiResponse<StockItemDTO>>(
+    `/admin/products/${productId}/stock-items`,
+    { content }
   );
+  return data(res);
+}
 
-  const data = await res.json();
+export async function deleteStockItem(itemId: string): Promise<void> {
+  await api.delete(`/admin/products/stock-items/${itemId}`);
+}
 
-  if (!res.ok) {
-    throw new Error(data?.error?.message || 'Erro ao fazer upload no Cloudinary');
-  }
+// ─── Payments ─────────────────────────────────────────────────────────────────
 
-  if (!data?.secure_url) {
-    throw new Error('Upload concluído sem URL retornada');
-  }
+export async function getPayments(
+  params?: Partial<{
+    page: number;
+    perPage: number;
+    status: string;
+    orderStatus: string;
+    productId: string;
+    startDate: string;
+    endDate: string;
+    search: string;
+  }>
+): Promise<ApiResponse<PaginatedResponse<PaymentDTO>>> {
+  const res = await api.get('/admin/payments', { params });
+  return res.data;
+}
 
-  return data.secure_url as string;
+export async function getPayment(id: string): Promise<PaymentDTO> {
+  const res = await api.get<ApiResponse<PaymentDTO>>(`/admin/payments/${id}`);
+  return data(res);
+}
+
+export async function reprocessPayment(
+  id: string
+): Promise<{ success: boolean; message?: string; error?: string; mpStatus?: string; alreadyApproved?: boolean }> {
+  const res = await api.post(`/admin/payments/${id}/reprocess`);
+  return res.data;
+}
+
+// ─── Delivery Medias (por pedido) ─────────────────────────────────────────────
+
+export async function getOrderMedias(orderId: string): Promise<DeliveryMediaDTO[]> {
+  const res = await api.get<ApiResponse<DeliveryMediaDTO[]>>(
+    `/admin/products/orders/${orderId}/medias`
+  );
+  return data(res);
+}
+
+export async function createOrderMedia(
+  orderId: string,
+  mediaData: Omit<DeliveryMediaDTO, 'id' | 'orderId' | 'createdAt'>
+): Promise<DeliveryMediaDTO> {
+  const res = await api.post<ApiResponse<DeliveryMediaDTO>>(
+    `/admin/products/orders/${orderId}/medias`,
+    mediaData
+  );
+  return data(res);
+}
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+
+export async function getUsers(
+  params?: Partial<{ page: number; perPage: number; search: string }>
+): Promise<ApiResponse<PaginatedResponse<TelegramUserDTO & { totalSpent: number }>>> {
+  const res = await api.get('/admin/users', { params });
+  return res.data;
+}
+
+export async function getUser(id: string) {
+  const res = await api.get(`/admin/users/${id}`);
+  return res.data;
+}
+
+// ─── Me ───────────────────────────────────────────────────────────────────────
+
+export async function getMe() {
+  const res = await api.get('/admin/me');
+  return res.data;
 }

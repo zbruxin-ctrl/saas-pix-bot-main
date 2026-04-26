@@ -1,16 +1,8 @@
 import StatusBadge from './StatusBadge';
 import { formatCurrency, formatDate } from '@/lib/utils';
+import type { RecentPaymentItem } from '@saas-pix/shared';
 
-interface RecentPayment {
-  id: string;
-  amount: number;
-  status: string;
-  approvedAt: string;
-  productName: string;
-  userName: string;
-}
-
-export default function RecentPaymentsTable({ payments }: { payments: RecentPayment[] }) {
+export default function RecentPaymentsTable({ payments }: { payments: RecentPaymentItem[] }) {
   if (payments.length === 0) {
     return (
       <div className="text-center py-8 text-gray-400 text-sm">
@@ -36,7 +28,7 @@ export default function RecentPaymentsTable({ payments }: { payments: RecentPaym
               <td className="py-2.5 font-medium text-gray-900">{p.userName}</td>
               <td className="py-2.5 text-gray-600">{p.productName}</td>
               <td className="py-2.5 font-semibold text-green-700">{formatCurrency(p.amount)}</td>
-              <td className="py-2.5 text-gray-400 text-xs">{formatDate(p.approvedAt)}</td>
+              <td className="py-2.5 text-gray-400 text-xs">{formatDate(p.approvedAt ?? '')}</td>
             </tr>
           ))}
         </tbody>

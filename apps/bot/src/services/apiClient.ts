@@ -1,7 +1,13 @@
 // Cliente HTTP para comunicação do bot com a API interna
 import axios, { AxiosInstance } from 'axios';
 import { env } from '../config/env';
-import type { CreatePaymentResponse, ProductDTO, ApiResponse } from '@saas-pix/shared';
+import type {
+  CreatePaymentResponse,
+  CreateDepositResponse,
+  WalletBalanceResponse,
+  ProductDTO,
+  ApiResponse,
+} from '@saas-pix/shared';
 
 class ApiClient {
   private client: AxiosInstance;
@@ -11,7 +17,6 @@ class ApiClient {
       baseURL: env.API_URL,
       headers: {
         'Content-Type': 'application/json',
-        // Token secreto para autenticar requisições do bot na API
         'x-bot-secret': env.TELEGRAM_BOT_SECRET,
       },
       timeout: 15000,
@@ -26,13 +31,13 @@ class ApiClient {
     );
   }
 
-  // Lista todos os produtos ativos
+  // Lista todos os produtos ativos (ordenados por sortOrder)
   async getProducts(): Promise<ProductDTO[]> {
     const { data } = await this.client.get<ApiResponse<ProductDTO[]>>('/api/payments/products');
     return data.data!;
   }
 
-  // Cria um pagamento PIX
+  // Cria um pagamento PIX para produto
   async createPayment(params: {
     telegramId: string;
     productId: string;
@@ -46,10 +51,40 @@ class ApiClient {
     return data.data!;
   }
 
+  // Cria um PIX de depósito de saldo (sem produto vinculado)
+  async createDeposit(
+    telegramId: string,
+    amount: number,
+    firstName?: string,
+    username?: string
+  ): Promise<CreateDepositResponse> {
+    const { data } = await this.client.post<ApiResponse<CreateDepositResponse>>(
+      '/api/payments/deposit',
+      { telegramId, amount, firstName, username }
+    );
+    return data.data!;
+  }
+
+  // Retorna saldo e últimas transações do usuário
+  async getBalance(telegramId: string): Promise<WalletBalanceResponse> {
+    const { data } = await this.client.get<ApiResponse<WalletBalanceResponse>>(
+      `/api/payments/balance?telegramId=${encodeURIComponent(telegramId)}`
+    );
+    return data.data!;
+  }
+
   // Verifica status de um pagamento
   async getPaymentStatus(paymentId: string): Promise<{ status: string; paymentId: string }> {
     const { data } = await this.client.get<ApiResponse<{ status: string; paymentId: string }>>(
       `/api/payments/${paymentId}/status`
+    );
+    return data.data!;
+  }
+
+  // Cancela um pagamento PENDING a pedido do usuário
+  async cancelPayment(paymentId: string): Promise<{ cancelled: boolean; message: string }> {
+    const { data } = await this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
+      `/api/payments/${paymentId}/cancel`
     );
     return data.data!;
   }

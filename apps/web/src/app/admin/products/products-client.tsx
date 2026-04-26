@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { ProductDTO, DeliveryType, StockItemDTO } from '@saas-pix/shared';
 import {
   getProducts,
   createProduct,
@@ -9,28 +10,28 @@ import {
   getProductMedias,
   updateProductMedias,
   uploadMediaFile,
+  getStockItems,
+  createStockItem,
+  reorderProducts,
   type ProductMedia,
 } from '@/lib/api';
 import { formatCurrency } from '@/lib/utils';
 import { toast } from '@/components/admin/Toast';
 import ConfirmModal from '@/components/admin/ConfirmModal';
 
-interface Product {
-  id: string;
-  name: string;
-  description: string;
-  price: number;
-  deliveryType: string;
-  deliveryContent: string;
-  isActive: boolean;
-  stock: number | null;
+interface Product extends ProductDTO {
+  deliveryContent?: string | null;
+  stockItems?: StockItemDTO[];
   _count?: { payments: number; orders: number };
+  sortOrder?: number;
 }
 
 interface DeliveryItem {
   id: string;
   value: string;
 }
+
+type ProductPayload = Partial<ProductDTO> & { deliveryContent?: string };
 
 const DELIVERY_TYPES = [
   { value: 'TEXT', label: 'TEXT — Mensagem de texto' },
@@ -55,25 +56,23 @@ const EMPTY_FORM = {
   name: '',
   description: '',
   price: '',
-  deliveryType: 'TEXT',
+  deliveryType: 'TEXT' as DeliveryType,
   deliveryContent: '',
+  confirmationMessage: '',
   isActive: true,
   stock: '',
 };
+
+const FIFO_TYPES = ['ACCOUNT', 'LINK', 'TEXT'];
 
 function itemsToContent(items: DeliveryItem[]): string {
   const vals = items.map((i) => i.value.trim()).filter(Boolean);
   return JSON.stringify(vals);
 }
 
-function contentToItems(content: string): DeliveryItem[] {
-  try {
-    const parsed = JSON.parse(content);
-    if (Array.isArray(parsed)) {
-      return parsed.map((v, i) => ({ id: String(i), value: String(v) }));
-    }
-  } catch {}
-  return [{ id: '0', value: content }];
+function stockItemsToDeliveryItems(stockItems: StockItemDTO[]): DeliveryItem[] {
+  if (!stockItems || stockItems.length === 0) return [newItem()];
+  return stockItems.map((s) => ({ id: s.id, value: s.content }));
 }
 
 function newItem(): DeliveryItem {
@@ -87,21 +86,16 @@ function newMedia(): ProductMedia {
 function validate(form: typeof EMPTY_FORM, items: DeliveryItem[]): string | null {
   if (!form.name.trim()) return 'O nome do produto é obrigatório.';
   if (!form.description.trim()) return 'A descrição é obrigatória.';
-
   const price = parseFloat(form.price);
   if (isNaN(price) || price <= 0) return 'Informe um preço válido maior que zero.';
 
-  const usesItems = ['ACCOUNT', 'LINK', 'TEXT'].includes(form.deliveryType);
-
+  const usesItems = FIFO_TYPES.includes(form.deliveryType);
   if (usesItems) {
     const filled = items.filter((i) => i.value.trim());
     if (filled.length === 0) return 'Adicione pelo menos um item de entrega.';
-
     if (form.deliveryType === 'ACCOUNT') {
       for (const item of filled) {
-        try {
-          JSON.parse(item.value);
-        } catch {
+        try { JSON.parse(item.value); } catch {
           return `O item "${item.value.slice(0, 30)}..." não é um JSON válido.`;
         }
       }
@@ -109,7 +103,6 @@ function validate(form: typeof EMPTY_FORM, items: DeliveryItem[]): string | null
   } else if (form.deliveryType === 'FILE_MEDIA') {
     if (!form.deliveryContent.trim()) return 'Informe a URL ou file_id da mídia.';
   }
-
   return null;
 }
 
@@ -127,9 +120,7 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-
     setUploading(true);
-
     try {
       const uploadedUrl = await uploadMediaFile(file, media.mediaType);
       onUpdate(idx, { url: uploadedUrl });
@@ -149,32 +140,15 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
     <div className="border border-gray-200 rounded-xl p-3 space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-gray-500">Mídia {idx + 1}</span>
-        <button
-          type="button"
-          onClick={() => onRemove(idx)}
-          className="text-red-400 hover:text-red-600 text-sm"
-        >
-          Remover
-        </button>
+        <button type="button" onClick={() => onRemove(idx)} className="text-red-400 hover:text-red-600 text-sm">Remover</button>
       </div>
-
       <select
         className="input text-sm"
         value={media.mediaType}
-        onChange={(e) =>
-          onUpdate(idx, {
-            mediaType: e.target.value as ProductMedia['mediaType'],
-            url: '',
-          })
-        }
+        onChange={(e) => onUpdate(idx, { mediaType: e.target.value as ProductMedia['mediaType'], url: '' })}
       >
-        {MEDIA_TYPES.map((t) => (
-          <option key={t.value} value={t.value}>
-            {t.label}
-          </option>
-        ))}
+        {MEDIA_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
       </select>
-
       <div className="flex gap-2 items-center">
         <input
           className="flex-1 input text-sm"
@@ -182,7 +156,6 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
           value={media.url}
           onChange={(e) => onUpdate(idx, { url: e.target.value })}
         />
-
         <button
           type="button"
           title="Enviar arquivo do computador"
@@ -190,43 +163,14 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
           onClick={() => fileInputRef.current?.click()}
           className="shrink-0 flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 bg-white hover:bg-gray-50 text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
-          {uploading ? (
-            <span className="animate-spin">⏳</span>
-          ) : (
-            <>
-              📁 <span className="hidden sm:inline">Upload</span>
-            </>
-          )}
+          {uploading ? <span className="animate-spin">⏳</span> : <>📁 <span className="hidden sm:inline">Upload</span></>}
         </button>
-
         {media.url && (
-          <button
-            type="button"
-            title="Limpar"
-            onClick={() => onUpdate(idx, { url: '' })}
-            className="shrink-0 text-gray-400 hover:text-red-500 text-lg leading-none px-1"
-          >
-            ×
-          </button>
+          <button type="button" title="Limpar" onClick={() => onUpdate(idx, { url: '' })} className="shrink-0 text-gray-400 hover:text-red-500 text-lg leading-none px-1">×</button>
         )}
       </div>
-
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept={ACCEPT_BY_TYPE[media.mediaType]}
-        className="hidden"
-        onChange={handleFileChange}
-      />
-
-      {isImage && (
-        <img
-          src={media.url}
-          alt="preview"
-          className="w-full max-h-32 object-contain rounded-lg bg-gray-50"
-        />
-      )}
-
+      <input ref={fileInputRef} type="file" accept={ACCEPT_BY_TYPE[media.mediaType]} className="hidden" onChange={handleFileChange} />
+      {isImage && <img src={media.url} alt="preview" className="w-full max-h-32 object-contain rounded-lg bg-gray-50" />}
       <input
         className="input text-sm"
         placeholder="Legenda (opcional)"
@@ -237,11 +181,109 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
   );
 }
 
+// ─── Drag-and-drop (nativo, sem biblioteca externa) ───────────────────────────
+
+interface SortableCardProps {
+  product: Product;
+  index: number;
+  isDragging: boolean;
+  isOver: boolean;
+  onDragStart: (index: number) => void;
+  onDragEnter: (index: number) => void;
+  onDragEnd: () => void;
+  onEdit: (p: Product) => void;
+  onDelete: (id: string) => void;
+}
+
+function SortableCard({
+  product: p,
+  index,
+  isDragging,
+  isOver,
+  onDragStart,
+  onDragEnter,
+  onDragEnd,
+  onEdit,
+  onDelete,
+}: SortableCardProps) {
+  const itemCount = p.stockItems ? p.stockItems.length : null;
+
+  return (
+    <div
+      draggable
+      onDragStart={() => onDragStart(index)}
+      onDragEnter={() => onDragEnter(index)}
+      onDragEnd={onDragEnd}
+      onDragOver={(e) => e.preventDefault()}
+      className={[
+        'card relative transition-all duration-150 cursor-default',
+        !p.isActive ? 'opacity-60' : '',
+        isDragging ? 'opacity-40 scale-95 shadow-lg ring-2 ring-blue-400' : '',
+        isOver && !isDragging ? 'ring-2 ring-blue-300 bg-blue-50/40' : '',
+      ].filter(Boolean).join(' ')}
+    >
+      {/* Handle de arrastar */}
+      <div
+        className="absolute top-3 right-3 cursor-grab active:cursor-grabbing text-gray-300 hover:text-gray-500 select-none z-10"
+        title="Arrastar para reordenar"
+        draggable={false}
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+          <rect x="3" y="3" width="2" height="2" rx="1" />
+          <rect x="7" y="3" width="2" height="2" rx="1" />
+          <rect x="11" y="3" width="2" height="2" rx="1" />
+          <rect x="3" y="7" width="2" height="2" rx="1" />
+          <rect x="7" y="7" width="2" height="2" rx="1" />
+          <rect x="11" y="7" width="2" height="2" rx="1" />
+          <rect x="3" y="11" width="2" height="2" rx="1" />
+          <rect x="7" y="11" width="2" height="2" rx="1" />
+          <rect x="11" y="11" width="2" height="2" rx="1" />
+        </svg>
+      </div>
+
+      <div className="flex items-start justify-between mb-1 pr-8">
+        <h3 className="font-semibold text-gray-900 leading-snug">{p.name}</h3>
+        <span className={[
+          'shrink-0 text-xs px-2 py-0.5 rounded-full font-medium ml-2',
+          p.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-500',
+        ].join(' ')}>
+          {p.isActive ? 'Ativo' : 'Inativo'}
+        </span>
+      </div>
+      <p className="text-sm text-gray-500 mb-3 line-clamp-2">{p.description}</p>
+      <div className="text-2xl font-bold text-blue-600 mb-3">{formatCurrency(p.price)}</div>
+      <div className="flex items-center gap-2 text-xs text-gray-500 mb-4 flex-wrap">
+        <span className="bg-gray-100 px-2 py-1 rounded">{p.deliveryType}</span>
+        {itemCount !== null && (
+          <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded">
+            {itemCount} item{itemCount !== 1 ? 's' : ''} disponíveis
+          </span>
+        )}
+        {p.stock != null && (
+          <span className="bg-yellow-100 text-yellow-700 px-2 py-1 rounded">
+            {p.stock} em estoque
+          </span>
+        )}
+      </div>
+      {p._count && (
+        <div className="text-xs text-gray-400 mb-4">
+          {p._count.payments} pagamentos · {p._count.orders} pedidos
+        </div>
+      )}
+      <div className="flex gap-2">
+        <button onClick={() => onEdit(p)} className="btn-secondary text-sm flex-1">Editar</button>
+        <button onClick={() => onDelete(p.id)} className="btn-danger text-sm px-3" title="Desativar produto">🗑</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Componente principal ─────────────────────────────────────────────────────
+
 export default function ProductsClient() {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
-  const [activeTab, setActiveTab] = useState<'product' | 'medias'>('product');
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState(EMPTY_FORM);
   const [items, setItems] = useState<DeliveryItem[]>([newItem()]);
@@ -252,32 +294,85 @@ export default function ProductsClient() {
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  const usesItemList = ['ACCOUNT', 'LINK', 'TEXT'].includes(form.deliveryType);
+  // ── Drag-and-drop state ──────────────────────────────────────────────────────
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [overIndex, setOverIndex] = useState<number | null>(null);
+  const [reordering, setReordering] = useState(false);
 
-  const loadProducts = () => {
+  const usesItemList = FIFO_TYPES.includes(form.deliveryType);
+
+  // Produtos sem filtro de busca (usados para reordenação)
+  const [allProducts, setAllProducts] = useState<Product[]>([]);
+
+  const loadProducts = useCallback(() => {
     setLoading(true);
     getProducts()
-      .then(setProducts)
+      .then((data) => {
+        const list = data as Product[];
+        setAllProducts(list);
+        setProducts(list);
+      })
       .catch(() => toast('Erro ao carregar produtos', 'error'))
       .finally(() => setLoading(false));
-  };
-
-  useEffect(() => {
-    loadProducts();
   }, []);
+
+  useEffect(() => { loadProducts(); }, [loadProducts]);
 
   const filtered = useMemo(() => {
     return products.filter((p) => {
       const matchSearch =
         p.name.toLowerCase().includes(search.toLowerCase()) ||
         p.description.toLowerCase().includes(search.toLowerCase());
-
-      const matchFilter =
-        filter === 'all' ? true : filter === 'active' ? p.isActive : !p.isActive;
-
+      const matchFilter = filter === 'all' ? true : filter === 'active' ? p.isActive : !p.isActive;
       return matchSearch && matchFilter;
     });
   }, [products, search, filter]);
+
+  // Determina se está com filtro/busca ativo (impede reordenação visual)
+  const isFiltering = search.trim() !== '' || filter !== 'all';
+
+  // ── Handlers drag-and-drop ───────────────────────────────────────────────────
+  function handleDragStart(index: number) {
+    if (isFiltering) return;
+    setDragIndex(index);
+  }
+
+  function handleDragEnter(index: number) {
+    if (dragIndex === null || dragIndex === index) return;
+    setOverIndex(index);
+  }
+
+  async function handleDragEnd() {
+    if (dragIndex === null || overIndex === null || dragIndex === overIndex) {
+      setDragIndex(null);
+      setOverIndex(null);
+      return;
+    }
+
+    // Reordena localmente
+    const reordered = [...products];
+    const [moved] = reordered.splice(dragIndex, 1);
+    reordered.splice(overIndex, 0, moved);
+    setProducts(reordered);
+    setAllProducts(reordered);
+    setDragIndex(null);
+    setOverIndex(null);
+
+    // Persiste no banco via API
+    setReordering(true);
+    try {
+      const payload = reordered.map((p, i) => ({ id: p.id, sortOrder: i }));
+      await reorderProducts(payload);
+      toast('Ordem atualizada com sucesso!', 'success');
+    } catch {
+      toast('Erro ao salvar ordem. Recarregando...', 'error');
+      loadProducts();
+    } finally {
+      setReordering(false);
+    }
+  }
+
+  // ── Formulário ───────────────────────────────────────────────────────────────
 
   function openCreate() {
     setForm(EMPTY_FORM);
@@ -285,81 +380,81 @@ export default function ProductsClient() {
     setMedias([]);
     setEditId(null);
     setFieldError('');
-    setActiveTab('product');
     setShowModal(true);
   }
 
-  function openEdit(p: Product) {
-    const f = {
+  async function openEdit(p: Product) {
+    const meta = (p.metadata ?? {}) as Record<string, unknown>;
+    setForm({
       name: p.name,
       description: p.description,
       price: String(p.price),
       deliveryType: p.deliveryType,
-      deliveryContent: p.deliveryContent || '',
+      deliveryContent: p.deliveryContent ?? '',
+      confirmationMessage: (meta.confirmationMessage as string) ?? '',
       isActive: p.isActive,
       stock: p.stock != null ? String(p.stock) : '',
-    };
-
-    setForm(f);
-    setItems(
-      ['ACCOUNT', 'LINK', 'TEXT'].includes(p.deliveryType)
-        ? contentToItems(p.deliveryContent || '[]')
-        : [newItem()]
-    );
+    });
     setEditId(p.id);
     setFieldError('');
-    setActiveTab('product');
     setShowModal(true);
+
+    if (FIFO_TYPES.includes(p.deliveryType)) {
+      if (p.stockItems && p.stockItems.length > 0) {
+        setItems(stockItemsToDeliveryItems(p.stockItems));
+      } else {
+        getStockItems(p.id)
+          .then((si) => setItems(stockItemsToDeliveryItems(si)))
+          .catch(() => setItems([newItem()]));
+      }
+    } else {
+      setItems([newItem()]);
+    }
 
     getProductMedias(p.id)
       .then(setMedias)
       .catch(() => setMedias([]));
   }
 
-  function addItem() {
-    setItems((prev) => [...prev, newItem()]);
-  }
-
-  function removeItem(id: string) {
-    setItems((prev) => prev.filter((i) => i.id !== id));
-  }
-
+  function addItem() { setItems((prev) => [...prev, newItem()]); }
+  function removeItem(id: string) { setItems((prev) => prev.filter((i) => i.id !== id)); }
   function updateItemValue(id: string, value: string) {
     setItems((prev) => prev.map((i) => (i.id === id ? { ...i, value } : i)));
   }
-
-  function addMedia() {
-    setMedias((prev) => [...prev, newMedia()]);
-  }
-
-  function removeMedia(idx: number) {
-    setMedias((prev) => prev.filter((_, i) => i !== idx));
-  }
-
+  function addMedia() { setMedias((prev) => [...prev, newMedia()]); }
+  function removeMedia(idx: number) { setMedias((prev) => prev.filter((_, i) => i !== idx)); }
   function updateMedia(idx: number, patch: Partial<ProductMedia>) {
     setMedias((prev) => prev.map((m, i) => (i === idx ? { ...m, ...patch } : m)));
   }
 
   async function handleSave() {
     const err = validate(form, items);
-    if (err) {
-      setFieldError(err);
-      setActiveTab('product');
-      return;
-    }
+    if (err) { setFieldError(err); return; }
 
     setSaving(true);
     setFieldError('');
 
     try {
-      const deliveryContent = usesItemList ? itemsToContent(items) : form.deliveryContent;
-      const fifoCount = usesItemList ? items.filter((i) => i.value.trim()).length : null;
+      const isFifo = FIFO_TYPES.includes(form.deliveryType);
+      const deliveryContent = isFifo ? itemsToContent(items) : form.deliveryContent;
+      const fifoCount = isFifo ? items.filter((i) => i.value.trim()).length : null;
+      const stockValue = isFifo ? fifoCount : form.stock ? parseInt(form.stock, 10) : null;
 
-      const payload = {
-        ...form,
-        deliveryContent,
+      const existingMeta = (allProducts.find((p) => p.id === editId)?.metadata ?? {}) as Record<string, unknown>;
+      const newMetadata = {
+        ...existingMeta,
+        confirmationMessage: form.confirmationMessage.trim() || undefined,
+      };
+
+      const payload: ProductPayload = {
+        name: form.name,
+        description: form.description,
         price: parseFloat(form.price),
-        stock: usesItemList ? fifoCount : form.stock ? parseInt(form.stock) : null,
+        deliveryType: form.deliveryType,
+        isActive: form.isActive,
+        stock: stockValue,
+        deliveryContent,
+        metadata: newMetadata,
       };
 
       let savedId = editId;
@@ -374,21 +469,11 @@ export default function ProductsClient() {
       }
 
       if (savedId) {
-  const validMedias = medias.filter((m) => m.url.trim());
-
-  await updateProductMedias(savedId, validMedias, {
-    name: payload.name,
-    description: payload.description,
-    price: Number(payload.price),
-    deliveryType: payload.deliveryType,
-    deliveryContent: payload.deliveryContent,
-    isActive: payload.isActive,
-    stock: payload.stock,
-    metadata: {},
-  }).catch(() =>
-    toast('Produto salvo, mas erro ao salvar mídias extras.', 'error')
-  );
-}
+        const validMedias = medias.filter((m) => m.url.trim());
+        await updateProductMedias(savedId, validMedias).catch(() =>
+          toast('Produto salvo, mas erro ao salvar mídias extras.', 'error')
+        );
+      }
 
       setShowModal(false);
       loadProducts();
@@ -402,7 +487,6 @@ export default function ProductsClient() {
 
   async function handleConfirmDelete() {
     if (!confirmDelete) return;
-
     try {
       await deleteProduct(confirmDelete);
       toast('Produto desativado.', 'info');
@@ -414,8 +498,6 @@ export default function ProductsClient() {
     }
   }
 
-  const filePlaceholder = 'URL pública ou file_id do Telegram (foto, vídeo ou doc)';
-
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -423,11 +505,10 @@ export default function ProductsClient() {
           <h1 className="text-2xl font-bold text-gray-900">Produtos</h1>
           <p className="text-gray-500 text-sm mt-1">
             {filtered.length} de {products.length} produto{products.length !== 1 ? 's' : ''}
+            {reordering && <span className="ml-2 text-blue-500 animate-pulse">· Salvando ordem...</span>}
           </p>
         </div>
-        <button onClick={openCreate} className="btn-primary">
-          + Novo Produto
-        </button>
+        <button onClick={openCreate} className="btn-primary">+ Novo Produto</button>
       </div>
 
       <div className="flex flex-col sm:flex-row gap-3">
@@ -437,7 +518,6 @@ export default function ProductsClient() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-
         <div className="flex gap-2">
           {(['all', 'active', 'inactive'] as const).map((f) => (
             <button
@@ -456,6 +536,13 @@ export default function ProductsClient() {
         </div>
       </div>
 
+      {/* Aviso quando filtro está ativo e drag está desativado */}
+      {isFiltering && !loading && products.length > 0 && (
+        <p className="text-xs text-gray-400 text-center">
+          ⚠️ Reordenação desativada durante busca/filtro. Limpe os filtros para arrastar.
+        </p>
+      )}
+
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {[...Array(6)].map((_, i) => (
@@ -472,350 +559,175 @@ export default function ProductsClient() {
           <div className="text-4xl mb-3">📦</div>
           <p className="font-medium text-gray-500">Nenhum produto encontrado</p>
           <p className="text-sm mt-1">
-            {search
-              ? 'Tente outros termos de busca'
-              : 'Crie seu primeiro produto clicando em "+ Novo Produto"'}
+            {search ? 'Tente outros termos de busca' : 'Crie seu primeiro produto clicando em "+ Novo Produto"'}
           </p>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-          {filtered.map((p) => {
-            let itemCount: number | null = null;
-
-            try {
-              const parsed = JSON.parse(p.deliveryContent || '');
-              if (Array.isArray(parsed)) itemCount = parsed.length;
-            } catch {}
-
-            return (
-              <div
-                key={p.id}
-                className={['card relative', !p.isActive ? 'opacity-60' : ''].join(' ')}
-              >
-                <div className="flex items-start justify-between mb-1">
-                  <h3 className="font-semibold text-gray-900 pr-4 leading-snug">{p.name}</h3>
-                  <span
-                    className={[
-                      'shrink-0 text-xs px-2 py-0.5 rounded-full font-medium',
-                      p.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-500',
-                    ].join(' ')}
-                  >
-                    {p.isActive ? 'Ativo' : 'Inativo'}
-                  </span>
-                </div>
-
-                <p className="text-sm text-gray-500 mb-3 line-clamp-2">{p.description}</p>
-
-                <div className="text-2xl font-bold text-blue-600 mb-3">
-                  {formatCurrency(p.price)}
-                </div>
-
-                <div className="flex items-center gap-2 text-xs text-gray-500 mb-4 flex-wrap">
-                  <span className="bg-gray-100 px-2 py-1 rounded">{p.deliveryType}</span>
-
-                  {itemCount !== null && (
-                    <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded">
-                      {itemCount} item{itemCount !== 1 ? 's' : ''} na fila
-                    </span>
-                  )}
-
-                  {p.stock != null && (
-                    <span className="bg-yellow-100 text-yellow-700 px-2 py-1 rounded">
-                      {p.stock} em estoque
-                    </span>
-                  )}
-                </div>
-
-                {p._count && (
-                  <div className="text-xs text-gray-400 mb-4">
-                    {p._count.payments} pagamentos · {p._count.orders} pedidos
-                  </div>
-                )}
-
-                <div className="flex gap-2">
-                  <button onClick={() => openEdit(p)} className="btn-secondary text-sm flex-1">
-                    Editar
-                  </button>
-                  <button
-                    onClick={() => setConfirmDelete(p.id)}
-                    className="btn-danger text-sm px-3"
-                    title="Desativar produto"
-                  >
-                    🗑
-                  </button>
-                </div>
-              </div>
-            );
-          })}
+          {filtered.map((p, index) => (
+            <SortableCard
+              key={p.id}
+              product={p}
+              index={index}
+              isDragging={dragIndex === index}
+              isOver={overIndex === index}
+              onDragStart={handleDragStart}
+              onDragEnter={handleDragEnter}
+              onDragEnd={handleDragEnd}
+              onEdit={openEdit}
+              onDelete={(id) => setConfirmDelete(id)}
+            />
+          ))}
         </div>
       )}
 
       {showModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
-            <div className="px-6 pt-6 pb-0">
+            <div className="px-6 pt-6">
               <h2 className="text-xl font-bold text-gray-900 mb-4">
                 {editId ? 'Editar Produto' : 'Novo Produto'}
               </h2>
-
-              <div className="flex gap-1 border-b border-gray-200">
-                {([
-                  { key: 'product', label: '📦 Produto' },
-                  {
-                    key: 'medias',
-                    label: `🎬 Mídias Extras${
-                      medias.filter((m) => m.url.trim()).length > 0
-                        ? ` (${medias.filter((m) => m.url.trim()).length})`
-                        : ''
-                    }`,
-                  },
-                ] as const).map((tab) => (
-                  <button
-                    key={tab.key}
-                    onClick={() => setActiveTab(tab.key)}
-                    className={[
-                      'px-4 py-2 text-sm font-medium rounded-t-lg transition-colors',
-                      activeTab === tab.key
-                        ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600'
-                        : 'text-gray-500 hover:text-gray-700',
-                    ].join(' ')}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
             </div>
 
-            <div className="p-6">
-              {activeTab === 'product' && (
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Nome *</label>
-                    <input
-                      className="input"
-                      value={form.name}
-                      onChange={(e) => setForm({ ...form, name: e.target.value })}
-                      placeholder="Ex: Plano Pro"
-                    />
-                  </div>
+            <div className="px-6 pb-6 space-y-4">
 
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Descrição *
-                    </label>
-                    <textarea
-                      className="input"
-                      rows={2}
-                      value={form.description}
-                      onChange={(e) => setForm({ ...form, description: e.target.value })}
-                      placeholder="Descrição exibida no bot"
-                    />
-                  </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Nome *</label>
+                <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Ex: Plano Pro" />
+              </div>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">
-                        Preço (R$) *
-                      </label>
-                      <input
-                        className="input"
-                        type="number"
-                        step="0.01"
-                        min="0.01"
-                        value={form.price}
-                        onChange={(e) => setForm({ ...form, price: e.target.value })}
-                        placeholder="29.90"
-                      />
-                    </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Descrição *</label>
+                <textarea className="input" rows={2} value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Descrição exibida no bot" />
+              </div>
 
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">
-                        Estoque
-                      </label>
-
-                      {usesItemList ? (
-                        <div className="input bg-gray-50 text-gray-400 cursor-not-allowed select-none">
-                          Auto ({items.filter((i) => i.value.trim()).length} itens)
-                        </div>
-                      ) : (
-                        <input
-                          className="input"
-                          type="number"
-                          min="0"
-                          value={form.stock}
-                          onChange={(e) => setForm({ ...form, stock: e.target.value })}
-                          placeholder="Vazio = ilimitado"
-                        />
-                      )}
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Tipo de Entrega *
-                    </label>
-                    <select
-                      className="input"
-                      value={form.deliveryType}
-                      onChange={(e) => {
-                        setForm({ ...form, deliveryType: e.target.value, deliveryContent: '' });
-                        setItems([newItem()]);
-                      }}
-                    >
-                      {DELIVERY_TYPES.map((t) => (
-                        <option key={t.value} value={t.value}>
-                          {t.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  {usesItemList && (
-                    <div>
-                      <div className="flex items-center justify-between mb-2">
-                        <label className="block text-sm font-medium text-gray-700">
-                          {form.deliveryType === 'ACCOUNT'
-                            ? 'Contas / Dados JSON *'
-                            : form.deliveryType === 'LINK'
-                            ? 'Links de acesso *'
-                            : 'Mensagens de entrega *'}
-                        </label>
-
-                        <button
-                          type="button"
-                          onClick={addItem}
-                          className="text-xs text-blue-600 hover:text-blue-700 font-medium"
-                        >
-                          + Adicionar item
-                        </button>
-                      </div>
-
-                      <div className="space-y-2">
-                        {items.map((item, idx) => (
-                          <div key={item.id} className="flex gap-2 items-start">
-                            <span className="text-xs text-gray-400 mt-2.5 w-5 text-right shrink-0">
-                              {idx + 1}.
-                            </span>
-
-                            <textarea
-                              className="input flex-1 font-mono text-xs"
-                              rows={form.deliveryType === 'ACCOUNT' ? 2 : 1}
-                              value={item.value}
-                              onChange={(e) => updateItemValue(item.id, e.target.value)}
-                              placeholder={
-                                form.deliveryType === 'ACCOUNT'
-                                  ? '{"login": "user", "senha": "123", "url": "https://..."}'
-                                  : form.deliveryType === 'LINK'
-                                  ? 'https://...'
-                                  : 'Conteúdo enviado ao comprador'
-                              }
-                            />
-
-                            {items.length > 1 && (
-                              <button
-                                type="button"
-                                onClick={() => removeItem(item.id)}
-                                className="text-red-400 hover:text-red-600 mt-2 shrink-0 text-lg leading-none"
-                              >
-                                ×
-                              </button>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-
-                      {form.deliveryType === 'ACCOUNT' && (
-                        <p className="text-xs text-gray-400 mt-1">
-                          Cada item deve ser um JSON válido.
-                        </p>
-                      )}
-
-                      <p className="text-xs text-gray-400 mt-1">
-                        🔢 Fila FIFO — o bot entrega o item #1 para a 1ª compra, o #2 para a 2ª, e
-                        assim por diante. O estoque é ajustado automaticamente.
-                      </p>
-                    </div>
-                  )}
-
-                  {form.deliveryType === 'FILE_MEDIA' && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">
-                        URL / file_id da mídia *
-                      </label>
-                      <input
-                        className="input"
-                        value={form.deliveryContent}
-                        onChange={(e) => setForm({ ...form, deliveryContent: e.target.value })}
-                        placeholder={filePlaceholder}
-                      />
-                      <p className="text-xs text-gray-400 mt-1">
-                        Cole uma URL pública (imagem/vídeo) ou um file_id do Telegram.
-                      </p>
-                    </div>
-                  )}
-
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      id="isActive"
-                      checked={form.isActive}
-                      onChange={(e) => setForm({ ...form, isActive: e.target.checked })}
-                      className="rounded"
-                    />
-                    <label htmlFor="isActive" className="text-sm font-medium text-gray-700">
-                      Produto ativo
-                    </label>
-                  </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Preço (R$) *</label>
+                  <input className="input" type="number" step="0.01" min="0.01" value={form.price} onChange={(e) => setForm({ ...form, price: e.target.value })} placeholder="29.90" />
                 </div>
-              )}
-
-              {activeTab === 'medias' && (
-                <div className="space-y-4">
-                  <p className="text-sm text-gray-500">
-                    Mídias enviadas ao comprador logo após a entrega principal (fotos, vídeos,
-                    arquivos extras).
-                  </p>
-
-                  {medias.length === 0 ? (
-                    <div className="text-center py-8 text-gray-400">
-                      <div className="text-3xl mb-2">🎬</div>
-                      <p className="text-sm">Nenhuma mídia extra cadastrada</p>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Estoque</label>
+                  {usesItemList ? (
+                    <div className="input bg-gray-50 text-gray-400 cursor-not-allowed select-none">
+                      Auto ({items.filter((i) => i.value.trim()).length} disponíveis)
                     </div>
                   ) : (
-                    <div className="space-y-3">
-                      {medias.map((media, idx) => (
-                        <MediaRow
-                          key={idx}
-                          media={media}
-                          idx={idx}
-                          onUpdate={updateMedia}
-                          onRemove={removeMedia}
-                        />
-                      ))}
-                    </div>
+                    <input className="input" type="number" min="0" value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} placeholder="Vazio = ilimitado" />
                   )}
+                </div>
+              </div>
 
-                  <button
-                    type="button"
-                    onClick={addMedia}
-                    className="w-full border-2 border-dashed border-gray-200 hover:border-blue-400 text-gray-400 hover:text-blue-500 rounded-xl py-3 text-sm font-medium transition-colors"
-                  >
-                    + Adicionar mídia
-                  </button>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Tipo de Entrega *</label>
+                <select className="input" value={form.deliveryType} onChange={(e) => { setForm({ ...form, deliveryType: e.target.value as DeliveryType, deliveryContent: '' }); setItems([newItem()]); }}>
+                  {DELIVERY_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                </select>
+              </div>
+
+              {usesItemList && (
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-sm font-medium text-gray-700">
+                      {form.deliveryType === 'ACCOUNT' ? 'Contas / Dados JSON *' : form.deliveryType === 'LINK' ? 'Links de acesso *' : 'Itens de entrega *'}
+                    </label>
+                    <button type="button" onClick={addItem} className="text-xs text-blue-600 hover:text-blue-700 font-medium">+ Adicionar item</button>
+                  </div>
+                  <div className="space-y-2">
+                    {items.map((item, idx) => (
+                      <div key={item.id} className="flex gap-2 items-start">
+                        <span className="text-xs text-gray-400 mt-2.5 w-5 text-right shrink-0">{idx + 1}.</span>
+                        <textarea
+                          className="input flex-1 font-mono text-xs"
+                          rows={form.deliveryType === 'ACCOUNT' ? 2 : 1}
+                          value={item.value}
+                          onChange={(e) => updateItemValue(item.id, e.target.value)}
+                          placeholder={
+                            form.deliveryType === 'ACCOUNT'
+                              ? '{"login": "user", "senha": "123", "url": "https://..."}'
+                              : form.deliveryType === 'LINK'
+                              ? 'https://...'
+                              : 'Conteúdo enviado ao comprador'
+                          }
+                        />
+                        {items.length > 1 && (
+                          <button type="button" onClick={() => removeItem(item.id)} className="text-red-400 hover:text-red-600 mt-2 shrink-0 text-lg leading-none">×</button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-1">
+                    🔢 Fila FIFO — apenas itens <strong>disponíveis</strong> são exibidos. Itens já entregues são removidos automaticamente.
+                  </p>
                 </div>
               )}
 
+              {form.deliveryType === 'FILE_MEDIA' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">URL / file_id da mídia *</label>
+                  <input className="input" value={form.deliveryContent} onChange={(e) => setForm({ ...form, deliveryContent: e.target.value })} placeholder="URL pública ou file_id do Telegram" />
+                </div>
+              )}
+
+              <div className="border border-blue-100 bg-blue-50 rounded-xl p-4 space-y-2">
+                <label className="block text-sm font-semibold text-blue-800">✉️ Mensagem de entrega (opcional)</label>
+                <p className="text-xs text-blue-600">
+                  Personalize o que o cliente recebe ao pagar. Use <code className="bg-blue-100 px-1 rounded">{'{{produto}}'}</code> e <code className="bg-blue-100 px-1 rounded">{'{{conteudo}}'}</code> como variáveis.
+                  Se deixar vazio, usa a mensagem padrão.
+                </p>
+                <textarea
+                  className="input text-sm font-mono"
+                  rows={4}
+                  value={form.confirmationMessage}
+                  onChange={(e) => setForm({ ...form, confirmationMessage: e.target.value })}
+                  placeholder={`🎉 Obrigado pela compra!\n\nSeu produto: {{produto}}\n\n{{conteudo}}\n\n✅ Aproveite!`}
+                />
+              </div>
+
+              <div className="border border-gray-200 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="block text-sm font-semibold text-gray-700">
+                    🎬 Mídias enviadas ao comprador
+                    {medias.filter((m) => m.url.trim()).length > 0 && (
+                      <span className="ml-2 text-xs bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">
+                        {medias.filter((m) => m.url.trim()).length}
+                      </span>
+                    )}
+                  </label>
+                  <button type="button" onClick={addMedia} className="text-xs text-blue-600 hover:text-blue-700 font-medium">+ Adicionar</button>
+                </div>
+                <p className="text-xs text-gray-400">A primeira mídia é enviada junto com a mensagem de entrega (como legenda).</p>
+                {medias.length === 0 ? (
+                  <button type="button" onClick={addMedia} className="w-full border-2 border-dashed border-gray-200 hover:border-blue-400 text-gray-400 hover:text-blue-500 rounded-xl py-3 text-sm font-medium transition-colors">
+                    + Adicionar mídia
+                  </button>
+                ) : (
+                  <div className="space-y-3">
+                    {medias.map((media, idx) => (
+                      <MediaRow key={idx} media={media} idx={idx} onUpdate={updateMedia} onRemove={removeMedia} />
+                    ))}
+                    <button type="button" onClick={addMedia} className="w-full border-2 border-dashed border-gray-200 hover:border-blue-400 text-gray-400 hover:text-blue-500 rounded-xl py-2 text-sm font-medium transition-colors">
+                      + Adicionar mídia
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <input type="checkbox" id="isActive" checked={form.isActive} onChange={(e) => setForm({ ...form, isActive: e.target.checked })} className="rounded" />
+                <label htmlFor="isActive" className="text-sm font-medium text-gray-700">Produto ativo</label>
+              </div>
+
               {fieldError && (
-                <div className="mt-4 bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm flex items-start gap-2">
+                <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm flex items-start gap-2">
                   <span>⚠️</span>
                   <span>{fieldError}</span>
                 </div>
               )}
 
-              <div className="flex gap-3 mt-6">
-                <button onClick={() => setShowModal(false)} className="btn-secondary flex-1">
-                  Cancelar
-                </button>
+              <div className="flex gap-3 pt-2">
+                <button onClick={() => setShowModal(false)} className="btn-secondary flex-1">Cancelar</button>
                 <button onClick={handleSave} disabled={saving} className="btn-primary flex-1">
                   {saving ? 'Salvando...' : editId ? 'Salvar Alterações' : 'Criar Produto'}
                 </button>

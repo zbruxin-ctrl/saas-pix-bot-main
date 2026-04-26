@@ -3,13 +3,12 @@ import path from 'path';
 
 // Em produção as variáveis já vêm injetadas pela plataforma (Railway/Render/Coolify)
 // Em desenvolvimento carrega o .env da raiz do monorepo
-// Tenta múltiplos caminhos para cobrir tanto `ts-node src/` quanto `node dist/`
 if (process.env.NODE_ENV !== 'production') {
   const candidates = [
-    path.resolve(process.cwd(), '.env'),                     // raiz onde o processo foi iniciado
-    path.resolve(__dirname, '../../../../.env'),             // relativo ao src/config (ts-node)
-    path.resolve(__dirname, '../../../../../.env'),          // relativo ao dist/config (node)
-    path.resolve(__dirname, '../../.env'),                   // dentro de apps/api
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(__dirname, '../../../../.env'),
+    path.resolve(__dirname, '../../../../../.env'),
+    path.resolve(__dirname, '../../.env'),
   ];
 
   for (const p of candidates) {
@@ -34,7 +33,9 @@ const envSchema = z.object({
   COOKIE_SECRET: z.string().min(32, 'COOKIE_SECRET deve ter pelo menos 32 caracteres'),
 
   MERCADO_PAGO_ACCESS_TOKEN: z.string().min(1, 'MERCADO_PAGO_ACCESS_TOKEN é obrigatório'),
-  MERCADO_PAGO_WEBHOOK_SECRET: z.string().default('dev_placeholder_troque_em_producao'),
+  // FIX BUG3: sem default — se não configurado em produção, o sistema detecta e avisa
+  // no lugar de silenciosamente descartar todos os webhooks com assinatura "inválida".
+  MERCADO_PAGO_WEBHOOK_SECRET: z.string().optional(),
 
   TELEGRAM_BOT_TOKEN: z.string().min(1, 'TELEGRAM_BOT_TOKEN é obrigatório'),
   TELEGRAM_BOT_SECRET: z.string().min(16, 'TELEGRAM_BOT_SECRET deve ter pelo menos 16 caracteres'),
@@ -42,6 +43,12 @@ const envSchema = z.object({
   API_URL: z.string().url().default('http://localhost:3001'),
   ADMIN_URL: z.string().url().default('http://localhost:3000'),
   BOT_WEBHOOK_URL: z.string().url().optional(),
+
+  // CORS extra: domínios adicionais separados por vírgula (ex: previews do Vercel específicos)
+  ALLOWED_ORIGINS: z.string().optional(),
+
+  // Cloudinary: configure CLOUDINARY_URL no Railway para usar Cloudinary.
+  CLOUDINARY_URL: z.string().optional(),
 
   REDIS_URL: z.string().optional(),
 });

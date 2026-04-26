@@ -1,4 +1,3 @@
-// Ponto de entrada da API
 import 'express-async-errors';
 import express from 'express';
 import cors from 'cors';
@@ -6,6 +5,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import morgan from 'morgan';
+import bcrypt from 'bcryptjs';
 
 import { env } from './config/env';
 import { logger } from './lib/logger';
@@ -18,33 +18,39 @@ import adminRouter from './routes/admin';
 import { startExpireJob, stopExpireJob } from './jobs/expirePayments';
 
 const app = express();
-
 app.set('trust proxy', 1);
 
-// ─── Segurança ──────────────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
 
-// Origens fixas permitidas (env vars)
-const fixedOrigins = env.NODE_ENV === 'development'
-  ? ['http://localhost:3000', 'http://localhost:3001', env.ADMIN_URL]
-  : [env.ADMIN_URL, env.BOT_WEBHOOK_URL].filter(Boolean) as string[];
+// CORS: allowlist explícita + todos os subdominios *.vercel.app (deploys dinâmicos)
+// Para adicionar domínios próprios, configure ALLOWED_ORIGINS no Railway:
+//   ALLOWED_ORIGINS=https://meudominio.com,https://outro.com
+const extraOrigins = (process.env.ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-// Função que valida origem dinamicamente
-// Aceita origens fixas + qualquer subdomínio *.vercel.app (previews e deployments)
+const allowedOrigins = [
+  env.ADMIN_URL,
+  ...(env.BOT_WEBHOOK_URL ? [env.BOT_WEBHOOK_URL] : []),
+  ...(env.NODE_ENV === 'development'
+    ? ['http://localhost:3000', 'http://localhost:3001']
+    : []),
+  ...extraOrigins,
+].filter(Boolean) as string[];
+
 function isOriginAllowed(origin: string | undefined): boolean {
-  if (!origin) return true; // server-to-server: proxy não envia Origin
-  if (fixedOrigins.includes(origin)) return true;
-  if (origin.endsWith('.vercel.app')) return true;
-  return false;
+  if (!origin) return true; // requests sem Origin (curl, Railway health checks)
+  // Permite qualquer subdomínio do Vercel (deploys de preview e produção)
+  if (/^https:\/\/[a-z0-9-]+-[a-z0-9-]+-[a-z0-9]+-projects\.vercel\.app$/.test(origin)) return true;
+  if (/^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/.test(origin)) return true;
+  return allowedOrigins.includes(origin);
 }
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (isOriginAllowed(origin)) {
-      callback(null, origin ?? '*'); // reflete a origin exata (obrigatório com credentials)
-    } else {
-      callback(new Error(`CORS: origem não permitida: ${origin}`));
-    }
+    if (isOriginAllowed(origin)) callback(null, origin ?? '*');
+    else callback(new Error(`CORS: origem nao permitida: ${origin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -52,47 +58,58 @@ app.use(cors({
   exposedHeaders: ['Set-Cookie'],
 }));
 
-// ─── Middlewares gerais ────────────────────────────────────────────────────────────
 app.use(compression());
 app.use(cookieParser(env.COOKIE_SECRET));
-app.use(morgan('combined', {
-  stream: { write: (message) => logger.info(message.trim()) },
-}));
-
-// Body parser (webhooks precisam raw)
+app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } }));
 app.use('/api/webhooks', express.raw({ type: 'application/json', limit: '1mb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// ─── Rotas ────────────────────────────────────────────────────────────────────
+// Serve uploads locais (fallback quando Cloudinary não está configurado)
+app.use('/uploads', express.static('uploads'));
+
+// --- Rota de setup inicial ---
+app.post('/setup-admin', async (req, res) => {
+  const setupSecret = process.env.SETUP_SECRET;
+  if (!setupSecret) { res.status(404).json({ error: 'Rota nao disponivel' }); return; }
+
+  const { secret, email, password } = req.body as Record<string, string>;
+  if (secret !== setupSecret) { res.status(403).json({ error: 'Secret invalido' }); return; }
+  if (!email || !password || password.length < 8) {
+    res.status(400).json({ error: 'Informe email e password (minimo 8 caracteres)' });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+  const admin = await prisma.adminUser.upsert({
+    where: { email: email.toLowerCase() },
+    update: { passwordHash, isActive: true },
+    create: { email: email.toLowerCase(), passwordHash, name: 'Admin Principal', role: 'SUPERADMIN', isActive: true },
+  });
+
+  logger.info(`[setup-admin] Admin criado/atualizado: ${admin.email}`);
+  res.json({ success: true, message: `Admin ${admin.email} pronto. Remova SETUP_SECRET do Railway agora.` });
+});
+
 app.use('/api/auth', authRouter);
 app.use('/api/payments', paymentsRouter);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/api/admin', adminRouter);
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// ─── Handler de erros ─────────────────────────────────────────────────────────────
 app.use(errorHandler);
 
-// ─── Inicialização ───────────────────────────────────────────────────────────────────
 const server = app.listen(env.PORT, () => {
-  logger.info(`🚀 API rodando na porta ${env.PORT}`);
-  logger.info(`🌍 Ambiente: ${env.NODE_ENV}`);
+  logger.info(`API rodando na porta ${env.PORT}`);
+  logger.info(`Ambiente: ${env.NODE_ENV}`);
   startExpireJob();
 });
 
-// Graceful shutdown
 async function shutdown(signal: string) {
   logger.info(`${signal} recebido. Encerrando servidor...`);
   stopExpireJob();
-  server.close(async () => {
-    await prisma.$disconnect();
-    logger.info('Servidor encerrado.');
-    process.exit(0);
-  });
+  server.close(async () => { await prisma.$disconnect(); process.exit(0); });
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

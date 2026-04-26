@@ -1,5 +1,9 @@
-// deliveryService.ts — entrega produto com proteção contra duplicidade
-// Usa StockItem.content como conteúdo prioritário para entrega FIFO
+// deliveryService.ts
+// FEAT: mensagem de confirmaçao customizável via product.metadata.confirmationMessage
+//       Variáveis: {{produto}}, {{conteudo}}
+// FIX:  primeira mídia é enviada com a mensagem como caption (acoplada).
+//       Se a mensagem ultrapassar 1024 chars (limite do Telegram),
+//       envia o texto separado primeiro e depois as mídias normalmente.
 import { DeliveryType, TelegramUser, Product } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { telegramService } from './telegramService';
@@ -7,12 +11,131 @@ import { stockService } from './stockService';
 import { logger } from '../lib/logger';
 
 const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 5000;
+const BASE_RETRY_MS = 3000;
+const MAX_RETRY_MS = 15000;
+
+/** Limite de caption do Telegram */
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+type MediaEntry = {
+  url: string;
+  mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
+  caption?: string;
+};
+
+/** Monta a mensagem de entrega — aplica template customizado ou retorna fallback padrão */
+function buildConfirmationMessage(
+  product: Product,
+  content: string,
+  deliveryType: DeliveryType
+): string {
+  const meta = product.metadata as Record<string, unknown> | null;
+  const custom = meta?.confirmationMessage as string | undefined;
+
+  if (custom && custom.trim()) {
+    return custom
+      .replace(/\{\{produto\}\}/g, product.name)
+      .replace(/\{\{conteudo\}\}/g, content);
+  }
+
+  switch (deliveryType) {
+    case DeliveryType.LINK:
+      return (
+        `🎉 *Pagamento confirmado!*\n\n` +
+        `📦 *Produto:* ${product.name}\n\n` +
+        `🔗 Acesse através do link abaixo:\n${content}\n\n` +
+        `⚠️ _Guarde este link em local seguro._`
+      );
+    case DeliveryType.ACCOUNT:
+      return `🎉 *Pagamento confirmado!*\n\n📦 *Produto:* ${product.name}\n\n${content}`;
+    default:
+      return `🎉 *Pagamento confirmado!*\n\n📦 *Produto:* ${product.name}\n\n${content}`;
+  }
+}
+
+/**
+ * Envia a mensagem acoplada à primeira mídia como caption.
+ * Fallback: se a mensagem ultrapassar 1024 chars, envia o texto primeiro
+ * e depois as mídias sem caption (para não perder nenhuma informação).
+ * Se não houver mídias, envia como texto puro.
+ */
+async function sendMessageWithMedias(
+  telegramId: string,
+  message: string,
+  medias: MediaEntry[]
+): Promise<void> {
+  const validMedias = medias.filter((m) => m.url.trim());
+
+  if (validMedias.length === 0) {
+    await telegramService.sendMessage(telegramId, message);
+    return;
+  }
+
+  const messageTooBig = message.length > TELEGRAM_CAPTION_LIMIT;
+
+  if (messageTooBig) {
+    // Fallback: texto separado + mídias sem caption de mensagem
+    logger.warn(
+      `Mensagem de entrega (${message.length} chars) ultrapassa limite de caption do Telegram (${TELEGRAM_CAPTION_LIMIT}). Enviando separado.`
+    );
+    await telegramService.sendMessage(telegramId, message);
+    for (const media of validMedias) {
+      await sendMedia(telegramId, media);
+    }
+    return;
+  }
+
+  // Caminho normal: primeira mídia com a mensagem como caption
+  const [first, ...rest] = validMedias;
+  await sendMedia(telegramId, first, message);
+
+  for (const media of rest) {
+    await sendMedia(telegramId, media);
+  }
+}
+
+async function sendMedia(
+  telegramId: string,
+  media: MediaEntry,
+  captionOverride?: string
+): Promise<void> {
+  const caption = captionOverride ?? media.caption;
+  try {
+    if (media.mediaType === 'VIDEO') {
+      await telegramService.sendVideo(telegramId, media.url, caption);
+    } else if (media.mediaType === 'IMAGE') {
+      await telegramService.sendPhoto(telegramId, media.url, caption);
+    } else {
+      const msg = caption ? `${caption}\n📎 ${media.url}` : `📎 ${media.url}`;
+      await telegramService.sendMessage(telegramId, msg);
+    }
+  } catch (err) {
+    logger.error(`Erro ao enviar mídia ${media.url}:`, err);
+    throw err;
+  }
+}
+
+function getProductMedias(product: Product): MediaEntry[] {
+  const meta = product.metadata as Record<string, unknown> | null;
+  if (!meta?.medias || !Array.isArray(meta.medias)) return [];
+  return meta.medias as MediaEntry[];
+}
+
+async function getOrderMedias(orderId: string): Promise<MediaEntry[]> {
+  const rows = await prisma.deliveryMedia.findMany({
+    where: { orderId },
+    orderBy: { sortOrder: 'asc' },
+  });
+  return rows.map((r) => ({
+    url: r.url,
+    mediaType: r.mediaType as 'IMAGE' | 'VIDEO' | 'FILE',
+    caption: r.caption ?? undefined,
+  }));
+}
 
 class DeliveryService {
 
   async deliver(orderId: string, telegramUser: TelegramUser, product: Product): Promise<void> {
-    // Proteção contra duplicidade: se já entregue, loga e sai sem reenviar
     const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order) throw new Error(`Pedido ${orderId} não encontrado`);
     if (order.status === 'DELIVERED') {
@@ -22,7 +145,6 @@ class DeliveryService {
 
     logger.info(`Iniciando entrega do pedido ${orderId}`);
 
-    // Conteúdo FIFO: usa o conteúdo da unidade reservada, se existir
     const itemContent = await stockService.getReservedItemContent(order.paymentId);
 
     let attempt = 0;
@@ -48,9 +170,7 @@ class DeliveryService {
           }),
         ]);
 
-        // Marca unidade como entregue no StockItem
         await stockService.markDelivered(order.paymentId, orderId);
-
         logger.info(`Pedido ${orderId} entregue com sucesso na tentativa ${attempt}`);
         return;
 
@@ -67,7 +187,10 @@ class DeliveryService {
           },
         });
 
-        if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS * attempt);
+        if (attempt < MAX_RETRIES) {
+          const delay = Math.min(BASE_RETRY_MS * Math.pow(2, attempt - 1), MAX_RETRY_MS);
+          await sleep(delay);
+        }
       }
     }
 
@@ -87,153 +210,73 @@ class DeliveryService {
     orderId: string,
     itemContent: string | null
   ): Promise<void> {
-    // itemContent substitui deliveryContent quando presente (FIFO por unidade)
-    const content = itemContent ?? product.deliveryContent;
+    const content = itemContent ?? product.deliveryContent ?? '';
+
+    const productMedias = getProductMedias(product);
+    const orderMedias = await getOrderMedias(orderId);
+    const allMedias = [...productMedias, ...orderMedias];
 
     switch (product.deliveryType) {
       case DeliveryType.TEXT:
-        await this.deliverText(telegramId, content, product.name);
+      case DeliveryType.LINK: {
+        const message = buildConfirmationMessage(product, content, product.deliveryType);
+        await sendMessageWithMedias(telegramId, message, allMedias);
         break;
-      case DeliveryType.LINK:
-        await this.deliverLink(telegramId, content, product.name);
+      }
+
+      case DeliveryType.ACCOUNT: {
+        const message = await this.buildAccountMessage(product, content);
+        await sendMessageWithMedias(telegramId, message, allMedias);
         break;
-      case DeliveryType.FILE_MEDIA:
-        await this.deliverFileMedia(telegramId, content, product.name);
+      }
+
+      case DeliveryType.FILE_MEDIA: {
+        const isVideo =
+          /\.(mp4|mov|avi|mkv|webm)(\?|$)/i.test(content) ||
+          content.includes('youtube.com') ||
+          content.includes('youtu.be');
+
+        const confirmMsg =
+          `🎉 *Pagamento confirmado!*\n\n` +
+          `📦 *Produto:* ${product.name}`;
+
+        const mainMedia: MediaEntry = {
+          url: content,
+          mediaType: isVideo ? 'VIDEO' : 'IMAGE',
+        };
+
+        // Usa sendMessageWithMedias para ter o mesmo fallback automático
+        await sendMessageWithMedias(telegramId, confirmMsg, [mainMedia, ...allMedias]);
         break;
-      case DeliveryType.ACCOUNT:
-        await this.deliverAccount(telegramId, content, product.name);
-        break;
+      }
+
       default:
         throw new Error(`Tipo de entrega desconhecido: ${product.deliveryType}`);
     }
-
-<<<<<<< HEAD
-    // Envia mídias extras configuradas no produto (imagens/vídeos do painel admin)
-    await this.sendProductMedias(telegramId, product);
-
-    // Envia mídias extras anexadas ao pedido (se existirem)
-=======
-    await this.sendProductMedias(telegramId, product);
->>>>>>> 5d6c0b3 (descrição do que mudou)
-    await this.sendOrderMedias(telegramId, orderId);
   }
 
-  private async deliverText(telegramId: string, content: string, productName: string): Promise<void> {
-    const message = `🎉 *Pagamento confirmado!*\n\n📦 *Produto:* ${productName}\n\n${content}`;
-    await telegramService.sendMessage(telegramId, message);
-  }
+  private async buildAccountMessage(product: Product, content: string): Promise<string> {
+    const meta = product.metadata as Record<string, unknown> | null;
+    const custom = meta?.confirmationMessage as string | undefined;
 
-  private async deliverLink(telegramId: string, link: string, productName: string): Promise<void> {
-    const message =
-      `🎉 *Pagamento confirmado!*\n\n` +
-      `📦 *Produto:* ${productName}\n\n` +
-      `🔗 Acesse através do link abaixo:\n${link}\n\n` +
-      `⚠️ _Guarde este link em local seguro._`;
-    await telegramService.sendMessage(telegramId, message);
-  }
-
-  private async deliverFileMedia(telegramId: string, url: string, productName: string): Promise<void> {
-    const message =
-      `🎉 *Pagamento confirmado!*\n\n` +
-      `📦 *Produto:* ${productName}\n\n` +
-      `📎 Seu conteúdo está disponível abaixo:`;
-    await telegramService.sendMessage(telegramId, message);
-
-<<<<<<< HEAD
-    const isVideo = /\.(mp4|mov|avi|mkv|webm)(\?|$)/i.test(url) ||
-                    url.includes('youtube.com') ||
-                    url.includes('youtu.be');
-=======
-    const isVideo =
-      /\.(mp4|mov|avi|mkv|webm)(\?|$)/i.test(url) ||
-      url.includes('youtube.com') ||
-      url.includes('youtu.be');
->>>>>>> 5d6c0b3 (descrição do que mudou)
-
-    if (isVideo) {
-      await telegramService.sendVideo(telegramId, url);
-    } else {
-      await telegramService.sendPhoto(telegramId, url);
+    if (custom && custom.trim()) {
+      return buildConfirmationMessage(product, content, DeliveryType.ACCOUNT);
     }
-  }
 
-  private async deliverAccount(telegramId: string, content: string, productName: string): Promise<void> {
     let parsedContent: Record<string, unknown>;
     try {
       parsedContent = JSON.parse(content);
     } catch {
-      await this.deliverText(telegramId, content, productName);
-      return;
+      return buildConfirmationMessage(product, content, DeliveryType.ACCOUNT);
     }
 
-    const message =
+    return (
       `🎉 *${parsedContent.message || 'Acesso liberado!'}*\n\n` +
-      `📦 *Produto:* ${productName}\n\n` +
+      `📦 *Produto:* ${product.name}\n\n` +
       (parsedContent.accessUrl ? `🌐 *URL de acesso:* ${parsedContent.accessUrl}\n\n` : '') +
       (parsedContent.instructions ? `📋 *Instruções:* ${parsedContent.instructions}\n\n` : '') +
-      `⚠️ _Salve estas informações em local seguro._`;
-
-    await telegramService.sendMessage(telegramId, message);
-  }
-
-<<<<<<< HEAD
-  // Envia mídias extras configuradas no produto via painel admin (salvas em product.metadata)
-=======
->>>>>>> 5d6c0b3 (descrição do que mudou)
-  private async sendProductMedias(telegramId: string, product: Product): Promise<void> {
-    const meta = product.metadata as Record<string, unknown> | null;
-    if (!meta?.medias || !Array.isArray(meta.medias)) return;
-
-    const medias = meta.medias as Array<{
-      url: string;
-      mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
-      caption?: string;
-    }>;
-
-    for (const media of medias) {
-      try {
-        if (media.mediaType === 'VIDEO') {
-          await telegramService.sendVideo(telegramId, media.url, media.caption);
-        } else if (media.mediaType === 'IMAGE') {
-          await telegramService.sendPhoto(telegramId, media.url, media.caption);
-        } else {
-          const msg = media.caption
-            ? `📎 ${media.caption}\n${media.url}`
-            : `📎 Arquivo: ${media.url}`;
-          await telegramService.sendMessage(telegramId, msg);
-        }
-      } catch (err) {
-        logger.error(`Erro ao enviar mídia extra do produto ${product.id}:`, err);
-      }
-    }
-  }
-
-<<<<<<< HEAD
-  // Envia mídias extras anexadas ao pedido no painel admin
-=======
->>>>>>> 5d6c0b3 (descrição do que mudou)
-  private async sendOrderMedias(telegramId: string, orderId: string): Promise<void> {
-    const medias = await prisma.deliveryMedia.findMany({
-      where: { orderId },
-      orderBy: { sortOrder: 'asc' },
-    });
-
-    for (const media of medias) {
-      try {
-        if (media.mediaType === 'VIDEO') {
-          await telegramService.sendVideo(telegramId, media.url, media.caption ?? undefined);
-        } else if (media.mediaType === 'IMAGE') {
-          await telegramService.sendPhoto(telegramId, media.url, media.caption ?? undefined);
-        } else {
-          const msg = media.caption
-            ? `📎 ${media.caption}\n${media.url}`
-            : `📎 Arquivo: ${media.url}`;
-          await telegramService.sendMessage(telegramId, msg);
-        }
-      } catch (err) {
-        logger.error(`Erro ao enviar mídia ${media.id} para pedido ${orderId}:`, err);
-      }
-    }
+      `⚠️ _Salve estas informações em local seguro._`
+    );
   }
 }
 

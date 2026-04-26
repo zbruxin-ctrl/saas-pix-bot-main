@@ -5,24 +5,7 @@ import { getPayments } from '@/lib/api';
 import { useRouter } from 'next/navigation';
 import StatusBadge from '@/components/admin/StatusBadge';
 import { formatCurrency, formatDate } from '@/lib/utils';
-
-interface Payment {
-  id: string;
-  amount: number;
-  status: string;
-  createdAt: string;
-  approvedAt: string | null;
-  product: { name: string };
-  telegramUser: { username: string | null; firstName: string | null; telegramId: string };
-  mercadoPagoId: string | null;
-}
-
-interface PaginatedData {
-  data: Payment[];
-  total: number;
-  page: number;
-  totalPages: number;
-}
+import type { PaymentDTO, PaginatedResponse } from '@saas-pix/shared';
 
 const STATUS_OPTIONS = [
   { value: '', label: 'Todos os status' },
@@ -35,7 +18,7 @@ const STATUS_OPTIONS = [
 
 export default function PaymentsPage() {
   const router = useRouter();
-  const [result, setResult] = useState<PaginatedData | null>(null);
+  const [result, setResult] = useState<PaginatedResponse<PaymentDTO> | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('');
@@ -44,8 +27,8 @@ export default function PaymentsPage() {
   const fetchPayments = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await getPayments({ page, status: status || undefined, search: search || undefined });
-      setResult(data);
+      const res = await getPayments({ page, status: status || undefined, search: search || undefined });
+      setResult(res.data ?? null);
     } catch {
       //
     } finally {
@@ -120,11 +103,11 @@ export default function PaymentsPage() {
                   <tr key={p.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
                     <td className="px-4 py-3">
                       <div className="font-medium text-gray-900">
-                        {p.telegramUser.firstName || p.telegramUser.username || '—'}
+                        {p.telegramUser?.firstName || p.telegramUser?.username || '—'}
                       </div>
-                      <div className="text-gray-400 text-xs">ID: {p.telegramUser.telegramId}</div>
+                      <div className="text-gray-400 text-xs">ID: {p.telegramUser?.telegramId}</div>
                     </td>
-                    <td className="px-4 py-3 text-gray-700">{p.product.name}</td>
+                    <td className="px-4 py-3 text-gray-700">{p.product?.name}</td>
                     <td className="px-4 py-3 font-semibold text-gray-900">
                       {formatCurrency(p.amount)}
                     </td>

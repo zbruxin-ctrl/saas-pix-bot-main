@@ -1,5 +1,8 @@
 // Serviço de integração com Mercado Pago
 // Documentação: https://www.mercadopago.com.br/developers/pt/reference
+// FIX B7: idempotencyKey usa apenas externalReference SEM Date.now()
+//   → retries do mesmo pagamento retornam resposta cacheada do MP
+//   → evita criar dois PIX distintos para o mesmo pedido
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
@@ -8,7 +11,6 @@ import { logger } from '../lib/logger';
 interface PixPaymentData {
   transactionAmount: number;
   description: string;
-  payerEmail: string;
   payerName: string;
   externalReference: string;
   notificationUrl: string;
@@ -43,7 +45,6 @@ interface MercadoPagoPaymentDetail {
   };
 }
 
-// Verifica se a URL é pública HTTPS (não é localhost)
 function isPublicUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -60,12 +61,10 @@ function isPublicUrl(url: string): boolean {
   }
 }
 
-// O MP exige e-mail com domínio válido — .user é rejeitado
 function buildPayerEmail(externalReference: string): string {
   return `telegram.${externalReference}@pagador.com.br`;
 }
 
-// Extrai a mensagem real do erro do Mercado Pago
 function extractMpError(error: unknown): string {
   const axiosError = error as AxiosError<{
     message?: string;
@@ -97,7 +96,6 @@ class MercadoPagoService {
       timeout: 30000,
     });
 
-    // Interceptor: loga SEMPRE o corpo completo do erro do MP
     this.client.interceptors.response.use(
       (response) => response,
       (error: AxiosError) => {
@@ -112,14 +110,16 @@ class MercadoPagoService {
   }
 
   async createPixPayment(data: PixPaymentData): Promise<MercadoPagoPixResponse> {
-    const idempotencyKey = `pix_${data.externalReference}_${Date.now()}`;
+    // FIX B7: chave de idempotência baseada APENAS no externalReference (paymentId UUID).
+    // Assim retries do mesmo pagamento retornam a resposta cacheada do MP
+    // em vez de criar um segundo PIX para o mesmo pedido.
+    const idempotencyKey = `pix_${data.externalReference}`;
 
     const requestBody: Record<string, unknown> = {
       transaction_amount: data.transactionAmount,
       description: data.description.substring(0, 255),
       payment_method_id: 'pix',
       payer: {
-        // Domínio .com.br é aceito pelo MP — .user era rejeitado
         email: buildPayerEmail(data.externalReference),
         first_name: (data.payerName.split(' ')[0] || 'Usuario').substring(0, 50),
         last_name: (data.payerName.split(' ').slice(1).join(' ') || 'Telegram').substring(0, 50),
@@ -128,7 +128,6 @@ class MercadoPagoService {
       date_of_expiration: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
     };
 
-    // Só envia notification_url se for HTTPS público — MP rejeita localhost
     if (isPublicUrl(data.notificationUrl)) {
       requestBody.notification_url = data.notificationUrl;
     } else {

@@ -1,34 +1,29 @@
-// Job agendado: expira pagamentos pendentes há mais de 30 minutos
-// Deve ser inicializado uma vez no index.ts com startExpireJob()
-import { PaymentStatus } from '@prisma/client';
+// Job agendado: expira pagamentos pendentes cujo PIX já passou do prazo
+// FIX B4/L2/M10: usa pixExpiresAt < now (campo correto do PIX) ao invés de createdAt < cutoff
+//   Isso garante que apenas PIX realmente vencidos sejam expirados.
+//   Lógica extraída para paymentService.findExpiredPayments() (M10).
 import { prisma } from '../lib/prisma';
 import { paymentService } from '../services/paymentService';
 import { stockService } from '../services/stockService';
 import { logger } from '../lib/logger';
 
-const JOB_INTERVAL_MS = 60 * 1000;    // roda a cada 1 minuto
-const PAYMENT_TTL_MINUTES = 30;
+const JOB_INTERVAL_MS = 60 * 1000; // roda a cada 1 minuto
 
 let jobTimer: ReturnType<typeof setInterval> | null = null;
 
 async function runExpireJob(): Promise<void> {
   try {
-    const cutoff = new Date(Date.now() - PAYMENT_TTL_MINUTES * 60 * 1000);
+    const now = new Date();
 
-    // Busca pagamentos pendentes que passaram do TTL
-    const expiredPayments = await prisma.payment.findMany({
-      where: {
-        status: PaymentStatus.PENDING,
-        createdAt: { lt: cutoff },
-      },
-      select: { id: true },
-    });
+    // FIX B4: busca por pixExpiresAt < now — não por createdAt
+    // Isso respeita o prazo real do QR Code (definido pelo Mercado Pago, geralmente 30min)
+    // e evita expirar pagamentos criados há 31min mas cujo PIX ainda é válido.
+    const expiredPayments = await paymentService.findExpiredPaymentIds(now);
 
     if (expiredPayments.length > 0) {
       logger.info(`[ExpireJob] ${expiredPayments.length} pagamentos a expirar`);
-
       await Promise.allSettled(
-        expiredPayments.map((p) => paymentService.cancelExpiredPayment(p.id))
+        expiredPayments.map((id) => paymentService.cancelExpiredPayment(id))
       );
     }
 
@@ -42,15 +37,9 @@ async function runExpireJob(): Promise<void> {
 
 export function startExpireJob(): void {
   if (jobTimer) return;
-
   logger.info(`[ExpireJob] Iniciado — intervalo: ${JOB_INTERVAL_MS / 1000}s`);
-
-  // Executa imediatamente na inicialização
   void runExpireJob();
-
-  jobTimer = setInterval(() => {
-    void runExpireJob();
-  }, JOB_INTERVAL_MS);
+  jobTimer = setInterval(() => { void runExpireJob(); }, JOB_INTERVAL_MS);
 }
 
 export function stopExpireJob(): void {
