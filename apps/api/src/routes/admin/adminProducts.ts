@@ -28,7 +28,7 @@ const listQuerySchema = z.object({
   perPage: z.string().default('20').transform(Number),
 });
 
-// ─── Multer: diskStorage com fallback para Cloudinary ────────────────────────
+// ─── Multer ───────────────────────────────────────────────────────────────────
 const uploadDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -43,7 +43,7 @@ const storage: StorageEngine = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (_req: Request, file: Express.Multer.File, cb: FileFilterCallback) => {
     const allowed = /image|video|application\/pdf|application\/zip|application\/octet-stream/;
     if (allowed.test(file.mimetype)) cb(null, true);
@@ -51,7 +51,6 @@ const upload = multer({
   },
 });
 
-// Helper: tenta fazer upload para Cloudinary se a env estiver configurada
 async function uploadToCloudinary(
   filePath: string,
   originalname: string,
@@ -59,7 +58,6 @@ async function uploadToCloudinary(
 ): Promise<string | null> {
   const cloudinaryUrl = process.env.CLOUDINARY_URL;
   if (!cloudinaryUrl) return null;
-
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { v2: cloudinary } = require('cloudinary');
@@ -76,57 +74,48 @@ async function uploadToCloudinary(
   }
 }
 
+/** Tipos FIFO que usam StockItems como fila */
+const FIFO_TYPES = ['TEXT', 'LINK', 'ACCOUNT'];
+
 /**
- * Se deliveryContent for um JSON de array (ex: ["bb", "AA"]), sincroniza os
- * itens como StockItems FIFO do produto, apagando os AVAILABLE antigos e
- * criando os novos na ordem recebida.
- *
- * Retorna true se fez a sincronização (e o caller deve limpar deliveryContent).
+ * Sincroniza itens FIFO recebidos como array para StockItems.
+ * Apaga apenas os AVAILABLE (preserva RESERVED/CONFIRMED/DELIVERED).
+ * Zera o deliveryContent do produto (StockItem é a única fonte de verdade).
+ * Retorna true se sincronizou.
  */
-async function syncDeliveryContentToStockItems(
+async function syncFifoItems(
   productId: string,
-  deliveryContent: string,
+  items: string[],
   deliveryType: string
 ): Promise<boolean> {
-  // Apenas tipos que fazem sentido como fila FIFO
-  if (deliveryType !== 'TEXT' && deliveryType !== 'LINK' && deliveryType !== 'ACCOUNT') {
-    return false;
-  }
+  if (!FIFO_TYPES.includes(deliveryType)) return false;
+  const valid = items.map((v) => v.trim()).filter(Boolean);
+  if (valid.length === 0) return false;
 
-  let items: string[];
-  try {
-    const parsed = JSON.parse(deliveryContent);
-    if (!Array.isArray(parsed) || parsed.length === 0) return false;
-    items = parsed.map((v: unknown) => String(v)).filter((s) => s.trim().length > 0);
-    if (items.length === 0) return false;
-  } catch {
-    // Não é JSON array — conteúdo simples (ex: texto único ou link)
-    return false;
-  }
-
-  // Remove apenas os StockItems AVAILABLE (preserva RESERVED/CONFIRMED/DELIVERED)
-  await prisma.stockItem.deleteMany({
-    where: { productId, status: StockItemStatus.AVAILABLE },
+  await prisma.$transaction(async (tx) => {
+    // Remove apenas os disponíveis (não toca nos entregues ou reservados)
+    await tx.stockItem.deleteMany({
+      where: { productId, status: StockItemStatus.AVAILABLE },
+    });
+    await tx.stockItem.createMany({
+      data: valid.map((content) => ({
+        productId,
+        content,
+        status: StockItemStatus.AVAILABLE,
+      })),
+    });
+    // Limpa deliveryContent — StockItem é a fonte de verdade
+    await tx.product.update({
+      where: { id: productId },
+      data: { deliveryContent: '__FIFO__' },
+    });
   });
 
-  // Cria os novos itens na ordem recebida
-  await prisma.stockItem.createMany({
-    data: items.map((content) => ({
-      productId,
-      content,
-      status: StockItemStatus.AVAILABLE,
-    })),
-  });
-
-  logger.info(
-    `[adminProducts] ${items.length} StockItems sincronizados para produto=${productId}`
-  );
+  logger.info(`[adminProducts] ${valid.length} StockItems FIFO sincronizados para produto=${productId}`);
   return true;
 }
 
-// ─── CRÍTICO: /upload DEVE vir ANTES de /:id ─────────────────────────────────
-
-// POST /api/admin/products/upload
+// ─── Upload ────────────────────────────────────────────────────────────────────
 adminProductsRouter.post(
   '/upload',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -136,14 +125,12 @@ adminProductsRouter.post(
       res.status(400).json({ success: false, error: 'Nenhum arquivo enviado' });
       return;
     }
-
     let url: string;
     const cloudinaryResult = await uploadToCloudinary(
       req.file.path,
       req.file.originalname,
       req.file.mimetype
     );
-
     if (cloudinaryResult) {
       fs.unlink(req.file.path, () => {});
       url = cloudinaryResult;
@@ -151,29 +138,21 @@ adminProductsRouter.post(
       const baseUrl = process.env.API_URL ?? '';
       url = `${baseUrl}/uploads/${req.file.filename}`;
     }
-
     res.status(201).json({ success: true, data: { url, filename: req.file.filename } });
   }
 );
 
-// ─── Produtos ─────────────────────────────────────────────────────────────────
-
+// ─── Listagem ─────────────────────────────────────────────────────────────────
 adminProductsRouter.get(
   '/',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const { page, perPage } = listQuerySchema.parse(req.query);
     const skip = (page - 1) * perPage;
-
     const [products, total] = await Promise.all([
-      prisma.product.findMany({
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: perPage,
-      }),
+      prisma.product.findMany({ orderBy: { createdAt: 'desc' }, skip, take: perPage }),
       prisma.product.count(),
     ]);
-
     res.json({
       success: true,
       data: {
@@ -187,61 +166,44 @@ adminProductsRouter.get(
   }
 );
 
-// M7: GET /stock — visão consolidada de estoque por produto
+// ─── Estoque consolidado ───────────────────────────────────────────────────────
 adminProductsRouter.get(
   '/stock',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (_req: AuthenticatedRequest, res: Response) => {
     const products = await prisma.product.findMany({
       where: { isActive: true },
-      select: {
-        id: true,
-        name: true,
-        stock: true,
-        _count: { select: { stockItems: true } },
-      },
+      select: { id: true, name: true, stock: true, _count: { select: { stockItems: true } } },
     });
-
     const result = await Promise.all(
       products.map(async (p) => {
         if (p._count.stockItems > 0) {
-          const available = await prisma.stockItem.count({
-            where: { productId: p.id, status: 'AVAILABLE' },
-          });
-          const reserved = await prisma.stockItem.count({
-            where: { productId: p.id, status: 'RESERVED' },
-          });
-          return {
-            productId: p.id,
-            productName: p.name,
-            mode: 'FIFO' as const,
-            available,
-            reserved,
-            total: p._count.stockItems,
-            stockField: null,
-          };
+          const available = await prisma.stockItem.count({ where: { productId: p.id, status: 'AVAILABLE' } });
+          const reserved = await prisma.stockItem.count({ where: { productId: p.id, status: 'RESERVED' } });
+          return { productId: p.id, productName: p.name, mode: 'FIFO' as const, available, reserved, total: p._count.stockItems, stockField: null };
         }
-        return {
-          productId: p.id,
-          productName: p.name,
-          mode: p.stock !== null ? ('NUMERIC' as const) : ('UNLIMITED' as const),
-          available: p.stock,
-          reserved: null,
-          total: null,
-          stockField: p.stock,
-        };
+        return { productId: p.id, productName: p.name, mode: p.stock !== null ? ('NUMERIC' as const) : ('UNLIMITED' as const), available: p.stock, reserved: null, total: null, stockField: p.stock };
       })
     );
-
     res.json({ success: true, data: result });
   }
 );
 
+// ─── GET /:id — inclui stockItems AVAILABLE para o admin ─────────────────────
 adminProductsRouter.get(
   '/:id',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const product = await prisma.product.findUnique({ where: { id: req.params.id } });
+    const product = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      include: {
+        stockItems: {
+          where: { status: StockItemStatus.AVAILABLE },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true, content: true, status: true, createdAt: true },
+        },
+      },
+    });
     if (!product) {
       res.status(404).json({ success: false, error: 'Produto não encontrado' });
       return;
@@ -250,51 +212,76 @@ adminProductsRouter.get(
   }
 );
 
+// ─── POST / — criar produto ───────────────────────────────────────────────────
 adminProductsRouter.post(
   '/',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const data = productSchema.parse(req.body);
+    const isFifo = FIFO_TYPES.includes(data.deliveryType);
 
-    const product = await prisma.product.create({
-      data: { ...data, metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined },
-    });
+    // Para FIFO, armazena um marcador; itens vêm via StockItems
+    const productData = {
+      ...data,
+      deliveryContent: isFifo ? '__FIFO__' : data.deliveryContent,
+      metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined,
+    };
 
-    // Se deliveryContent for um array JSON, converte em StockItems automaticamente
-    const synced = await syncDeliveryContentToStockItems(
-      product.id,
-      data.deliveryContent,
-      data.deliveryType
-    );
-    if (synced) {
-      // Atualiza deliveryContent para sinalizar que usa FIFO (mantém o JSON como referência)
-      logger.info(`[adminProducts] Produto ${product.id} criado com StockItems FIFO`);
+    const product = await prisma.product.create({ data: productData });
+
+    // Sincroniza itens FIFO se vier como array JSON
+    if (isFifo) {
+      try {
+        const parsed = JSON.parse(data.deliveryContent);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          await syncFifoItems(product.id, parsed.map(String), data.deliveryType);
+        }
+      } catch {
+        // deliveryContent não é array — item único
+        if (data.deliveryContent && data.deliveryContent !== '__FIFO__') {
+          await syncFifoItems(product.id, [data.deliveryContent], data.deliveryType);
+        }
+      }
     }
 
     res.status(201).json({ success: true, data: { ...product, price: Number(product.price) } });
   }
 );
 
+// ─── PUT /:id — atualizar produto ─────────────────────────────────────────────
 adminProductsRouter.put(
   '/:id',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const data = productSchema.partial().parse(req.body);
+    const isFifo = data.deliveryType ? FIFO_TYPES.includes(data.deliveryType) : false;
+
+    const updateData: Prisma.ProductUpdateInput = {
+      ...data,
+      metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined,
+    };
+
+    // Para FIFO nunca armazena os itens no deliveryContent
+    if (isFifo) {
+      updateData.deliveryContent = '__FIFO__';
+    }
 
     const product = await prisma.product.update({
       where: { id: req.params.id },
-      data: { ...data, metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined },
+      data: updateData,
     });
 
-    // Se deliveryContent for um array JSON, sincroniza os StockItems
-    if (data.deliveryContent && data.deliveryType) {
-      const synced = await syncDeliveryContentToStockItems(
-        product.id,
-        data.deliveryContent,
-        data.deliveryType
-      );
-      if (synced) {
-        logger.info(`[adminProducts] StockItems FIFO sincronizados para produto ${product.id}`);
+    // Sincroniza os itens FIFO enviados pelo frontend
+    if (isFifo && data.deliveryContent && data.deliveryContent !== '__FIFO__') {
+      try {
+        const parsed = JSON.parse(data.deliveryContent);
+        if (Array.isArray(parsed)) {
+          await syncFifoItems(product.id, parsed.map(String), data.deliveryType!);
+        }
+      } catch {
+        if (data.deliveryContent) {
+          await syncFifoItems(product.id, [data.deliveryContent], data.deliveryType!);
+        }
       }
     }
 
@@ -302,6 +289,7 @@ adminProductsRouter.put(
   }
 );
 
+// ─── DELETE /:id ───────────────────────────────────────────────────────────────
 adminProductsRouter.delete(
   '/:id',
   requireRole('SUPERADMIN'),
@@ -311,21 +299,13 @@ adminProductsRouter.delete(
   }
 );
 
-// ─── Mídias de configuração do produto (medias-config) ───────────────────────
-
+// ─── Mídias de configuração do produto ────────────────────────────────────────
 adminProductsRouter.get(
   '/:id/medias-config',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const product = await prisma.product.findUnique({
-      where: { id: req.params.id },
-      select: { metadata: true },
-    });
-    if (!product) {
-      res.status(404).json({ success: false, error: 'Produto não encontrado' });
-      return;
-    }
-
+    const product = await prisma.product.findUnique({ where: { id: req.params.id }, select: { metadata: true } });
+    if (!product) { res.status(404).json({ success: false, error: 'Produto não encontrado' }); return; }
     const meta = product.metadata as Record<string, unknown> | null;
     const medias = Array.isArray(meta?.medias) ? meta!.medias : [];
     res.json({ success: true, data: medias });
@@ -333,13 +313,11 @@ adminProductsRouter.get(
 );
 
 const mediasConfigSchema = z.object({
-  medias: z.array(
-    z.object({
-      url: z.string().min(1),
-      mediaType: z.enum(['IMAGE', 'VIDEO', 'FILE']),
-      caption: z.string().max(500).optional(),
-    })
-  ),
+  medias: z.array(z.object({
+    url: z.string().min(1),
+    mediaType: z.enum(['IMAGE', 'VIDEO', 'FILE']),
+    caption: z.string().max(500).optional(),
+  })),
 });
 
 adminProductsRouter.put(
@@ -347,39 +325,24 @@ adminProductsRouter.put(
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const { medias } = mediasConfigSchema.parse(req.body);
-
-    const product = await prisma.product.findUnique({
-      where: { id: req.params.id },
-      select: { metadata: true },
-    });
-    if (!product) {
-      res.status(404).json({ success: false, error: 'Produto não encontrado' });
-      return;
-    }
-
+    const product = await prisma.product.findUnique({ where: { id: req.params.id }, select: { metadata: true } });
+    if (!product) { res.status(404).json({ success: false, error: 'Produto não encontrado' }); return; }
     const existingMeta = (product.metadata as Record<string, unknown>) ?? {};
     const updatedMeta: Prisma.InputJsonValue = { ...existingMeta, medias };
-
-    await prisma.product.update({
-      where: { id: req.params.id },
-      data: { metadata: updatedMeta },
-    });
-
+    await prisma.product.update({ where: { id: req.params.id }, data: { metadata: updatedMeta } });
     res.json({ success: true, data: medias });
   }
 );
 
 // ─── StockItem CRUD ───────────────────────────────────────────────────────────
-const stockItemSchema = z.object({
-  content: z.string().min(1),
-});
+const stockItemSchema = z.object({ content: z.string().min(1) });
 
 adminProductsRouter.get(
   '/:productId/stock-items',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const items = await prisma.stockItem.findMany({
-      where: { productId: req.params.productId },
+      where: { productId: req.params.productId, status: StockItemStatus.AVAILABLE },
       orderBy: { createdAt: 'asc' },
     });
     res.json({ success: true, data: items });
@@ -419,10 +382,7 @@ adminProductsRouter.get(
   '/orders/:orderId/medias',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const medias = await prisma.deliveryMedia.findMany({
-      where: { orderId: req.params.orderId },
-      orderBy: { sortOrder: 'asc' },
-    });
+    const medias = await prisma.deliveryMedia.findMany({ where: { orderId: req.params.orderId }, orderBy: { sortOrder: 'asc' } });
     res.json({ success: true, data: medias });
   }
 );
@@ -432,9 +392,7 @@ adminProductsRouter.post(
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const data = mediaSchema.parse(req.body);
-    const media = await prisma.deliveryMedia.create({
-      data: { orderId: req.params.orderId, ...data },
-    });
+    const media = await prisma.deliveryMedia.create({ data: { orderId: req.params.orderId, ...data } });
     res.status(201).json({ success: true, data: media });
   }
 );

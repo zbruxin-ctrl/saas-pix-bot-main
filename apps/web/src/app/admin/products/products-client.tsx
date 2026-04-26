@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ProductDTO, DeliveryType } from '@saas-pix/shared';
+import type { ProductDTO, DeliveryType, StockItemDTO } from '@saas-pix/shared';
 import {
   getProducts,
   createProduct,
@@ -10,6 +10,8 @@ import {
   getProductMedias,
   updateProductMedias,
   uploadMediaFile,
+  getStockItems,
+  createStockItem,
   type ProductMedia,
 } from '@/lib/api';
 import { formatCurrency } from '@/lib/utils';
@@ -18,6 +20,7 @@ import ConfirmModal from '@/components/admin/ConfirmModal';
 
 interface Product extends ProductDTO {
   deliveryContent?: string | null;
+  stockItems?: StockItemDTO[];
   _count?: { payments: number; orders: number };
 }
 
@@ -58,19 +61,17 @@ const EMPTY_FORM = {
   stock: '',
 };
 
+const FIFO_TYPES = ['ACCOUNT', 'LINK', 'TEXT'];
+
 function itemsToContent(items: DeliveryItem[]): string {
   const vals = items.map((i) => i.value.trim()).filter(Boolean);
   return JSON.stringify(vals);
 }
 
-function contentToItems(content: string): DeliveryItem[] {
-  try {
-    const parsed = JSON.parse(content);
-    if (Array.isArray(parsed)) {
-      return parsed.map((v, i) => ({ id: String(i), value: String(v) }));
-    }
-  } catch {}
-  return [{ id: '0', value: content }];
+/** Converte StockItems AVAILABLE em DeliveryItems para o formulário */
+function stockItemsToDeliveryItems(stockItems: StockItemDTO[]): DeliveryItem[] {
+  if (!stockItems || stockItems.length === 0) return [newItem()];
+  return stockItems.map((s) => ({ id: s.id, value: s.content }));
 }
 
 function newItem(): DeliveryItem {
@@ -84,21 +85,16 @@ function newMedia(): ProductMedia {
 function validate(form: typeof EMPTY_FORM, items: DeliveryItem[]): string | null {
   if (!form.name.trim()) return 'O nome do produto é obrigatório.';
   if (!form.description.trim()) return 'A descrição é obrigatória.';
-
   const price = parseFloat(form.price);
   if (isNaN(price) || price <= 0) return 'Informe um preço válido maior que zero.';
 
-  const usesItems = ['ACCOUNT', 'LINK', 'TEXT'].includes(form.deliveryType);
-
+  const usesItems = FIFO_TYPES.includes(form.deliveryType);
   if (usesItems) {
     const filled = items.filter((i) => i.value.trim());
     if (filled.length === 0) return 'Adicione pelo menos um item de entrega.';
-
     if (form.deliveryType === 'ACCOUNT') {
       for (const item of filled) {
-        try {
-          JSON.parse(item.value);
-        } catch {
+        try { JSON.parse(item.value); } catch {
           return `O item "${item.value.slice(0, 30)}..." não é um JSON válido.`;
         }
       }
@@ -106,7 +102,6 @@ function validate(form: typeof EMPTY_FORM, items: DeliveryItem[]): string | null
   } else if (form.deliveryType === 'FILE_MEDIA') {
     if (!form.deliveryContent.trim()) return 'Informe a URL ou file_id da mídia.';
   }
-
   return null;
 }
 
@@ -144,21 +139,15 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
     <div className="border border-gray-200 rounded-xl p-3 space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-gray-500">Mídia {idx + 1}</span>
-        <button type="button" onClick={() => onRemove(idx)} className="text-red-400 hover:text-red-600 text-sm">
-          Remover
-        </button>
+        <button type="button" onClick={() => onRemove(idx)} className="text-red-400 hover:text-red-600 text-sm">Remover</button>
       </div>
-
       <select
         className="input text-sm"
         value={media.mediaType}
         onChange={(e) => onUpdate(idx, { mediaType: e.target.value as ProductMedia['mediaType'], url: '' })}
       >
-        {MEDIA_TYPES.map((t) => (
-          <option key={t.value} value={t.value}>{t.label}</option>
-        ))}
+        {MEDIA_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
       </select>
-
       <div className="flex gap-2 items-center">
         <input
           className="flex-1 input text-sm"
@@ -176,18 +165,11 @@ function MediaRow({ media, idx, onUpdate, onRemove }: MediaRowProps) {
           {uploading ? <span className="animate-spin">⏳</span> : <>📁 <span className="hidden sm:inline">Upload</span></>}
         </button>
         {media.url && (
-          <button type="button" title="Limpar" onClick={() => onUpdate(idx, { url: '' })} className="shrink-0 text-gray-400 hover:text-red-500 text-lg leading-none px-1">
-            ×
-          </button>
+          <button type="button" title="Limpar" onClick={() => onUpdate(idx, { url: '' })} className="shrink-0 text-gray-400 hover:text-red-500 text-lg leading-none px-1">×</button>
         )}
       </div>
-
       <input ref={fileInputRef} type="file" accept={ACCEPT_BY_TYPE[media.mediaType]} className="hidden" onChange={handleFileChange} />
-
-      {isImage && (
-        <img src={media.url} alt="preview" className="w-full max-h-32 object-contain rounded-lg bg-gray-50" />
-      )}
-
+      {isImage && <img src={media.url} alt="preview" className="w-full max-h-32 object-contain rounded-lg bg-gray-50" />}
       <input
         className="input text-sm"
         placeholder="Legenda (opcional)"
@@ -212,7 +194,7 @@ export default function ProductsClient() {
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
-  const usesItemList = ['ACCOUNT', 'LINK', 'TEXT'].includes(form.deliveryType);
+  const usesItemList = FIFO_TYPES.includes(form.deliveryType);
 
   const loadProducts = () => {
     setLoading(true);
@@ -243,7 +225,7 @@ export default function ProductsClient() {
     setShowModal(true);
   }
 
-  function openEdit(p: Product) {
+  async function openEdit(p: Product) {
     const meta = (p.metadata ?? {}) as Record<string, unknown>;
     setForm({
       name: p.name,
@@ -255,14 +237,24 @@ export default function ProductsClient() {
       isActive: p.isActive,
       stock: p.stock != null ? String(p.stock) : '',
     });
-    setItems(
-      ['ACCOUNT', 'LINK', 'TEXT'].includes(p.deliveryType)
-        ? contentToItems(p.deliveryContent ?? '[]')
-        : [newItem()]
-    );
     setEditId(p.id);
     setFieldError('');
     setShowModal(true);
+
+    // ── Opção 2: popula itens FIFO a partir dos StockItems AVAILABLE ──
+    if (FIFO_TYPES.includes(p.deliveryType)) {
+      // Se o produto já veio com stockItems (include da API), usa direto
+      if (p.stockItems && p.stockItems.length > 0) {
+        setItems(stockItemsToDeliveryItems(p.stockItems));
+      } else {
+        // Caso contrário busca via API
+        getStockItems(p.id)
+          .then((si) => setItems(stockItemsToDeliveryItems(si)))
+          .catch(() => setItems([newItem()]));
+      }
+    } else {
+      setItems([newItem()]);
+    }
 
     getProductMedias(p.id)
       .then(setMedias)
@@ -288,11 +280,13 @@ export default function ProductsClient() {
     setFieldError('');
 
     try {
-      const deliveryContent = usesItemList ? itemsToContent(items) : form.deliveryContent;
-      const fifoCount = usesItemList ? items.filter((i) => i.value.trim()).length : null;
-      const stockValue = usesItemList ? fifoCount : form.stock ? parseInt(form.stock, 10) : null;
+      const isFifo = FIFO_TYPES.includes(form.deliveryType);
 
-      // Mescla confirmationMessage no metadata existente
+      // Para FIFO: serializa os itens como JSON e manda pro backend sincronizar
+      const deliveryContent = isFifo ? itemsToContent(items) : form.deliveryContent;
+      const fifoCount = isFifo ? items.filter((i) => i.value.trim()).length : null;
+      const stockValue = isFifo ? fifoCount : form.stock ? parseInt(form.stock, 10) : null;
+
       const existingMeta = (products.find((p) => p.id === editId)?.metadata ?? {}) as Record<string, unknown>;
       const newMetadata = {
         ...existingMeta,
@@ -410,11 +404,8 @@ export default function ProductsClient() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {filtered.map((p) => {
-            let itemCount: number | null = null;
-            try {
-              const parsed = JSON.parse(p.deliveryContent ?? '');
-              if (Array.isArray(parsed)) itemCount = parsed.length;
-            } catch {}
+            // Conta os StockItems AVAILABLE (fonte de verdade)
+            const itemCount = p.stockItems ? p.stockItems.length : null;
 
             return (
               <div key={p.id} className={['card relative', !p.isActive ? 'opacity-60' : ''].join(' ')}>
@@ -433,7 +424,7 @@ export default function ProductsClient() {
                   <span className="bg-gray-100 px-2 py-1 rounded">{p.deliveryType}</span>
                   {itemCount !== null && (
                     <span className="bg-blue-100 text-blue-700 px-2 py-1 rounded">
-                      {itemCount} item{itemCount !== 1 ? 's' : ''} na fila
+                      {itemCount} item{itemCount !== 1 ? 's' : ''} disponíveis
                     </span>
                   )}
                   {p.stock != null && (
@@ -468,7 +459,6 @@ export default function ProductsClient() {
 
             <div className="px-6 pb-6 space-y-4">
 
-              {/* ── Informações básicas ── */}
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Nome *</label>
                 <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Ex: Plano Pro" />
@@ -488,7 +478,7 @@ export default function ProductsClient() {
                   <label className="block text-sm font-medium text-gray-700 mb-1">Estoque</label>
                   {usesItemList ? (
                     <div className="input bg-gray-50 text-gray-400 cursor-not-allowed select-none">
-                      Auto ({items.filter((i) => i.value.trim()).length} itens)
+                      Auto ({items.filter((i) => i.value.trim()).length} disponíveis)
                     </div>
                   ) : (
                     <input className="input" type="number" min="0" value={form.stock} onChange={(e) => setForm({ ...form, stock: e.target.value })} placeholder="Vazio = ilimitado" />
@@ -503,7 +493,7 @@ export default function ProductsClient() {
                 </select>
               </div>
 
-              {/* ── Itens de entrega (FIFO) ── */}
+              {/* ── Itens FIFO — fonte de verdade: StockItems AVAILABLE ── */}
               {usesItemList && (
                 <div>
                   <div className="flex items-center justify-between mb-2">
@@ -536,7 +526,7 @@ export default function ProductsClient() {
                     ))}
                   </div>
                   <p className="text-xs text-gray-400 mt-1">
-                    🔢 Fila FIFO — o bot entrega o item #1 para a 1ª compra, #2 para a 2ª, e assim por diante.
+                    🔢 Fila FIFO — apenas itens <strong>disponíveis</strong> são exibidos. Itens já entregues são removidos automaticamente.
                   </p>
                 </div>
               )}
@@ -548,7 +538,7 @@ export default function ProductsClient() {
                 </div>
               )}
 
-              {/* ── Mensagem de confirmação customizável ── */}
+              {/* ── Mensagem de entrega customizável ── */}
               <div className="border border-blue-100 bg-blue-50 rounded-xl p-4 space-y-2">
                 <label className="block text-sm font-semibold text-blue-800">✉️ Mensagem de entrega (opcional)</label>
                 <p className="text-xs text-blue-600">
@@ -564,7 +554,7 @@ export default function ProductsClient() {
                 />
               </div>
 
-              {/* ── Mídias de entrega (acopladas) ── */}
+              {/* ── Mídias de entrega (acopladas à mensagem) ── */}
               <div className="border border-gray-200 rounded-xl p-4 space-y-3">
                 <div className="flex items-center justify-between">
                   <label className="block text-sm font-semibold text-gray-700">
@@ -577,8 +567,7 @@ export default function ProductsClient() {
                   </label>
                   <button type="button" onClick={addMedia} className="text-xs text-blue-600 hover:text-blue-700 font-medium">+ Adicionar</button>
                 </div>
-                <p className="text-xs text-gray-400">Fotos, vídeos ou arquivos enviados logo após a mensagem de entrega.</p>
-
+                <p className="text-xs text-gray-400">A primeira mídia é enviada junto com a mensagem de entrega (como legenda).</p>
                 {medias.length === 0 ? (
                   <button type="button" onClick={addMedia} className="w-full border-2 border-dashed border-gray-200 hover:border-blue-400 text-gray-400 hover:text-blue-500 rounded-xl py-3 text-sm font-medium transition-colors">
                     + Adicionar mídia
