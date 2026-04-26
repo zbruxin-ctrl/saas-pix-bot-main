@@ -5,37 +5,20 @@ import { getPayments } from '@/lib/api';
 import { useRouter } from 'next/navigation';
 import StatusBadge from '@/components/admin/StatusBadge';
 import { formatCurrency, formatDate } from '@/lib/utils';
-
-interface Payment {
-  id: string;
-  amount: number;
-  status: string;
-  createdAt: string;
-  approvedAt: string | null;
-  product: { name: string };
-  telegramUser: { username: string | null; firstName: string | null; telegramId: string };
-  mercadoPagoId: string | null;
-}
-
-interface PaginatedData {
-  data: Payment[];
-  total: number;
-  page: number;
-  totalPages: number;
-}
+import type { PaymentDTO, PaginatedResponse } from '@saas-pix/shared';
 
 const STATUS_OPTIONS = [
   { value: '', label: 'Todos os status' },
-  { value: 'APPROVED', label: '✅ Aprovado' },
-  { value: 'PENDING', label: '⏳ Pendente' },
-  { value: 'REJECTED', label: '❌ Rejeitado' },
-  { value: 'CANCELLED', label: '🚫 Cancelado' },
-  { value: 'EXPIRED', label: '⌛ Expirado' },
+  { value: 'APPROVED', label: '\u2705 Aprovado' },
+  { value: 'PENDING', label: '\u23f3 Pendente' },
+  { value: 'REJECTED', label: '\u274c Rejeitado' },
+  { value: 'CANCELLED', label: '\ud83d\udeab Cancelado' },
+  { value: 'EXPIRED', label: '\u231b Expirado' },
 ];
 
 export default function PaymentsPage() {
   const router = useRouter();
-  const [result, setResult] = useState<PaginatedData | null>(null);
+  const [result, setResult] = useState<PaginatedResponse<PaymentDTO> | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('');
@@ -44,8 +27,8 @@ export default function PaymentsPage() {
   const fetchPayments = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await getPayments({ page, status: status || undefined, search: search || undefined });
-      setResult(data);
+      const res = await getPayments({ page, status: status || undefined, search: search || undefined });
+      setResult(res.data ?? null);
     } catch {
       //
     } finally {
@@ -94,12 +77,12 @@ export default function PaymentsPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-100 bg-gray-50">
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">Usuário</th>
+                <th className="text-left px-4 py-3 font-semibold text-gray-600">Usu\u00e1rio</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Produto</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Valor</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Status</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Data</th>
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">Ação</th>
+                <th className="text-left px-4 py-3 font-semibold text-gray-600">A\u00e7\u00e3o</th>
               </tr>
             </thead>
             <tbody>
@@ -109,22 +92,22 @@ export default function PaymentsPage() {
                     <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 mx-auto" />
                   </td>
                 </tr>
-              ) : result?.data.length === 0 ? (
+              ) : result?.items.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="text-center py-12 text-gray-400">
                     Nenhum pagamento encontrado
                   </td>
                 </tr>
               ) : (
-                result?.data.map((p) => (
+                result?.items.map((p) => (
                   <tr key={p.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
                     <td className="px-4 py-3">
                       <div className="font-medium text-gray-900">
-                        {p.telegramUser.firstName || p.telegramUser.username || '—'}
+                        {p.telegramUser?.firstName || p.telegramUser?.username || '\u2014'}
                       </div>
-                      <div className="text-gray-400 text-xs">ID: {p.telegramUser.telegramId}</div>
+                      <div className="text-gray-400 text-xs">ID: {p.telegramUser?.telegramId}</div>
                     </td>
-                    <td className="px-4 py-3 text-gray-700">{p.product.name}</td>
+                    <td className="px-4 py-3 text-gray-700">{p.product?.name}</td>
                     <td className="px-4 py-3 font-semibold text-gray-900">
                       {formatCurrency(p.amount)}
                     </td>
@@ -139,7 +122,7 @@ export default function PaymentsPage() {
                         onClick={() => router.push(`/admin/payments/${p.id}`)}
                         className="text-blue-600 hover:text-blue-700 font-medium text-xs"
                       >
-                        Ver detalhes →
+                        Ver detalhes \u2192
                       </button>
                     </td>
                   </tr>
@@ -149,11 +132,11 @@ export default function PaymentsPage() {
           </table>
         </div>
 
-        {/* Paginação */}
+        {/* Pagina\u00e7\u00e3o */}
         {result && result.totalPages > 1 && (
           <div className="px-4 py-3 border-t border-gray-100 flex items-center justify-between">
             <span className="text-sm text-gray-500">
-              Página {result.page} de {result.totalPages}
+              P\u00e1gina {result.page} de {result.totalPages}
             </span>
             <div className="flex gap-2">
               <button
@@ -161,14 +144,14 @@ export default function PaymentsPage() {
                 disabled={page === 1}
                 className="btn-secondary text-sm py-1 px-3 disabled:opacity-40"
               >
-                ← Anterior
+                \u2190 Anterior
               </button>
               <button
                 onClick={() => setPage((p) => Math.min(result.totalPages, p + 1))}
                 disabled={page === result.totalPages}
                 className="btn-secondary text-sm py-1 px-3 disabled:opacity-40"
               >
-                Próxima →
+                Pr\u00f3xima \u2192
               </button>
             </div>
           </div>
