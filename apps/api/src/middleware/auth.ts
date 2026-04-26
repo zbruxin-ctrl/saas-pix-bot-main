@@ -1,4 +1,5 @@
-// middleware/auth.ts — autenticação JWT com respostas consistentes
+// middleware/auth.ts — autenticação JWT com cache em memória (TTL 30s)
+// FIX #11: cache de 30s por adminId evita query ao banco em todo request
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { env } from '../config/env';
@@ -10,6 +11,42 @@ export interface AuthenticatedRequest extends Request {
     email: string;
     role: string;
   };
+}
+
+// Cache em memória: adminId → { data, expiresAt }
+// Sem external deps (sem Redis); TTL curto garante que desativações sejam respeitadas em ≤30s
+interface CachedAdmin {
+  id: string;
+  email: string;
+  role: string;
+  isActive: boolean;
+  expiresAt: number;
+}
+const adminCache = new Map<string, CachedAdmin>();
+const CACHE_TTL_MS = 30_000; // 30 segundos
+
+async function getAdminCached(adminId: string): Promise<CachedAdmin | null> {
+  const cached = adminCache.get(adminId);
+  if (cached && cached.expiresAt > Date.now()) return cached;
+
+  const admin = await prisma.adminUser.findUnique({
+    where: { id: adminId },
+    select: { id: true, email: true, role: true, isActive: true },
+  });
+
+  if (!admin) {
+    adminCache.delete(adminId);
+    return null;
+  }
+
+  const entry: CachedAdmin = { ...admin, expiresAt: Date.now() + CACHE_TTL_MS };
+  adminCache.set(adminId, entry);
+  return entry;
+}
+
+// Permite invalidar o cache de um admin específico (ex: após desativar)
+export function invalidateAdminCache(adminId: string): void {
+  adminCache.delete(adminId);
 }
 
 export async function requireAuth(
@@ -34,10 +71,7 @@ export async function requireAuth(
       role: string;
     };
 
-    const admin = await prisma.adminUser.findUnique({
-      where: { id: payload.adminId },
-      select: { id: true, email: true, role: true, isActive: true },
-    });
+    const admin = await getAdminCached(payload.adminId);
 
     if (!admin || !admin.isActive) {
       res.status(401).json({ success: false, error: 'Sessão inválida' });
@@ -51,7 +85,6 @@ export async function requireAuth(
       res.status(401).json({ success: false, error: 'Sessão expirada' });
       return;
     }
-    // Token inválido é erro de autenticação, não erro interno
     res.status(401).json({ success: false, error: 'Token inválido' });
   }
 }
