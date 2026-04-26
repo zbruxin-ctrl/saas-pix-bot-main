@@ -67,9 +67,17 @@ export async function getDashboard(): Promise<{
 
 // ─── Products ─────────────────────────────────────────────────────────────────
 
+/**
+ * A API retorna { success: true, data: { data: ProductDTO[], total: number } }
+ * (resposta paginada). Precisamos extrair o array interno.
+ */
 export async function getProducts(): Promise<ProductDTO[]> {
-  const res = await api.get<ApiResponse<ProductDTO[]>>('/admin/products');
-  return data(res);
+  const res = await api.get<ApiResponse<{ data: ProductDTO[]; total: number }>>('/admin/products');
+  const payload = res.data.data;
+  // payload pode ser { data: [...], total: N } ou diretamente um array (fallback)
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray((payload as any).data)) return (payload as any).data;
+  return [];
 }
 
 export async function getProduct(id: string): Promise<ProductDTO> {
@@ -93,11 +101,6 @@ export async function deleteProduct(id: string): Promise<void> {
 
 // ─── Product Medias (usado em products-client.tsx) ────────────────────────────
 
-/**
- * Retorna as mídias de configuração de um produto.
- * Rota: GET /admin/products/:id/medias-config
- * As mídias ficam em product.metadata.medias (sem tabela própria).
- */
 export async function getProductMedias(productId: string): Promise<ProductMedia[]> {
   try {
     const res = await api.get<ApiResponse<ProductMedia[]>>(
@@ -109,11 +112,6 @@ export async function getProductMedias(productId: string): Promise<ProductMedia[
   }
 }
 
-/**
- * Sincroniza APENAS as mídias de configuração do produto.
- * O salvamento dos dados do produto deve ser feito separadamente via updateProduct().
- * Rota: PUT /admin/products/:id/medias-config
- */
 export async function updateProductMedias(
   productId: string,
   medias: ProductMedia[]
@@ -121,15 +119,10 @@ export async function updateProductMedias(
   try {
     await api.put(`/admin/products/${productId}/medias-config`, { medias });
   } catch {
-    // Não bloqueia o fluxo de salvamento se a rota não estiver disponível
+    // não bloqueia o salvamento se a rota não estiver disponível
   }
 }
 
-/**
- * Faz upload de um arquivo de mídia e retorna a URL pública (Cloudinary).
- * Endpoint: POST /api/proxy/admin/products/upload (multipart/form-data).
- * A API usa CLOUDINARY_URL automaticamente quando disponível.
- */
 export async function uploadMediaFile(
   file: File,
   mediaType: ProductMedia['mediaType']
