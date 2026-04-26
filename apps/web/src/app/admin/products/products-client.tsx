@@ -16,8 +16,14 @@ import { formatCurrency } from '@/lib/utils';
 import { toast } from '@/components/admin/Toast';
 import ConfirmModal from '@/components/admin/ConfirmModal';
 
-// Usa ProductDTO do shared diretamente — elimina o conflito de tipos com getProducts()
-type Product = ProductDTO;
+/**
+ * Product extends ProductDTO with extra fields returned by the admin API
+ * that are not part of the shared DTO (deliveryContent, _count).
+ */
+interface Product extends ProductDTO {
+  deliveryContent?: string | null;
+  _count?: { payments: number; orders: number };
+}
 
 interface DeliveryItem {
   id: string;
@@ -249,7 +255,7 @@ export default function ProductsClient() {
   const loadProducts = () => {
     setLoading(true);
     getProducts()
-      .then(setProducts)
+      .then((data) => setProducts(data as Product[]))
       .catch(() => toast('Erro ao carregar produtos', 'error'))
       .finally(() => setLoading(false));
   };
@@ -347,7 +353,7 @@ export default function ProductsClient() {
       const deliveryContent = usesItemList ? itemsToContent(items) : form.deliveryContent;
       const fifoCount = usesItemList ? items.filter((i) => i.value.trim()).length : null;
 
-      const payload: Partial<ProductDTO> = {
+      const payload: Partial<ProductDTO> & { deliveryContent?: string } = {
         ...form,
         deliveryContent,
         price: parseFloat(form.price),
