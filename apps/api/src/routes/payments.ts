@@ -1,11 +1,16 @@
 // Rotas de pagamento (usadas pelo bot)
 // FIX BUG1: adiciona POST /:id/cancel para que o bot possa gravar CANCELLED no banco
+// FIX STOCK-DISPLAY: /products agora retorna availableStock calculado corretamente
+//   para produtos FIFO (conta StockItems AVAILABLE) e numéricos (campo stock).
+//   Produtos sem estoque disponível são filtrados da lista.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
+import { StockItemStatus } from '@prisma/client';
 import { paymentService } from '../services/paymentService';
 import { paymentRateLimit } from '../middleware/rateLimit';
 import { requireBotSecret } from '../middleware/auth';
 import { logger } from '../lib/logger';
+import { prisma } from '../lib/prisma';
 
 export const paymentsRouter = Router();
 
@@ -39,8 +44,6 @@ paymentsRouter.post(
 
 // Cancela um pagamento PENDING a pedido do usuário no bot
 // POST /api/payments/:id/cancel
-// FIX BUG1: antes o bot só parava de mostrar o QR Code localmente;
-// agora grava CANCELLED no banco, liberando o estoque e atualizando o painel.
 paymentsRouter.post(
   '/:id/cancel',
   requireBotSecret,
@@ -81,8 +84,6 @@ paymentsRouter.get(
   '/products',
   requireBotSecret,
   async (_req: Request, res: Response) => {
-    const { prisma } = await import('../lib/prisma');
-
     const products = await prisma.product.findMany({
       where: { isActive: true },
       select: {
@@ -93,16 +94,51 @@ paymentsRouter.get(
         deliveryType: true,
         stock: true,
         metadata: true,
+        _count: { select: { stockItems: true } },
       },
       orderBy: { price: 'asc' },
     });
 
+    // Calcula estoque real para cada produto
+    const productsWithStock = await Promise.all(
+      products.map(async (p) => {
+        let availableStock: number | null;
+
+        if (p._count.stockItems > 0) {
+          // Modo FIFO: conta StockItems AVAILABLE
+          availableStock = await prisma.stockItem.count({
+            where: { productId: p.id, status: StockItemStatus.AVAILABLE },
+          });
+        } else if (p.stock !== null) {
+          // Modo numérico
+          availableStock = p.stock;
+        } else {
+          // Produto ilimitado
+          availableStock = null;
+        }
+
+        return {
+          id: p.id,
+          name: p.name,
+          description: p.description,
+          price: Number(p.price),
+          deliveryType: p.deliveryType,
+          metadata: p.metadata,
+          // null = ilimitado, number = quantidade disponível
+          availableStock,
+        };
+      })
+    );
+
+    // Filtra produtos esgotados (availableStock === 0)
+    // null (ilimitado) e qualquer número > 0 passam normalmente
+    const available = productsWithStock.filter(
+      (p) => p.availableStock === null || p.availableStock > 0
+    );
+
     res.json({
       success: true,
-      data: products.map((p) => ({
-        ...p,
-        price: Number(p.price),
-      })),
+      data: available,
     });
   }
 );
