@@ -1,4 +1,5 @@
-// Rotas de usuários Telegram no painel admin
+// ALTERAÇÕES: removido hack `payments: undefined`, uso de select+destructuring,
+// adicionado isBlocked no retorno da listagem
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma';
@@ -29,7 +30,16 @@ adminUsersRouter.get('/', async (req: Request, res: Response) => {
   const [users, total] = await Promise.all([
     prisma.telegramUser.findMany({
       where,
-      include: {
+      select: {
+        id: true,
+        telegramId: true,
+        username: true,
+        firstName: true,
+        lastName: true,
+        languageCode: true,
+        isBlocked: true,
+        createdAt: true,
+        updatedAt: true,
         _count: { select: { payments: true, orders: true } },
         payments: {
           where: { status: 'APPROVED' },
@@ -46,10 +56,9 @@ adminUsersRouter.get('/', async (req: Request, res: Response) => {
   res.json({
     success: true,
     data: {
-      data: users.map((u) => ({
+      data: users.map(({ payments, ...u }) => ({
         ...u,
-        totalSpent: u.payments.reduce((sum, p) => sum + Number(p.amount), 0),
-        payments: undefined, // remove do retorno
+        totalSpent: payments.reduce((sum, p) => sum + Number(p.amount), 0),
       })),
       total,
       page,
@@ -80,10 +89,15 @@ adminUsersRouter.get('/:id', async (req: Request, res: Response) => {
     return;
   }
 
+  const totalSpent = user.payments
+    .filter((p) => p.status === 'APPROVED')
+    .reduce((sum, p) => sum + Number(p.amount), 0);
+
   res.json({
     success: true,
     data: {
       ...user,
+      totalSpent,
       payments: user.payments.map((p) => ({ ...p, amount: Number(p.amount) })),
     },
   });
