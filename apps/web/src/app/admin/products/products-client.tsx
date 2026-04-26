@@ -30,6 +30,9 @@ interface DeliveryItem {
   value: string;
 }
 
+/** Payload enviado ao criar/atualizar produto (inclui deliveryContent que a API aceita) */
+type ProductPayload = Partial<ProductDTO> & { deliveryContent?: string };
+
 const DELIVERY_TYPES = [
   { value: 'TEXT', label: 'TEXT — Mensagem de texto' },
   { value: 'LINK', label: 'LINK — Link de acesso' },
@@ -53,7 +56,7 @@ const EMPTY_FORM = {
   name: '',
   description: '',
   price: '',
-  deliveryType: 'TEXT',
+  deliveryType: 'TEXT' as DeliveryType,
   deliveryContent: '',
   isActive: true,
   stock: '',
@@ -352,13 +355,21 @@ export default function ProductsClient() {
     try {
       const deliveryContent = usesItemList ? itemsToContent(items) : form.deliveryContent;
       const fifoCount = usesItemList ? items.filter((i) => i.value.trim()).length : null;
+      const stockValue = usesItemList
+        ? fifoCount
+        : form.stock
+        ? parseInt(form.stock, 10)
+        : null;
 
-      const payload: Partial<ProductDTO> & { deliveryContent?: string } = {
-        ...form,
-        deliveryType: form.deliveryType as DeliveryType,
-        deliveryContent,
+      // Constrói o payload campo a campo para evitar conflito de tipos com Partial<ProductDTO>
+      const payload: ProductPayload = {
+        name: form.name,
+        description: form.description,
         price: parseFloat(form.price),
-        stock: usesItemList ? fifoCount : form.stock ? parseInt(form.stock) : null,
+        deliveryType: form.deliveryType,
+        isActive: form.isActive,
+        stock: stockValue,
+        deliveryContent,
       };
 
       let savedId = editId;
@@ -374,7 +385,6 @@ export default function ProductsClient() {
 
       if (savedId) {
         const validMedias = medias.filter((m) => m.url.trim());
-
         await updateProductMedias(savedId, validMedias, payload).catch(() =>
           toast('Produto salvo, mas erro ao salvar mídias extras.', 'error')
         );
@@ -648,7 +658,11 @@ export default function ProductsClient() {
                       className="input"
                       value={form.deliveryType}
                       onChange={(e) => {
-                        setForm({ ...form, deliveryType: e.target.value, deliveryContent: '' });
+                        setForm({
+                          ...form,
+                          deliveryType: e.target.value as DeliveryType,
+                          deliveryContent: '',
+                        });
                         setItems([newItem()]);
                       }}
                     >
