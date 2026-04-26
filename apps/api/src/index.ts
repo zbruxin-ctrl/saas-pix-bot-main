@@ -22,10 +22,9 @@ app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false }));
 
-// FIX S1: CORS via allowlist explícita.
-// Não mais aceita qualquer *.vercel.app — apenas ADMIN_URL + origens extras declaradas em ALLOWED_ORIGINS.
-// Para adicionar outro domínio (ex: Vercel preview específico), configure ALLOWED_ORIGINS no Railway:
-//   ALLOWED_ORIGINS=https://meu-painel.vercel.app,https://preview-xyz.vercel.app
+// CORS: allowlist explícita + todos os subdominios *.vercel.app (deploys dinâmicos)
+// Para adicionar domínios próprios, configure ALLOWED_ORIGINS no Railway:
+//   ALLOWED_ORIGINS=https://meudominio.com,https://outro.com
 const extraOrigins = (process.env.ALLOWED_ORIGINS ?? '')
   .split(',')
   .map((s) => s.trim())
@@ -41,7 +40,10 @@ const allowedOrigins = [
 ].filter(Boolean) as string[];
 
 function isOriginAllowed(origin: string | undefined): boolean {
-  if (!origin) return true; // requests sem Origin (ex: curl, Railway health checks)
+  if (!origin) return true; // requests sem Origin (curl, Railway health checks)
+  // Permite qualquer subdomínio do Vercel (deploys de preview e produção)
+  if (/^https:\/\/[a-z0-9-]+-[a-z0-9-]+-[a-z0-9]+-projects\.vercel\.app$/.test(origin)) return true;
+  if (/^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/.test(origin)) return true;
   return allowedOrigins.includes(origin);
 }
 
@@ -64,13 +66,9 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Serve uploads locais (fallback quando Cloudinary não está configurado)
-// Em produção com Cloudinary isso não é chamado pois as URLs já são do Cloudinary
 app.use('/uploads', express.static('uploads'));
 
 // --- Rota de setup inicial ---
-// FIX S3: aceita apenas POST (não GET) para evitar navegação acidental no browser.
-// Uso: POST /setup-admin com body { secret, email, password }
-// Remova SETUP_SECRET do Railway após usar.
 app.post('/setup-admin', async (req, res) => {
   const setupSecret = process.env.SETUP_SECRET;
   if (!setupSecret) { res.status(404).json({ error: 'Rota nao disponivel' }); return; }
