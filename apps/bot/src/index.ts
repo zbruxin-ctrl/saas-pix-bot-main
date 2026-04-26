@@ -45,7 +45,6 @@ bot.command('start', async (ctx) => {
   const firstName = ctx.from?.first_name || 'visitante';
   const userId = ctx.from!.id;
 
-  // Reseta sessão do usuário
   sessions.set(userId, { step: 'idle' });
 
   const welcomeMessage =
@@ -101,7 +100,6 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   const userId = ctx.from!.id;
   const session = getSession(userId);
 
-  // Busca produto da sessão ou da API
   let product: ProductDTO | undefined = session.products?.find((p) => p.id === productId);
 
   if (!product) {
@@ -150,7 +148,6 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
   const userId = ctx.from!.id;
   const session = getSession(userId);
 
-  // Mensagem de carregamento
   const loadingMsg = await ctx.replyWithMarkdown('⏳ Gerando seu código PIX, aguarde...');
 
   try {
@@ -164,10 +161,8 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
     session.paymentId = payment.paymentId;
     session.step = 'awaiting_payment';
 
-    // Remove mensagem de carregamento
     await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
 
-    // Formata data de expiração
     const expiresAt = new Date(payment.expiresAt);
     const expiresStr = expiresAt.toLocaleTimeString('pt-BR', {
       hour: '2-digit',
@@ -175,7 +170,6 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       timeZone: 'America/Sao_Paulo',
     });
 
-    // Envia resumo do pagamento
     await ctx.replyWithMarkdown(
       `💳 *Pagamento PIX Gerado!*\n\n` +
       `📦 *Produto:* ${payment.productName}\n` +
@@ -184,14 +178,12 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       `_Escaneie o QR Code ou use o código copia e cola abaixo:_`
     );
 
-    // Envia QR code como imagem
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
     await ctx.replyWithPhoto(
       { source: qrBuffer },
       { caption: '📷 Escaneie este QR Code no seu banco' }
     );
 
-    // Envia código copia e cola em mensagem separada (fácil de copiar)
     await ctx.replyWithMarkdown(
       `📋 *Código PIX (Copia e Cola):*\n\n` +
       `\`${payment.pixQrCodeText}\`\n\n` +
@@ -200,7 +192,7 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       `⏰ _Este código expira em 30 minutos._`,
       Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
-        [Markup.button.callback('❌ Cancelar', 'cancel_payment')],
+        [Markup.button.callback('❌ Cancelar', `cancel_payment_${payment.paymentId}`)],
       ])
     );
 
@@ -212,7 +204,7 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
     logger.error(`Erro ao gerar PIX para ${userId}:`, error);
 
     const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econnreset');
-    
+
     await ctx.replyWithMarkdown(
       isTimeout
         ? `⏳ *Demorou um pouquinho mais que o esperado...*\n\nNão se preocupe! Isso acontece às vezes.\nÉ só clicar em *Tentar Novamente* abaixo que vai funcionar 😊`
@@ -260,9 +252,23 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
 });
 
 // ─── Callback: cancelar pagamento ─────────────────────────────────────────
-bot.action('cancel_payment', async (ctx) => {
-  await ctx.answerCbQuery('Pagamento cancelado');
+// FIX BUG1: agora chama a API para gravar CANCELLED no banco.
+// O botão agora carrega o paymentId diretamente (cancel_payment_<id>)
+// em vez de depender da sessão em memória (que pode ter sido perdida em restart).
+bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Cancelando pagamento...');
+  const paymentId = ctx.match[1];
   const userId = ctx.from!.id;
+
+  try {
+    await apiClient.cancelPayment(paymentId);
+    logger.info(`Pagamento ${paymentId} cancelado pelo usuário ${userId}`);
+  } catch (error) {
+    // Se falhar (ex: já cancelado/aprovado), apenas loga e continua
+    logger.warn(`Não foi possível cancelar pagamento ${paymentId} na API: ${error instanceof Error ? error.message : error}`);
+  }
+
+  // Reseta sessão local independente do resultado da API
   sessions.set(userId, { step: 'idle' });
 
   await ctx.replyWithMarkdown(
@@ -277,7 +283,6 @@ bot.action('cancel_payment', async (ctx) => {
 bot.on(message('text'), async (ctx) => {
   const text = ctx.message.text;
 
-  // Ignora comandos
   if (text.startsWith('/')) return;
 
   await ctx.replyWithMarkdown(
@@ -352,7 +357,6 @@ bot.catch((err, ctx) => {
 // ─── Inicialização ────────────────────────────────────────────────────────
 async function startBot(): Promise<void> {
   if (env.NODE_ENV === 'production' && env.BOT_WEBHOOK_URL) {
-    // Modo webhook para produção
     const webhookUrl = `${env.BOT_WEBHOOK_URL}/telegram-webhook`;
     await bot.launch({
       webhook: {
@@ -363,7 +367,6 @@ async function startBot(): Promise<void> {
     });
     logger.info(`🤖 Bot iniciado em modo WEBHOOK: ${webhookUrl}`);
   } else {
-    // Modo polling para desenvolvimento
     await bot.launch();
     logger.info('🤖 Bot iniciado em modo POLLING (desenvolvimento)');
   }
@@ -376,6 +379,5 @@ startBot().catch((err) => {
   process.exit(1);
 });
 
-// Graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

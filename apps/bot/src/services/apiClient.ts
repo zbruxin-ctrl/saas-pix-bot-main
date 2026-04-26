@@ -11,7 +11,6 @@ class ApiClient {
       baseURL: env.API_URL,
       headers: {
         'Content-Type': 'application/json',
-        // Token secreto para autenticar requisições do bot na API
         'x-bot-secret': env.TELEGRAM_BOT_SECRET,
       },
       timeout: 15000,
@@ -50,6 +49,15 @@ class ApiClient {
   async getPaymentStatus(paymentId: string): Promise<{ status: string; paymentId: string }> {
     const { data } = await this.client.get<ApiResponse<{ status: string; paymentId: string }>>(
       `/api/payments/${paymentId}/status`
+    );
+    return data.data!;
+  }
+
+  // Cancela um pagamento PENDING a pedido do usuário
+  // FIX BUG1: antes o bot só resetava a sessão local; agora grava CANCELLED no banco
+  async cancelPayment(paymentId: string): Promise<{ cancelled: boolean; message: string }> {
+    const { data } = await this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
+      `/api/payments/${paymentId}/cancel`
     );
     return data.data!;
   }
