@@ -7,7 +7,8 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { PaymentStatus, OrderStatus, Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
-import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
+import { requireRole } from '../../middleware/auth';
+import { paymentService } from '../../services/paymentService';
 import axios from 'axios';
 
 export const adminPaymentsRouter = Router();
@@ -104,8 +105,6 @@ adminPaymentsRouter.get(
 );
 
 // GET /api/admin/payments/:id
-// FIX B2: queries sequenciais para não esgotar connection_limit=1
-// FIX B1: stockItem lookup tipado sem cast para any
 adminPaymentsRouter.get(
   '/:id',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -157,8 +156,8 @@ adminPaymentsRouter.get(
 );
 
 // POST /api/admin/payments/:id/reprocess
-// Consulta o Mercado Pago pelo mercadoPagoId e, se payment_status === 'approved',
-// simula o webhook interno para forçar aprovação + entrega.
+// Consulta o Mercado Pago pelo mercadoPagoId e, se aprovado lá,
+// chama processApprovedPayment para forçar aprovação + entrega.
 adminPaymentsRouter.post(
   '/:id/reprocess',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -175,7 +174,10 @@ adminPaymentsRouter.post(
     }
 
     if (!payment.mercadoPagoId) {
-      res.status(400).json({ success: false, error: 'Este pagamento não tem ID do Mercado Pago registrado' });
+      res.status(400).json({
+        success: false,
+        error: 'Este pagamento não tem ID do Mercado Pago registrado',
+      });
       return;
     }
 
@@ -184,7 +186,7 @@ adminPaymentsRouter.post(
       return;
     }
 
-    // Consulta o MP para verificar o status real
+    // Consulta o MP para confirmar que foi pago
     const mpToken = process.env.MP_ACCESS_TOKEN;
     if (!mpToken) {
       res.status(500).json({ success: false, error: 'MP_ACCESS_TOKEN não configurado no servidor' });
@@ -199,39 +201,33 @@ adminPaymentsRouter.post(
       );
       mpData = mpRes.data;
     } catch (err: any) {
-      const status = err?.response?.status;
+      const httpStatus = err?.response?.status;
       const message = err?.response?.data?.message || err.message;
       res.status(502).json({
         success: false,
-        error: `Erro ao consultar Mercado Pago (${status}): ${message}`,
+        error: `Erro ao consultar Mercado Pago (${httpStatus}): ${message}`,
       });
       return;
     }
 
-    if (mpData.payment_status !== 'approved' && mpData.status !== 'approved') {
+    if (mpData.status !== 'approved') {
       res.json({
         success: false,
         mpStatus: mpData.status,
-        mpPaymentStatus: mpData.payment_status,
-        error: `O Mercado Pago retornou status "${mpData.status}" — pagamento não aprovado no MP`,
+        error: `O Mercado Pago retornou status "${mpData.status}" — pagamento ainda não aprovado no MP`,
       });
       return;
     }
 
-    // O pagamento está aprovado no MP mas não processado — chama o handler interno
-    // Importa dinamicamente para não criar dependência circular
+    // Pagamento aprovado no MP mas não processado — dispara o fluxo completo
     try {
-      const { handleApprovedPayment } = await import('../../services/paymentService');
-      await handleApprovedPayment(paymentId, payment.mercadoPagoId);
+      await paymentService.processApprovedPayment(paymentId);
     } catch (err: any) {
-      // Se o serviço não exportar essa função, faz o update manual mínimo
-      await prisma.payment.update({
-        where: { id: paymentId },
-        data: {
-          status: 'APPROVED',
-          approvedAt: new Date(),
-        },
+      res.status(500).json({
+        success: false,
+        error: `Erro ao processar pagamento: ${err?.message || 'erro desconhecido'}`,
       });
+      return;
     }
 
     res.json({
