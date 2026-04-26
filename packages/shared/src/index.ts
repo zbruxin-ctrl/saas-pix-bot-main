@@ -1,9 +1,39 @@
-// packages/shared/src/index.ts — tipos compartilhados alinhados com Prisma schema
-export type PaymentStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED' | 'EXPIRED' | 'REFUNDED';
-export type DeliveryType = 'TEXT' | 'LINK' | 'FILE_MEDIA' | 'ACCOUNT';
-export type OrderStatus = 'PROCESSING' | 'DELIVERED' | 'FAILED' | 'CANCELLED';
+// Tipos compartilhados entre todos os apps do monorepo
+// ALTERAÇÕES: TOKEN→FILE_MEDIA, CANCELLED em OrderStatus, novos DTOs (DeliveryLog, DeliveryMedia,
+// WebhookEvent, StockItem, OrderDetail), DashboardStats com métricas operacionais
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+export type PaymentStatus =
+  | 'PENDING'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'CANCELLED'
+  | 'EXPIRED'
+  | 'REFUNDED';
+
+export type DeliveryType = 'TEXT' | 'LINK' | 'FILE_MEDIA' | 'ACCOUNT'; // TOKEN removido
+
+export type OrderStatus = 'PROCESSING' | 'DELIVERED' | 'FAILED' | 'CANCELLED'; // CANCELLED adicionado
+
 export type AdminRole = 'SUPERADMIN' | 'ADMIN' | 'OPERATOR';
-export type StockItemStatus = 'AVAILABLE' | 'RESERVED' | 'CONFIRMED' | 'DELIVERED' | 'RELEASED';
+
+export type StockItemStatus = 'AVAILABLE' | 'RESERVED' | 'CONFIRMED' | 'DELIVERED';
+
+export type StockReservationStatus = 'ACTIVE' | 'CONFIRMED' | 'RELEASED';
+
+export type DeliveryLogStatus = 'SUCCESS' | 'FAILED' | 'RETRYING';
+
+export type DeliveryMediaType = 'IMAGE' | 'VIDEO' | 'FILE';
+
+export type WebhookEventStatus =
+  | 'RECEIVED'
+  | 'PROCESSING'
+  | 'PROCESSED'
+  | 'FAILED'
+  | 'IGNORED';
+
+// ─── DTOs base ────────────────────────────────────────────────────────────────
 
 export interface ProductDTO {
   id: string;
@@ -17,12 +47,62 @@ export interface ProductDTO {
   createdAt: string;
 }
 
+export interface TelegramUserDTO {
+  id: string;
+  telegramId: string;
+  username?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  isBlocked: boolean;
+  createdAt: string;
+}
+
 export interface StockItemDTO {
   id: string;
   productId: string;
   content: string;
   status: StockItemStatus;
+  paymentId?: string | null;
   createdAt: string;
+}
+
+export interface DeliveryLogDTO {
+  id: string;
+  orderId: string;
+  attempt: number;
+  status: DeliveryLogStatus;
+  message?: string | null;
+  error?: string | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface DeliveryMediaDTO {
+  id: string;
+  orderId: string;
+  url: string;
+  mediaType: DeliveryMediaType;
+  caption?: string | null;
+  sortOrder: number;
+  createdAt: string;
+}
+
+export interface WebhookEventDTO {
+  id: string;
+  eventType: string;
+  externalId: string;
+  status: WebhookEventStatus;
+  createdAt: string;
+}
+
+export interface OrderDTO {
+  id: string;
+  paymentId: string;
+  status: OrderStatus;
+  deliveredAt?: string | null;
+  createdAt: string;
+  deliveryLogs?: DeliveryLogDTO[];
+  deliveryMedias?: DeliveryMediaDTO[];
 }
 
 export interface PaymentDTO {
@@ -36,30 +116,47 @@ export interface PaymentDTO {
   pixQrCodeText?: string | null;
   pixExpiresAt?: string | null;
   approvedAt?: string | null;
+  cancelledAt?: string | null;
   createdAt: string;
-  product?: ProductDTO;
-  telegramUser?: TelegramUserDTO;
+  product?: ProductDTO | null;
+  telegramUser?: TelegramUserDTO | null;
+  order?: OrderDTO | null;
+  webhookEvents?: WebhookEventDTO[];
+  stockItem?: Pick<StockItemDTO, 'content' | 'status'> | null;
 }
 
-export interface TelegramUserDTO {
-  id: string;
-  telegramId: string;
-  username?: string | null;
-  firstName?: string | null;
-  lastName?: string | null;
-  createdAt: string;
-}
+// ─── Dashboard ────────────────────────────────────────────────────────────────
 
 export interface DashboardStats {
+  // Receita
   totalRevenue: number;
+  revenueToday: number;
+  revenueThisMonth: number;
+  // Volume
   totalApproved: number;
   totalPending: number;
   totalRejected: number;
-  revenueToday: number;
+  totalExpired: number;
+  totalCancelled: number;
+  totalRefunded: number;
   paymentsToday: number;
-  revenueThisMonth: number;
   paymentsThisMonth: number;
+  // Métricas operacionais
+  deliveriesFailedToday: number;
+  webhooksFailedToday: number;
+  ordersWithFailure: number;
 }
+
+export interface RecentPaymentItem {
+  id: string;
+  amount: number;
+  status: PaymentStatus;
+  approvedAt?: string | null;
+  productName: string;
+  userName: string;
+}
+
+// ─── Requests / Responses ─────────────────────────────────────────────────────
 
 export interface CreatePaymentRequest {
   telegramId: string;
@@ -70,10 +167,10 @@ export interface CreatePaymentRequest {
 
 export interface CreatePaymentResponse {
   paymentId: string;
-  pixQrCode: string;      // base64
-  pixQrCodeText: string;  // copia e cola
+  pixQrCode: string;       // base64
+  pixQrCodeText: string;   // copia e cola
   amount: number;
-  expiresAt: string;      // ISO 8601
+  expiresAt: string;
   productName: string;
 }
 
@@ -82,6 +179,7 @@ export interface ApiResponse<T = unknown> {
   data?: T;
   error?: string;
   message?: string;
+  details?: Array<{ field: string; message: string }>;
 }
 
 export interface PaginatedResponse<T> {
