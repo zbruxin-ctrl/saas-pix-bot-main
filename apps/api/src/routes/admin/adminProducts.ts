@@ -1,9 +1,12 @@
-// routes/admin/adminProducts.ts — roles corrigidas (SUPERADMIN) + DeliveryType alinhado
+// routes/admin/adminProducts.ts
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
 
 export const adminProductsRouter = Router();
 
@@ -17,6 +20,30 @@ const productSchema = z.object({
   stock: z.number().int().positive().nullable().optional(),
   metadata: z.record(z.unknown()).nullable().optional(),
 });
+
+// ─── Multer: upload local temporário (fallback sem cloud storage) ─────────────
+const uploadDir = path.join(process.cwd(), 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+  fileFilter: (_req, file, cb) => {
+    const allowed = /image|video|application\/pdf|application\/zip|application\/octet-stream/;
+    if (allowed.test(file.mimetype)) cb(null, true);
+    else cb(new Error('Tipo de arquivo não permitido'));
+  },
+});
+
+// ─── Produtos ─────────────────────────────────────────────────────────────────
 
 adminProductsRouter.get('/', async (_req, res: Response) => {
   const products = await prisma.product.findMany({ orderBy: { createdAt: 'desc' } });
@@ -63,7 +90,81 @@ adminProductsRouter.delete(
   }
 );
 
-// ─── StockItem CRUD (para cadastrar unidades individuais de estoque FIFO) ────
+// ─── Mídias de configuração do produto (medias-config) ───────────────────────
+// Armazenadas em product.metadata.medias — sem tabela própria por ora.
+// GET /api/admin/products/:id/medias-config
+adminProductsRouter.get(
+  '/:id/medias-config',
+  async (req: AuthenticatedRequest, res: Response) => {
+    const product = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      select: { metadata: true },
+    });
+    if (!product) return res.status(404).json({ success: false, error: 'Produto não encontrado' });
+
+    const meta = product.metadata as Record<string, unknown> | null;
+    const medias = Array.isArray(meta?.medias) ? meta!.medias : [];
+    res.json({ success: true, data: medias });
+  }
+);
+
+// PUT /api/admin/products/:id/medias-config
+const mediasConfigSchema = z.object({
+  medias: z.array(
+    z.object({
+      url: z.string().min(1),
+      mediaType: z.enum(['IMAGE', 'VIDEO', 'FILE']),
+      caption: z.string().max(500).optional(),
+    })
+  ),
+});
+
+adminProductsRouter.put(
+  '/:id/medias-config',
+  requireRole('ADMIN', 'SUPERADMIN'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const { medias } = mediasConfigSchema.parse(req.body);
+
+    const product = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      select: { metadata: true },
+    });
+    if (!product) return res.status(404).json({ success: false, error: 'Produto não encontrado' });
+
+    const existingMeta = (product.metadata as Record<string, unknown>) ?? {};
+    const updatedMeta: Prisma.InputJsonValue = { ...existingMeta, medias };
+
+    await prisma.product.update({
+      where: { id: req.params.id },
+      data: { metadata: updatedMeta },
+    });
+
+    res.json({ success: true, data: medias });
+  }
+);
+
+// ─── Upload de mídia (armazenamento local temporário) ─────────────────────────
+// POST /api/admin/upload
+// Nota: em produção substitua pelo upload direto para S3/R2/Supabase Storage.
+adminProductsRouter.post(
+  '/upload',
+  requireRole('ADMIN', 'SUPERADMIN'),
+  upload.single('file'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    if (!req.file) {
+      res.status(400).json({ success: false, error: 'Nenhum arquivo enviado' });
+      return;
+    }
+
+    // Gera URL pública usando a API_URL configurada no ambiente
+    const baseUrl = process.env.API_URL ?? '';
+    const url = `${baseUrl}/uploads/${req.file.filename}`;
+
+    res.status(201).json({ success: true, data: { url, filename: req.file.filename } });
+  }
+);
+
+// ─── StockItem CRUD ───────────────────────────────────────────────────────────
 const stockItemSchema = z.object({
   content: z.string().min(1),
 });
@@ -94,6 +195,7 @@ adminProductsRouter.post(
 );
 
 // DELETE /api/admin/products/stock-items/:itemId
+// FIX: movido para DEPOIS das rotas /:productId/* para evitar conflito de params no Express
 adminProductsRouter.delete(
   '/stock-items/:itemId',
   requireRole('SUPERADMIN'),
