@@ -15,8 +15,14 @@ interface User {
   _count: { payments: number; orders: number };
 }
 
+interface UsersResult {
+  data: User[];
+  total: number;
+  totalPages: number;
+}
+
 export default function UsersPage() {
-  const [result, setResult] = useState<{ data: User[]; total: number; totalPages: number } | null>(null);
+  const [result, setResult] = useState<UsersResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
@@ -24,8 +30,16 @@ export default function UsersPage() {
   const fetchUsers = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await getUsers({ page, search: search || undefined });
-      setResult(data);
+      const res = await getUsers({ page, search: search || undefined });
+      // getUsers retorna ApiResponse<PaginatedResponse<...>> — extraímos res.data
+      const paginated = res.data;
+      if (paginated) {
+        setResult({
+          data: paginated.data as User[],
+          total: paginated.total,
+          totalPages: paginated.totalPages,
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -97,8 +111,20 @@ export default function UsersPage() {
           <div className="px-4 py-3 border-t border-gray-100 flex items-center justify-between">
             <span className="text-sm text-gray-500">Página {page} de {result.totalPages}</span>
             <div className="flex gap-2">
-              <button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1} className="btn-secondary text-sm py-1 px-3 disabled:opacity-40">← Anterior</button>
-              <button onClick={() => setPage((p) => Math.min(result.totalPages, p + 1))} disabled={page === result.totalPages} className="btn-secondary text-sm py-1 px-3 disabled:opacity-40">Próxima →</button>
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page === 1}
+                className="btn-secondary text-sm py-1 px-3 disabled:opacity-40"
+              >
+                ← Anterior
+              </button>
+              <button
+                onClick={() => setPage((p) => Math.min(result.totalPages, p + 1))}
+                disabled={page === result.totalPages}
+                className="btn-secondary text-sm py-1 px-3 disabled:opacity-40"
+              >
+                Próxima →
+              </button>
             </div>
           </div>
         )}
