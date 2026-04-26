@@ -1,5 +1,7 @@
 // Serviço de integração com Mercado Pago
 // Documentação: https://www.mercadopago.com.br/developers/pt/reference
+// FIX #6: payerEmail removido do DTO externo — construído internamente por buildPayerEmail
+//         (domínio .user era rejeitado pelo MP; @pagador.com.br é aceito)
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
@@ -8,10 +10,10 @@ import { logger } from '../lib/logger';
 interface PixPaymentData {
   transactionAmount: number;
   description: string;
-  payerEmail: string;
   payerName: string;
   externalReference: string;
   notificationUrl: string;
+  // payerEmail removido: construído internamente por buildPayerEmail()
 }
 
 interface MercadoPagoPixResponse {
@@ -61,6 +63,7 @@ function isPublicUrl(url: string): boolean {
 }
 
 // O MP exige e-mail com domínio válido — .user é rejeitado
+// Usa externalReference (paymentId UUID) como identificador único do pagador
 function buildPayerEmail(externalReference: string): string {
   return `telegram.${externalReference}@pagador.com.br`;
 }
@@ -119,7 +122,7 @@ class MercadoPagoService {
       description: data.description.substring(0, 255),
       payment_method_id: 'pix',
       payer: {
-        // Domínio .com.br é aceito pelo MP — .user era rejeitado
+        // FIX #6: e-mail construído internamente com domínio aceito pelo MP
         email: buildPayerEmail(data.externalReference),
         first_name: (data.payerName.split(' ')[0] || 'Usuario').substring(0, 50),
         last_name: (data.payerName.split(' ').slice(1).join(' ') || 'Telegram').substring(0, 50),
