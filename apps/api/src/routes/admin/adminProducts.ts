@@ -1,7 +1,7 @@
 // routes/admin/adminProducts.ts
 import { Router, Response } from 'express';
 import { z } from 'zod';
-import { Prisma } from '@prisma/client';
+import { Prisma, StockItemStatus } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
 import multer, { FileFilterCallback, StorageEngine } from 'multer';
@@ -74,6 +74,54 @@ async function uploadToCloudinary(
     logger.warn('[Cloudinary] Falha no upload, usando URL local como fallback:', err);
     return null;
   }
+}
+
+/**
+ * Se deliveryContent for um JSON de array (ex: ["bb", "AA"]), sincroniza os
+ * itens como StockItems FIFO do produto, apagando os AVAILABLE antigos e
+ * criando os novos na ordem recebida.
+ *
+ * Retorna true se fez a sincronização (e o caller deve limpar deliveryContent).
+ */
+async function syncDeliveryContentToStockItems(
+  productId: string,
+  deliveryContent: string,
+  deliveryType: string
+): Promise<boolean> {
+  // Apenas tipos que fazem sentido como fila FIFO
+  if (deliveryType !== 'TEXT' && deliveryType !== 'LINK' && deliveryType !== 'ACCOUNT') {
+    return false;
+  }
+
+  let items: string[];
+  try {
+    const parsed = JSON.parse(deliveryContent);
+    if (!Array.isArray(parsed) || parsed.length === 0) return false;
+    items = parsed.map((v: unknown) => String(v)).filter((s) => s.trim().length > 0);
+    if (items.length === 0) return false;
+  } catch {
+    // Não é JSON array — conteúdo simples (ex: texto único ou link)
+    return false;
+  }
+
+  // Remove apenas os StockItems AVAILABLE (preserva RESERVED/CONFIRMED/DELIVERED)
+  await prisma.stockItem.deleteMany({
+    where: { productId, status: StockItemStatus.AVAILABLE },
+  });
+
+  // Cria os novos itens na ordem recebida
+  await prisma.stockItem.createMany({
+    data: items.map((content) => ({
+      productId,
+      content,
+      status: StockItemStatus.AVAILABLE,
+    })),
+  });
+
+  logger.info(
+    `[adminProducts] ${items.length} StockItems sincronizados para produto=${productId}`
+  );
+  return true;
 }
 
 // ─── CRÍTICO: /upload DEVE vir ANTES de /:id ─────────────────────────────────
@@ -207,9 +255,22 @@ adminProductsRouter.post(
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const data = productSchema.parse(req.body);
+
     const product = await prisma.product.create({
       data: { ...data, metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined },
     });
+
+    // Se deliveryContent for um array JSON, converte em StockItems automaticamente
+    const synced = await syncDeliveryContentToStockItems(
+      product.id,
+      data.deliveryContent,
+      data.deliveryType
+    );
+    if (synced) {
+      // Atualiza deliveryContent para sinalizar que usa FIFO (mantém o JSON como referência)
+      logger.info(`[adminProducts] Produto ${product.id} criado com StockItems FIFO`);
+    }
+
     res.status(201).json({ success: true, data: { ...product, price: Number(product.price) } });
   }
 );
@@ -219,10 +280,24 @@ adminProductsRouter.put(
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     const data = productSchema.partial().parse(req.body);
+
     const product = await prisma.product.update({
       where: { id: req.params.id },
       data: { ...data, metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined },
     });
+
+    // Se deliveryContent for um array JSON, sincroniza os StockItems
+    if (data.deliveryContent && data.deliveryType) {
+      const synced = await syncDeliveryContentToStockItems(
+        product.id,
+        data.deliveryContent,
+        data.deliveryType
+      );
+      if (synced) {
+        logger.info(`[adminProducts] StockItems FIFO sincronizados para produto ${product.id}`);
+      }
+    }
+
     res.json({ success: true, data: { ...product, price: Number(product.price) } });
   }
 );
