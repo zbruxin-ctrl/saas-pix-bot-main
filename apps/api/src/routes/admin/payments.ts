@@ -25,7 +25,7 @@ adminPaymentsRouter.get('/', async (req: Request, res: Response) => {
   const where: Record<string, unknown> = {};
 
   if (status) {
-    where.status = status;
+    where.status = status as import('@prisma/client').PaymentStatus;
   }
 
   if (startDate || endDate) {
