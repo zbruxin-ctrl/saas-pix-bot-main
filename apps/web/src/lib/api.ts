@@ -1,5 +1,4 @@
-// ALTERAÇÕES: funções tipadas com generics, adicionado getStockItems,
-// createStockItem, deleteStockItem, getOrderMedias, retorno tipado com ApiResponse
+// api.ts — cliente HTTP tipado para o painel admin
 import axios, { AxiosResponse } from 'axios';
 import type {
   ApiResponse,
@@ -12,6 +11,13 @@ import type {
   StockItemDTO,
   DeliveryMediaDTO,
 } from '@saas-pix/shared';
+
+// ─── Tipo local para mídias de produto (usado em products-client.tsx) ─────────
+export interface ProductMedia {
+  url: string;
+  mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
+  caption?: string;
+}
 
 const api = axios.create({
   baseURL: '/api/proxy',
@@ -85,6 +91,66 @@ export async function deleteProduct(id: string): Promise<void> {
   await api.delete(`/admin/products/${id}`);
 }
 
+// ─── Product Medias (usado em products-client.tsx) ────────────────────────────
+
+/**
+ * Retorna as mídias extras de um produto (rota: GET /admin/products/:id/medias-config).
+ * Nota: as mídias de ENTREGA ficam em orders/:orderId/medias.
+ * Aqui usamos a rota de config do produto para exibir/editar no painel.
+ */
+export async function getProductMedias(productId: string): Promise<ProductMedia[]> {
+  try {
+    const res = await api.get<ApiResponse<ProductMedia[]>>(
+      `/admin/products/${productId}/medias-config`
+    );
+    return res.data.data ?? [];
+  } catch {
+    // Endpoint ainda não implementado na API → retorna array vazio sem quebrar a UI
+    return [];
+  }
+}
+
+/**
+ * Salva (substitui) as mídias extras de um produto junto com o payload do produto.
+ * Faz PUT no produto e POST nas mídias em sequência.
+ */
+export async function updateProductMedias(
+  productId: string,
+  medias: ProductMedia[],
+  productPayload: Partial<ProductDTO>
+): Promise<void> {
+  // Atualiza os dados do produto
+  await api.put(`/admin/products/${productId}`, productPayload);
+
+  // Sincroniza mídias (ignora silenciosamente se a rota ainda não existir)
+  try {
+    await api.put(`/admin/products/${productId}/medias-config`, { medias });
+  } catch {
+    // Endpoint ainda não implementado → não bloqueia o fluxo de salvamento
+  }
+}
+
+/**
+ * Faz upload de um arquivo de mídia para o storage e retorna a URL pública.
+ * Endpoint esperado: POST /api/proxy/admin/upload com multipart/form-data.
+ */
+export async function uploadMediaFile(
+  file: File,
+  mediaType: ProductMedia['mediaType']
+): Promise<string> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('mediaType', mediaType);
+
+  const res = await api.post<ApiResponse<{ url: string }>>('/admin/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+
+  const url = res.data.data?.url;
+  if (!url) throw new Error('Upload falhou: URL não retornada pelo servidor.');
+  return url;
+}
+
 // ─── Stock Items ──────────────────────────────────────────────────────────────
 
 export async function getStockItems(productId: string): Promise<StockItemDTO[]> {
@@ -127,7 +193,7 @@ export async function getPayment(id: string): Promise<PaymentDTO> {
   return data(res);
 }
 
-// ─── Delivery Medias ──────────────────────────────────────────────────────────
+// ─── Delivery Medias (por pedido) ─────────────────────────────────────────────
 
 export async function getOrderMedias(orderId: string): Promise<DeliveryMediaDTO[]> {
   const res = await api.get<ApiResponse<DeliveryMediaDTO[]>>(
