@@ -1,5 +1,5 @@
-// ALTERAÇÕES: adicionadas métricas operacionais (expirados, cancelados, reembolsados,
-// falhas de entrega hoje, falhas de webhook hoje, pedidos com falha)
+// Dashboard admin — queries sequenciais para não esgotar o connection pool
+// (planos gratuitos têm connection_limit=1; Promise.all com 15 queries paralelas causa timeout)
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma';
 import { AuthenticatedRequest } from '../../middleware/auth';
@@ -11,95 +11,79 @@ adminDashboardRouter.get('/', async (_req: AuthenticatedRequest, res: Response) 
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
-  const [
-    totalApproved,
-    totalPending,
-    totalRejected,
-    totalExpired,
-    totalCancelled,
-    totalRefunded,
-    revenueResult,
-    todayPayments,
-    todayRevenue,
-    monthPayments,
-    monthRevenue,
-    deliveriesFailedToday,
-    webhooksFailedToday,
-    ordersWithFailure,
-    recentPayments,
-  ] = await Promise.all([
-    prisma.payment.count({ where: { status: 'APPROVED' } }),
-    prisma.payment.count({ where: { status: 'PENDING' } }),
-    prisma.payment.count({ where: { status: { in: ['REJECTED'] } } }),
-    prisma.payment.count({ where: { status: 'EXPIRED' } }),
-    prisma.payment.count({ where: { status: 'CANCELLED' } }),
-    prisma.payment.count({ where: { status: 'REFUNDED' } }),
-    prisma.payment.aggregate({
-      where: { status: 'APPROVED' },
-      _sum: { amount: true },
-    }),
-    prisma.payment.count({
-      where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
-    }),
-    prisma.payment.aggregate({
-      where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
-      _sum: { amount: true },
-    }),
-    prisma.payment.count({
-      where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
-    }),
-    prisma.payment.aggregate({
-      where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
-      _sum: { amount: true },
-    }),
-    // Logs de entrega com falha hoje
-    prisma.deliveryLog.count({
-      where: { status: 'FAILED', createdAt: { gte: startOfToday } },
-    }),
-    // Webhooks com falha hoje
-    prisma.webhookEvent.count({
-      where: { status: 'FAILED', createdAt: { gte: startOfToday } },
-    }),
-    // Pedidos com status FAILED (entrega mal-sucedida)
-    prisma.order.count({ where: { status: 'FAILED' } }),
-    // Últimos 10 pagamentos aprovados
-    prisma.payment.findMany({
-      where: { status: 'APPROVED' },
-      include: {
-        product: { select: { name: true } },
-        telegramUser: { select: { username: true, firstName: true } },
-      },
-      orderBy: { approvedAt: 'desc' },
-      take: 10,
-    }),
-  ]);
+  // --- queries sequenciais para respeitar connection_limit=1 ---
+  const totalApproved       = await prisma.payment.count({ where: { status: 'APPROVED' } });
+  const totalPending        = await prisma.payment.count({ where: { status: 'PENDING' } });
+  const totalRejected       = await prisma.payment.count({ where: { status: { in: ['REJECTED'] } } });
+  const totalExpired        = await prisma.payment.count({ where: { status: 'EXPIRED' } });
+  const totalCancelled      = await prisma.payment.count({ where: { status: 'CANCELLED' } });
+  const totalRefunded       = await prisma.payment.count({ where: { status: 'REFUNDED' } });
+
+  const revenueResult       = await prisma.payment.aggregate({
+    where: { status: 'APPROVED' },
+    _sum: { amount: true },
+  });
+
+  const todayPayments       = await prisma.payment.count({
+    where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
+  });
+  const todayRevenue        = await prisma.payment.aggregate({
+    where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
+    _sum: { amount: true },
+  });
+
+  const monthPayments       = await prisma.payment.count({
+    where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
+  });
+  const monthRevenue        = await prisma.payment.aggregate({
+    where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
+    _sum: { amount: true },
+  });
+
+  const deliveriesFailedToday = await prisma.deliveryLog.count({
+    where: { status: 'FAILED', createdAt: { gte: startOfToday } },
+  });
+  const webhooksFailedToday   = await prisma.webhookEvent.count({
+    where: { status: 'FAILED', createdAt: { gte: startOfToday } },
+  });
+  const ordersWithFailure     = await prisma.order.count({ where: { status: 'FAILED' } });
+
+  const recentPayments        = await prisma.payment.findMany({
+    where: { status: 'APPROVED' },
+    include: {
+      product:      { select: { name: true } },
+      telegramUser: { select: { username: true, firstName: true } },
+    },
+    orderBy: { approvedAt: 'desc' },
+    take: 10,
+  });
 
   res.json({
     success: true,
     data: {
       stats: {
-        totalRevenue: Number(revenueResult._sum.amount || 0),
+        totalRevenue:         Number(revenueResult._sum.amount || 0),
         totalApproved,
         totalPending,
         totalRejected,
         totalExpired,
         totalCancelled,
         totalRefunded,
-        revenueToday: Number(todayRevenue._sum.amount || 0),
-        paymentsToday: todayPayments,
-        revenueThisMonth: Number(monthRevenue._sum.amount || 0),
-        paymentsThisMonth: monthPayments,
+        revenueToday:         Number(todayRevenue._sum.amount || 0),
+        paymentsToday:        todayPayments,
+        revenueThisMonth:     Number(monthRevenue._sum.amount || 0),
+        paymentsThisMonth:    monthPayments,
         deliveriesFailedToday,
         webhooksFailedToday,
         ordersWithFailure,
       },
       recentPayments: recentPayments.map((p) => ({
-        id: p.id,
-        amount: Number(p.amount),
-        status: p.status,
-        approvedAt: p.approvedAt,
+        id:          p.id,
+        amount:      Number(p.amount),
+        status:      p.status,
+        approvedAt:  p.approvedAt,
         productName: p.product.name,
-        userName: p.telegramUser.firstName || p.telegramUser.username || 'Sem nome',
+        userName:    p.telegramUser.firstName || p.telegramUser.username || 'Sem nome',
       })),
     },
   });
