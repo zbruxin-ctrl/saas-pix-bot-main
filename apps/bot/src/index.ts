@@ -168,8 +168,11 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
     await ctx.deleteMessage(loadingMsg.message_id).catch(() => {});
 
     // Formata data de expiração
-    const expiresAt = new Date(payment.expiresAt);
-    const expiresStr = expiresAt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    const expiresStr = expiresAt.toLocaleTimeString('pt-BR', {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'America/Sao_Paulo',
+    });
 
     // Envia resumo do pagamento
     await ctx.replyWithMarkdown(
