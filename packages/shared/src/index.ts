@@ -1,6 +1,10 @@
 // Tipos compartilhados entre todos os apps do monorepo
 // ALTERAÇÕES: TOKEN→FILE_MEDIA, CANCELLED em OrderStatus, novos DTOs (DeliveryLog, DeliveryMedia,
 // WebhookEvent, StockItem, OrderDetail), DashboardStats com métricas operacionais
+// WALLET: WalletTransactionType, WalletTransactionDTO, CreateDepositRequest/Response,
+//         WalletBalanceResponse, WalletAdjustRequest
+// PRODUCT: sortOrder em ProductDTO
+// PAYMENT: paidWithBalance em CreatePaymentResponse
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -33,6 +37,8 @@ export type WebhookEventStatus =
   | 'FAILED'
   | 'IGNORED';
 
+export type WalletTransactionType = 'DEPOSIT' | 'PURCHASE' | 'REFUND';
+
 // ─── DTOs base ────────────────────────────────────────────────────────────────
 
 export interface ProductDTO {
@@ -43,6 +49,7 @@ export interface ProductDTO {
   deliveryType: DeliveryType;
   isActive: boolean;
   stock?: number | null;
+  sortOrder: number;
   metadata?: Record<string, unknown> | null;
   createdAt: string;
 }
@@ -54,6 +61,16 @@ export interface TelegramUserDTO {
   firstName?: string | null;
   lastName?: string | null;
   isBlocked: boolean;
+  balance: number;
+  createdAt: string;
+}
+
+export interface WalletTransactionDTO {
+  id: string;
+  type: WalletTransactionType;
+  amount: number;
+  description: string;
+  paymentId?: string | null;
   createdAt: string;
 }
 
@@ -167,11 +184,37 @@ export interface CreatePaymentRequest {
 
 export interface CreatePaymentResponse {
   paymentId: string;
-  pixQrCode: string;       // base64
-  pixQrCodeText: string;   // copia e cola
+  pixQrCode: string;       // base64 (vazio se paidWithBalance)
+  pixQrCodeText: string;   // copia e cola (vazio se paidWithBalance)
   amount: number;
   expiresAt: string;
   productName: string;
+  paidWithBalance?: boolean; // true = debitado do saldo, sem necessidade de PIX
+}
+
+export interface CreateDepositRequest {
+  telegramId: string;
+  amount: number;
+  firstName?: string;
+  username?: string;
+}
+
+export interface CreateDepositResponse {
+  paymentId: string;
+  pixQrCode: string;
+  pixQrCodeText: string;
+  amount: number;
+  expiresAt: string;
+}
+
+export interface WalletBalanceResponse {
+  balance: number;
+  transactions: WalletTransactionDTO[];
+}
+
+export interface WalletAdjustRequest {
+  amount: number;        // positivo = crédito, negativo = débito
+  justification: string;
 }
 
 export interface ApiResponse<T = unknown> {
