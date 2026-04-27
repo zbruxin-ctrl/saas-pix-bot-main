@@ -38,12 +38,14 @@ model TelegramUser {
   lastName     String?
   languageCode String?
   isBlocked    Boolean      @default(false)
+  balance      Decimal      @default(0) @db.Decimal(10, 2)
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 
-  payments         Payment[]
-  orders           Order[]
-  stockReservations StockReservation[]
+  payments            Payment[]
+  orders              Order[]
+  stockReservations   StockReservation[]
+  walletTransactions  WalletTransaction[]
 
   @@map("telegram_users")
 }
@@ -58,6 +60,7 @@ model Product {
   deliveryContent String
   isActive        Boolean      @default(true)
   stock           Int?         // null = ilimitado; contagem bruta antes de reservas
+  sortOrder       Int          @default(0)
   metadata        Json?
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
@@ -78,13 +81,10 @@ enum DeliveryType {
 }
 
 // ─── StockItem — unidade individual de estoque (base do FIFO) ─────────────────
-// Cada unidade cadastrada no produto vira uma linha aqui.
-// Ao criar pagamento: reserva a unidade mais antiga disponível (FIFO).
-// Ao aprovar: confirma. Ao expirar/cancelar: libera.
 model StockItem {
   id          String          @id @default(cuid())
   productId   String
-  content     String          @db.Text // conteúdo desta unidade (sobrescreve deliveryContent se presente)
+  content     String          @db.Text
   status      StockItemStatus @default(AVAILABLE)
   reservedAt  DateTime?
   confirmedAt DateTime?
@@ -105,14 +105,14 @@ model StockItem {
 }
 
 enum StockItemStatus {
-  AVAILABLE  // disponível para reserva
-  RESERVED   // reservado, aguardando pagamento
-  CONFIRMED  // pagamento aprovado
-  DELIVERED  // entregue ao usuário
-  RELEASED   // liberado (expirou ou cancelou)
+  AVAILABLE
+  RESERVED
+  CONFIRMED
+  DELIVERED
+  RELEASED
 }
 
-// ─── StockReservation — mantido para compatibilidade, mas não mais usado no FIFO ─
+// ─── StockReservation ─────────────────────────────────────────────────────────
 model StockReservation {
   id             String                 @id @default(cuid())
   productId      String
@@ -142,11 +142,34 @@ enum StockReservationStatus {
   RELEASED
 }
 
+// ─── WalletTransaction — histórico de movimentações de saldo ─────────────────
+model WalletTransaction {
+  id             String                @id @default(cuid())
+  telegramUserId String
+  type           WalletTransactionType
+  amount         Decimal               @db.Decimal(10, 2)
+  description    String
+  paymentId      String?
+  createdAt      DateTime              @default(now())
+
+  telegramUser TelegramUser @relation(fields: [telegramUserId], references: [id])
+
+  @@index([telegramUserId])
+  @@index([createdAt])
+  @@map("wallet_transactions")
+}
+
+enum WalletTransactionType {
+  DEPOSIT
+  PURCHASE
+  REFUND
+}
+
 // ─── Payment ──────────────────────────────────────────────────────────────────
 model Payment {
   id             String        @id @default(cuid())
   telegramUserId String
-  productId      String
+  productId      String?
   mercadoPagoId  String?       @unique
   amount         Decimal       @db.Decimal(10, 2)
   status         PaymentStatus @default(PENDING)
@@ -160,7 +183,7 @@ model Payment {
   updatedAt      DateTime      @updatedAt
 
   telegramUser     TelegramUser      @relation(fields: [telegramUserId], references: [id])
-  product          Product           @relation(fields: [productId], references: [id])
+  product          Product?          @relation(fields: [productId], references: [id])
   order            Order?
   webhookEvents    WebhookEvent[]
   stockReservation StockReservation?
