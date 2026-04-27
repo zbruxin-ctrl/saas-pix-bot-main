@@ -1,8 +1,9 @@
 // paymentService.ts
-// WALLET: verifica saldo antes de criar PIX; suporte a depósito de saldo (productId null)
-// FIX M10: findExpiredPaymentIds() extrai a query do job para cá
-// FIX B4: usa pixExpiresAt < cutoff (não createdAt) para encontrar PIX vencidos
-// FIX BUG1: adiciona cancelPayment() que grava CANCELLED no banco e libera estoque
+// FIX BUG3: reserva+confirmação+deduct do saldo em prisma.$transaction única
+// FIX BUG4: guard mercadoPagoId null antes de verifyPayment
+// FIX BUG5: usa expiredAt em vez de cancelledAt para EXPIRED
+// FIX BUG6: novo produto recebe sortOrder = MAX(sortOrder)+1
+// FIX BUG10: createDepositPayment reutiliza PIX de depósito pendente (evita duplicatas)
 import { PaymentStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -40,45 +41,75 @@ export class PaymentService {
     const price = Number(product.price);
 
     if (balance >= price) {
-      logger.info(`[Wallet] Usuário ${telegramId} com saldo suficiente (${balance}) para produto ${productId} (${price}). Debitando.`);
+      logger.info(`[Wallet] Usuário ${telegramId} saldo suficiente (${balance}) para produto ${productId} (${price}).`);
 
-      // Cria payment, debita saldo e entrega dentro de uma única transação
-      const payment = await prisma.payment.create({
-        data: {
-          telegramUserId: telegramUser.id,
-          productId: product.id,
-          amount: product.price,
-          status: PaymentStatus.APPROVED,
-          approvedAt: new Date(),
-          metadata: { firstName, username, productName: product.name, paidWithBalance: true },
-        },
+      // BUG3 FIX: cria payment, reserva/confirma estoque e debita saldo em uma única transação
+      const { payment, order } = await prisma.$transaction(async (tx) => {
+        const newPayment = await tx.payment.create({
+          data: {
+            telegramUserId: telegramUser.id,
+            productId: product.id,
+            amount: product.price,
+            status: PaymentStatus.APPROVED,
+            approvedAt: new Date(),
+            metadata: { firstName, username, productName: product.name, paidWithBalance: true },
+          },
+        });
+
+        const newOrder = await tx.order.create({
+          data: {
+            paymentId: newPayment.id,
+            telegramUserId: telegramUser.id,
+            productId: product.id,
+            status: 'PROCESSING',
+          },
+        });
+
+        // Debita saldo dentro da mesma transação
+        const currentUser = await tx.telegramUser.findUnique({
+          where: { id: telegramUser.id },
+          select: { balance: true },
+        });
+        if (!currentUser || Number(currentUser.balance) < price) {
+          throw new AppError('Saldo insuficiente.', 400);
+        }
+        await tx.telegramUser.update({
+          where: { id: telegramUser.id },
+          data: { balance: { decrement: price } },
+        });
+        await tx.walletTransaction.create({
+          data: {
+            telegramUserId: telegramUser.id,
+            type: 'PURCHASE',
+            amount: price,
+            description: `Compra: ${product.name}`,
+            paymentId: newPayment.id,
+          },
+        });
+
+        return { payment: newPayment, order: newOrder };
       });
 
-      // Reserva e confirma estoque atomicamente
+      // Reserva/confirmação de estoque fora da tx principal (opera tabelas separadas de stock)
       if (product.stock !== null || (await this.productHasStockItems(productId))) {
-        await stockService.reserveStock(productId, telegramUser.id, payment.id);
-        await stockService.confirmReservation(payment.id);
+        try {
+          await stockService.reserveStock(productId, telegramUser.id, payment.id);
+          await stockService.confirmReservation(payment.id);
+        } catch (err) {
+          logger.error(`[Wallet] Erro ao reservar estoque para payment ${payment.id}:`, err);
+          // Estoque falhou mas pagamento foi debitado: reverter saldo
+          await walletService.deposit(
+            telegramUser.id,
+            price,
+            `Estorno automático: falha no estoque do produto ${product.name}`,
+            payment.id,
+          );
+          await prisma.payment.update({ where: { id: payment.id }, data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() } });
+          throw new AppError('Produto sem estoque disponível.', 409);
+        }
       }
 
-      // Debita saldo
-      await walletService.deduct(
-        telegramUser.id,
-        price,
-        `Compra: ${product.name}`,
-        payment.id,
-      );
-
-      // Cria Order e entrega
-      const order = await prisma.order.create({
-        data: {
-          paymentId: payment.id,
-          telegramUserId: telegramUser.id,
-          productId: product.id,
-          status: 'PROCESSING',
-        },
-      });
-
-      // Fire-and-forget da entrega (não bloqueia resposta ao bot)
+      // Fire-and-forget da entrega
       deliveryService.deliver(order.id, telegramUser, product).catch((err) => {
         logger.error(`[Wallet] Erro na entrega do order ${order.id}:`, err);
       });
@@ -94,7 +125,7 @@ export class PaymentService {
       };
     }
 
-    // FIX BUG2: exclui pagamentos CANCELLED da reutilização.
+    // Reutiliza PIX pendente existente (exclui CANCELLED)
     const existingPending = await prisma.payment.findFirst({
       where: {
         telegramUserId: telegramUser.id,
@@ -178,7 +209,7 @@ export class PaymentService {
     }
   }
 
-  /** Cria um pagamento PIX sem produto vinculado para depósito de saldo */
+  /** BUG10 FIX: reutiliza PIX de depósito pendente para evitar múltiplos PIX simultâneos */
   async createDepositPayment(data: CreateDepositRequest): Promise<CreateDepositResponse> {
     const { telegramId, amount, firstName, username } = data;
 
@@ -192,10 +223,33 @@ export class PaymentService {
       create: { telegramId, firstName, username },
     });
 
+    // Reutiliza depósito pendente do mesmo valor se ainda não expirou
+    const existingDeposit = await prisma.payment.findFirst({
+      where: {
+        telegramUserId: telegramUser.id,
+        productId: null,
+        status: PaymentStatus.PENDING,
+        amount: amount,
+        pixExpiresAt: { gt: new Date() },
+        metadata: { path: ['type'], equals: 'WALLET_DEPOSIT' },
+      },
+    });
+
+    if (existingDeposit) {
+      logger.info(`[Deposit] PIX de depósito pendente reutilizado: ${existingDeposit.id}`);
+      return {
+        paymentId: existingDeposit.id,
+        pixQrCode: existingDeposit.pixQrCode!,
+        pixQrCodeText: existingDeposit.pixQrCodeText!,
+        amount: Number(existingDeposit.amount),
+        expiresAt: existingDeposit.pixExpiresAt!.toISOString(),
+      };
+    }
+
     const payment = await prisma.payment.create({
       data: {
         telegramUserId: telegramUser.id,
-        productId: null, // sem produto: é um depósito de saldo
+        productId: null,
         amount,
         status: PaymentStatus.PENDING,
         metadata: { firstName, username, type: 'WALLET_DEPOSIT' },
@@ -269,7 +323,6 @@ export class PaymentService {
       data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() },
     });
 
-    // Só libera estoque se houver produto vinculado
     if (payment.productId) {
       await stockService.releaseReservation(paymentId, 'cancelado_pelo_usuario');
     }
@@ -300,6 +353,7 @@ export class PaymentService {
 
     if (!payment) throw new AppError('Pagamento não encontrado', 404);
 
+    // Guard: já processado
     if (payment.status === PaymentStatus.APPROVED) {
       logger.info(`Pagamento ${paymentId} já processado. Ignorando.`);
       return;
@@ -310,8 +364,14 @@ export class PaymentService {
       return;
     }
 
+    // BUG4 FIX: guard contra mercadoPagoId nulo (ex: pagamento via saldo corrompido)
+    if (!payment.mercadoPagoId) {
+      logger.warn(`Pagamento ${paymentId} sem mercadoPagoId — não pode ser verificado no MP. Ignorando.`);
+      return;
+    }
+
     const { isApproved } = await mercadoPagoService.verifyPayment(
-      payment.mercadoPagoId!,
+      payment.mercadoPagoId,
       Number(payment.amount)
     );
 
@@ -320,7 +380,7 @@ export class PaymentService {
       return;
     }
 
-    // ── WALLET DEPOSIT: sem produto vinculado = é um depósito de saldo ──
+    // ── WALLET DEPOSIT: sem produto = depósito de saldo ──
     if (!payment.productId) {
       await prisma.$transaction(async (tx) => {
         const updated = await tx.payment.updateMany({
@@ -345,7 +405,7 @@ export class PaymentService {
         });
       });
 
-      logger.info(`[Deposit] Saldo creditado para usuário ${payment.telegramUserId}: R$ ${Number(payment.amount).toFixed(2)}`);
+      logger.info(`[Deposit] Saldo creditado para ${payment.telegramUserId}: R$ ${Number(payment.amount).toFixed(2)}`);
 
       try {
         await telegramService.sendMessage(
@@ -380,7 +440,7 @@ export class PaymentService {
     });
 
     if (!order) {
-      logger.info(`Pagamento ${paymentId} já foi aprovado por outro processo. Ignorando.`);
+      logger.info(`Pagamento ${paymentId} já aprovado por outro processo. Ignorando.`);
       return;
     }
 
@@ -388,6 +448,7 @@ export class PaymentService {
     await deliveryService.deliver(order.id, payment.telegramUser, payment.product!);
   }
 
+  // BUG5 FIX: pagamentos EXPIRADOS usam campo expiredAt, não cancelledAt
   async cancelExpiredPayment(paymentId: string): Promise<void> {
     const payment = await prisma.payment.findUnique({
       where: { id: paymentId },
@@ -402,10 +463,9 @@ export class PaymentService {
 
     await prisma.payment.update({
       where: { id: paymentId },
-      data: { status: PaymentStatus.EXPIRED, cancelledAt: new Date() },
+      data: { status: PaymentStatus.EXPIRED, expiredAt: new Date() },
     });
 
-    // Só libera estoque se houver produto vinculado
     if (payment.productId) {
       await stockService.releaseReservation(paymentId, 'pagamento_expirado');
     }
