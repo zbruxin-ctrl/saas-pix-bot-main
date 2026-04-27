@@ -1,4 +1,6 @@
 // routes/admin/adminProducts.ts
+// SORT: PATCH /reorder para drag-and-drop no painel admin
+// SORT: GET / agora ordena por sortOrder asc, createdAt asc
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import { Prisma, StockItemStatus } from '@prisma/client';
@@ -28,7 +30,17 @@ const listQuerySchema = z.object({
   perPage: z.string().default('20').transform(Number),
 });
 
-// ─── Multer ───────────────────────────────────────────────────────────────────
+const reorderSchema = z.object({
+  items: z.array(
+    z.object({
+      id: z.string().min(1),
+      sortOrder: z.number().int().min(0),
+    })
+  ).min(1),
+});
+
+// ─── Multer ───────────────────────────────────────────────────────────────
+
 const uploadDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
@@ -77,12 +89,6 @@ async function uploadToCloudinary(
 /** Tipos FIFO que usam StockItems como fila */
 const FIFO_TYPES = ['TEXT', 'LINK', 'ACCOUNT'];
 
-/**
- * Sincroniza itens FIFO recebidos como array para StockItems.
- * Apaga apenas os AVAILABLE (preserva RESERVED/CONFIRMED/DELIVERED).
- * Zera o deliveryContent do produto (StockItem é a única fonte de verdade).
- * Retorna true se sincronizou.
- */
 async function syncFifoItems(
   productId: string,
   items: string[],
@@ -93,7 +99,6 @@ async function syncFifoItems(
   if (valid.length === 0) return false;
 
   await prisma.$transaction(async (tx) => {
-    // Remove apenas os disponíveis (não toca nos entregues ou reservados)
     await tx.stockItem.deleteMany({
       where: { productId, status: StockItemStatus.AVAILABLE },
     });
@@ -104,7 +109,6 @@ async function syncFifoItems(
         status: StockItemStatus.AVAILABLE,
       })),
     });
-    // Limpa deliveryContent — StockItem é a fonte de verdade
     await tx.product.update({
       where: { id: productId },
       data: { deliveryContent: '__FIFO__' },
@@ -116,6 +120,7 @@ async function syncFifoItems(
 }
 
 // ─── Upload ────────────────────────────────────────────────────────────────────
+
 adminProductsRouter.post(
   '/upload',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -142,7 +147,8 @@ adminProductsRouter.post(
   }
 );
 
-// ─── Listagem ─────────────────────────────────────────────────────────────────
+// ─── Listagem (ordenada por sortOrder) ────────────────────────────────────────────
+
 adminProductsRouter.get(
   '/',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -150,7 +156,11 @@ adminProductsRouter.get(
     const { page, perPage } = listQuerySchema.parse(req.query);
     const skip = (page - 1) * perPage;
     const [products, total] = await Promise.all([
-      prisma.product.findMany({ orderBy: { createdAt: 'desc' }, skip, take: perPage }),
+      prisma.product.findMany({
+        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+        skip,
+        take: perPage,
+      }),
       prisma.product.count(),
     ]);
     res.json({
@@ -166,7 +176,30 @@ adminProductsRouter.get(
   }
 );
 
-// ─── Estoque consolidado ───────────────────────────────────────────────────────
+// ─── PATCH /reorder — drag-and-drop de produtos ──────────────────────────────────
+
+adminProductsRouter.patch(
+  '/reorder',
+  requireRole('ADMIN', 'SUPERADMIN'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    const { items } = reorderSchema.parse(req.body);
+
+    await prisma.$transaction(
+      items.map(({ id, sortOrder }) =>
+        prisma.product.update({
+          where: { id },
+          data: { sortOrder },
+        })
+      )
+    );
+
+    logger.info(`[adminProducts] Ordem de ${items.length} produtos atualizada`);
+    res.json({ success: true, message: 'Ordem atualizada com sucesso' });
+  }
+);
+
+// ─── Estoque consolidado ─────────────────────────────────────────────────────
+
 adminProductsRouter.get(
   '/stock',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -189,7 +222,8 @@ adminProductsRouter.get(
   }
 );
 
-// ─── GET /:id — inclui stockItems AVAILABLE para o admin ─────────────────────
+// ─── GET /:id ───────────────────────────────────────────────────────────────────
+
 adminProductsRouter.get(
   '/:id',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -212,7 +246,8 @@ adminProductsRouter.get(
   }
 );
 
-// ─── POST / — criar produto ───────────────────────────────────────────────────
+// ─── POST / ──────────────────────────────────────────────────────────────────────
+
 adminProductsRouter.post(
   '/',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -220,7 +255,6 @@ adminProductsRouter.post(
     const data = productSchema.parse(req.body);
     const isFifo = FIFO_TYPES.includes(data.deliveryType);
 
-    // Para FIFO, armazena um marcador; itens vêm via StockItems
     const productData = {
       ...data,
       deliveryContent: isFifo ? '__FIFO__' : data.deliveryContent,
@@ -229,7 +263,6 @@ adminProductsRouter.post(
 
     const product = await prisma.product.create({ data: productData });
 
-    // Sincroniza itens FIFO se vier como array JSON
     if (isFifo) {
       try {
         const parsed = JSON.parse(data.deliveryContent);
@@ -237,7 +270,6 @@ adminProductsRouter.post(
           await syncFifoItems(product.id, parsed.map(String), data.deliveryType);
         }
       } catch {
-        // deliveryContent não é array — item único
         if (data.deliveryContent && data.deliveryContent !== '__FIFO__') {
           await syncFifoItems(product.id, [data.deliveryContent], data.deliveryType);
         }
@@ -248,7 +280,8 @@ adminProductsRouter.post(
   }
 );
 
-// ─── PUT /:id — atualizar produto ─────────────────────────────────────────────
+// ─── PUT /:id ───────────────────────────────────────────────────────────────────
+
 adminProductsRouter.put(
   '/:id',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -261,7 +294,6 @@ adminProductsRouter.put(
       metadata: (data.metadata as Prisma.InputJsonValue) ?? undefined,
     };
 
-    // Para FIFO nunca armazena os itens no deliveryContent
     if (isFifo) {
       updateData.deliveryContent = '__FIFO__';
     }
@@ -271,7 +303,6 @@ adminProductsRouter.put(
       data: updateData,
     });
 
-    // Sincroniza os itens FIFO enviados pelo frontend
     if (isFifo && data.deliveryContent && data.deliveryContent !== '__FIFO__') {
       try {
         const parsed = JSON.parse(data.deliveryContent);
@@ -289,7 +320,8 @@ adminProductsRouter.put(
   }
 );
 
-// ─── DELETE /:id ───────────────────────────────────────────────────────────────
+// ─── DELETE /:id ────────────────────────────────────────────────────────────────
+
 adminProductsRouter.delete(
   '/:id',
   requireRole('SUPERADMIN'),
@@ -299,7 +331,8 @@ adminProductsRouter.delete(
   }
 );
 
-// ─── Mídias de configuração do produto ────────────────────────────────────────
+// ─── Mídias de configuração do produto ───────────────────────────────────────────────
+
 adminProductsRouter.get(
   '/:id/medias-config',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -334,7 +367,8 @@ adminProductsRouter.put(
   }
 );
 
-// ─── StockItem CRUD ───────────────────────────────────────────────────────────
+// ─── StockItem CRUD ────────────────────────────────────────────────────────────────
+
 const stockItemSchema = z.object({ content: z.string().min(1) });
 
 adminProductsRouter.get(
@@ -370,7 +404,8 @@ adminProductsRouter.delete(
   }
 );
 
-// ─── Mídias de entrega por pedido ─────────────────────────────────────────────
+// ─── Mídias de entrega por pedido ─────────────────────────────────────────────────
+
 const mediaSchema = z.object({
   url: z.string().url(),
   mediaType: z.enum(['IMAGE', 'VIDEO', 'FILE']),
