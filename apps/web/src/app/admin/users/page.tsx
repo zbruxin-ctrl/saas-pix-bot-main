@@ -12,7 +12,7 @@ interface User {
   isBlocked: boolean;
   totalSpent: number;
   createdAt: string;
-  _count: { payments: number; orders: number };
+  _count?: { payments: number; orders: number };
 }
 
 interface UsersResult {
@@ -35,7 +35,7 @@ export default function UsersPage() {
       const paginated = res.data;
       if (paginated) {
         setResult({
-          data: paginated.data as User[],
+          data: paginated.data as unknown as User[],
           total: paginated.total,
           totalPages: paginated.totalPages,
         });
@@ -99,7 +99,7 @@ export default function UsersPage() {
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-gray-600">{u.telegramId}</td>
                   <td className="px-4 py-3 font-semibold text-green-700">{formatCurrency(u.totalSpent)}</td>
-                  <td className="px-4 py-3 text-gray-700">{u._count.orders}</td>
+                  <td className="px-4 py-3 text-gray-700">{u._count?.orders ?? '—'}</td>
                   <td className="px-4 py-3 text-gray-500 text-xs">{formatDate(u.createdAt)}</td>
                 </tr>
               ))
