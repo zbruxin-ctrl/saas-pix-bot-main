@@ -1,4 +1,4 @@
-// schema.prisma — com StockItem para FIFO real por unidade
+// schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,7 +8,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// ─── Admin ────────────────────────────────────────────────────────────────────
+// ─── Admin ──────────────────────────────────────────────────────────────────
 model AdminUser {
   id           String     @id @default(cuid())
   email        String     @unique
@@ -59,16 +59,16 @@ model Product {
   deliveryType    DeliveryType
   deliveryContent String
   isActive        Boolean      @default(true)
-  stock           Int?         // null = ilimitado; contagem bruta antes de reservas
+  stock           Int?
   sortOrder       Int          @default(0)
   metadata        Json?
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
-  payments         Payment[]
-  orders           Order[]
+  payments          Payment[]
+  orders            Order[]
   stockReservations StockReservation[]
-  stockItems       StockItem[]
+  stockItems        StockItem[]
 
   @@map("products")
 }
@@ -80,7 +80,7 @@ enum DeliveryType {
   ACCOUNT
 }
 
-// ─── StockItem — unidade individual de estoque (base do FIFO) ─────────────────
+// ─── StockItem ─────────────────────────────────────────────────────────────────
 model StockItem {
   id          String          @id @default(cuid())
   productId   String
@@ -95,9 +95,9 @@ model StockItem {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
-  product  Product   @relation(fields: [productId], references: [id])
-  payment  Payment?  @relation(fields: [paymentId], references: [id])
-  order    Order?    @relation(fields: [orderId], references: [id])
+  product Product  @relation(fields: [productId], references: [id])
+  payment Payment? @relation(fields: [paymentId], references: [id])
+  order   Order?   @relation(fields: [orderId], references: [id])
 
   @@index([productId, status])
   @@index([productId, status, createdAt])
@@ -142,7 +142,7 @@ enum StockReservationStatus {
   RELEASED
 }
 
-// ─── WalletTransaction — histórico de movimentações de saldo ─────────────────
+// ─── WalletTransaction ─────────────────────────────────────────────────────────
 model WalletTransaction {
   id             String                @id @default(cuid())
   telegramUserId String
@@ -217,11 +217,12 @@ model Order {
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
 
-  telegramUser TelegramUser  @relation(fields: [telegramUserId], references: [id])
-  payment      Payment       @relation(fields: [paymentId], references: [id])
-  product      Product       @relation(fields: [productId], references: [id])
-  deliveryLogs DeliveryLog[]
-  stockItem    StockItem?
+  telegramUser  TelegramUser   @relation(fields: [telegramUserId], references: [id])
+  payment       Payment        @relation(fields: [paymentId], references: [id])
+  product       Product        @relation(fields: [productId], references: [id])
+  deliveryLogs  DeliveryLog[]
+  deliveryMedias DeliveryMedia[]
+  stockItem     StockItem?
 
   @@index([telegramUserId])
   @@index([status])
@@ -234,13 +235,14 @@ enum OrderStatus {
   FAILED
 }
 
-// ─── DeliveryLog ──────────────────────────────────────────────────────────────
+// ─── DeliveryLog ─────────────────────────────────────────────────────────────
 model DeliveryLog {
   id        String   @id @default(cuid())
   orderId   String
   status    String
   attempt   Int      @default(1)
   message   String?  @db.Text
+  error     String?  @db.Text
   createdAt DateTime @default(now())
 
   order Order @relation(fields: [orderId], references: [id])
@@ -250,22 +252,49 @@ model DeliveryLog {
   @@map("delivery_logs")
 }
 
-// ─── WebhookEvent ─────────────────────────────────────────────────────────────
-model WebhookEvent {
+// ─── DeliveryMedia ───────────────────────────────────────────────────────────
+model DeliveryMedia {
   id        String   @id @default(cuid())
-  source    String
-  eventType String
-  paymentId String?
-  payload   Json
-  status    String   @default("RECEIVED")
-  error     String?  @db.Text
+  orderId   String
+  url       String   @db.Text
+  mediaType String
+  caption   String?  @db.Text
+  sortOrder Int      @default(0)
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@map("delivery_medias")
+}
+
+// ─── WebhookEvent ────────────────────────────────────────────────────────────
+model WebhookEvent {
+  id          String             @id @default(cuid())
+  provider    String
+  eventType   String
+  externalId  String
+  paymentId   String?
+  rawPayload  Json
+  status      WebhookEventStatus @default(RECEIVED)
+  error       String?            @db.Text
+  processedAt DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
 
   payment Payment? @relation(fields: [paymentId], references: [id])
 
+  @@unique([provider, externalId, eventType])
   @@index([status])
   @@index([paymentId])
   @@index([createdAt])
   @@map("webhook_events")
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  IGNORED
+  FAILED
 }
