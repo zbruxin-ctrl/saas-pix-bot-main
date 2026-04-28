@@ -16,11 +16,31 @@ const STATUS_OPTIONS = [
   { value: 'EXPIRED', label: '⌛ Expirado' },
 ];
 
-// Retorna o nome do produto a exibir na coluna "Produto"
+const METHOD_OPTIONS = [
+  { value: '', label: 'Todos os métodos' },
+  { value: 'PIX', label: '📱 PIX' },
+  { value: 'BALANCE', label: '💰 Saldo' },
+  { value: 'MIXED', label: '🔀 Saldo + PIX' },
+];
+
 function getProductLabel(p: PaymentDTO): string {
   if (p.product?.name) return p.product.name;
-  // Sem produto vinculado = depósito de saldo
   return '💰 Saldo';
+}
+
+function MethodBadge({ method }: { method?: string | null }) {
+  if (!method) return <span className="text-gray-400 text-xs">—</span>;
+  const map: Record<string, { label: string; className: string }> = {
+    PIX:     { label: '📱 PIX',        className: 'bg-blue-50 text-blue-700 border border-blue-200' },
+    BALANCE: { label: '💰 Saldo',      className: 'bg-green-50 text-green-700 border border-green-200' },
+    MIXED:   { label: '🔀 Saldo+PIX',  className: 'bg-purple-50 text-purple-700 border border-purple-200' },
+  };
+  const cfg = map[method] ?? { label: method, className: 'bg-gray-50 text-gray-600 border border-gray-200' };
+  return (
+    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${cfg.className}`}>
+      {cfg.label}
+    </span>
+  );
 }
 
 export default function PaymentsPage() {
@@ -29,19 +49,20 @@ export default function PaymentsPage() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState('');
+  const [method, setMethod] = useState('');
   const [page, setPage] = useState(1);
 
   const fetchPayments = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await getPayments({ page, status: status || undefined, search: search || undefined });
+      const res = await getPayments({ page, status: status || undefined, search: search || undefined, method: method || undefined });
       setResult(res.data ?? null);
     } catch {
       //
     } finally {
       setLoading(false);
     }
-  }, [page, status, search]);
+  }, [page, status, search, method]);
 
   useEffect(() => {
     const t = setTimeout(fetchPayments, 300);
@@ -75,6 +96,15 @@ export default function PaymentsPage() {
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
+          <select
+            className="input sm:w-48"
+            value={method}
+            onChange={(e) => { setMethod(e.target.value); setPage(1); }}
+          >
+            {METHOD_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
         </div>
       </div>
 
@@ -87,6 +117,7 @@ export default function PaymentsPage() {
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Usuário</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Produto</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Valor</th>
+                <th className="text-left px-4 py-3 font-semibold text-gray-600">Método</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Status</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Data</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Ação</th>
@@ -95,13 +126,13 @@ export default function PaymentsPage() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="text-center py-12 text-gray-400">
+                  <td colSpan={7} className="text-center py-12 text-gray-400">
                     <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600 mx-auto" />
                   </td>
                 </tr>
               ) : result?.data.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="text-center py-12 text-gray-400">
+                  <td colSpan={7} className="text-center py-12 text-gray-400">
                     Nenhum pagamento encontrado
                   </td>
                 </tr>
@@ -117,6 +148,9 @@ export default function PaymentsPage() {
                     <td className="px-4 py-3 text-gray-700">{getProductLabel(p)}</td>
                     <td className="px-4 py-3 font-semibold text-gray-900">
                       {formatCurrency(p.amount)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <MethodBadge method={(p as any).paymentMethod} />
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge status={p.status} />
