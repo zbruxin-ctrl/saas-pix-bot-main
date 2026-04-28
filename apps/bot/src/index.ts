@@ -228,7 +228,10 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
 });
 
 // ─── Tela de escolha de método de pagamento ───────────────────────────
-// PERF #3: recebe o saldo já buscado em paralelo (sem request extra)
+// Regras:
+//   balance >= price  → Só Saldo | Só PIX
+//   0 < balance < price → Saldo + PIX | Só PIX
+//   balance == 0      → Só PIX
 
 async function showPaymentMethodScreen(
   ctx: Context,
@@ -250,7 +253,6 @@ async function showPaymentMethodScreen(
 
   const price = Number(product.price);
   const balanceStr = balance.toFixed(2);
-  const pixDiff = Math.max(0, price - balance).toFixed(2);
 
   const confirmMessage =
     `📦 *${product.name}*\n\n` +
@@ -259,13 +261,42 @@ async function showPaymentMethodScreen(
     `🏦 *Seu saldo:* R$ ${balanceStr}\n\n` +
     `*Como deseja pagar?*`;
 
+  // Monta os botões de acordo com o saldo disponível
+  const buttons = [];
+
+  if (balance >= price) {
+    // Saldo cobre tudo: oferece pagar só com saldo
+    buttons.push([
+      Markup.button.callback(
+        `💰 Só Saldo  (R$ ${price.toFixed(2)})`,
+        `pay_balance_${product.id}`
+      ),
+    ]);
+  }
+
+  // PIX sempre disponível
+  buttons.push([
+    Markup.button.callback(
+      `📱 Só PIX  (R$ ${price.toFixed(2)})`,
+      `pay_pix_${product.id}`
+    ),
+  ]);
+
+  if (balance > 0 && balance < price) {
+    // Saldo parcial: oferece modo misto
+    const pixDiff = (price - balance).toFixed(2);
+    buttons.push([
+      Markup.button.callback(
+        `🔀 Saldo + PIX  (saldo R$ ${balanceStr} + PIX R$ ${pixDiff})`,
+        `pay_mixed_${product.id}`
+      ),
+    ]);
+  }
+
+  buttons.push([Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')]);
+
   await editOrReply(ctx, confirmMessage, {
-    reply_markup: Markup.inlineKeyboard([
-      [Markup.button.callback(`💰 Só Saldo  (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)],
-      [Markup.button.callback(`📱 Só PIX  (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)],
-      [Markup.button.callback(`🔀 Saldo + PIX  (saldo R$ ${balanceStr} + PIX R$ ${pixDiff})`, `pay_mixed_${product.id}`)],
-      [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')],
-    ]).reply_markup,
+    reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
   });
 }
 
