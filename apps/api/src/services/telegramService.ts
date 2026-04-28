@@ -5,13 +5,18 @@ import { env } from '../config/env';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
 
+interface SendMessageOptions {
+  reply_markup?: object;
+}
+
 class TelegramService {
 
-  async sendMessage(chatId: string, text: string): Promise<void> {
+  async sendMessage(chatId: string, text: string, options?: SendMessageOptions): Promise<void> {
     await axios.post(`${TELEGRAM_API}/sendMessage`, {
       chat_id: chatId,
       text,
       parse_mode: 'Markdown',
+      ...(options ?? {}),
     });
   }
 
