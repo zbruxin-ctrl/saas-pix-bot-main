@@ -6,7 +6,9 @@ import { env } from '../config/env';
 const TELEGRAM_API = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
 
 interface SendMessageOptions {
+  parse_mode?: string;
   reply_markup?: object;
+  [key: string]: unknown;
 }
 
 class TelegramService {
