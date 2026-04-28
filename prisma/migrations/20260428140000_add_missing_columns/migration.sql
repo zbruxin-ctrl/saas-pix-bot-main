@@ -18,7 +18,6 @@ DO $$ BEGIN
 END $$;
 
 -- 3) Converte coluna status de text para enum
--- Precisa dropar o DEFAULT antes, converter, depois recolocar
 DO $$ BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -28,6 +27,7 @@ DO $$ BEGIN
     ALTER TABLE "webhook_events"
       ALTER COLUMN "status" TYPE "WebhookEventStatus"
       USING "status"::"WebhookEventStatus";
-    ALTER TABLE "webhook_events" ALTER COLUMN "status" SET DEFAULT 'RECEIVED':"WebhookEventStatus";
+    ALTER TABLE "webhook_events"
+      ALTER COLUMN "status" SET DEFAULT 'RECEIVED';
   END IF;
 END $$;
