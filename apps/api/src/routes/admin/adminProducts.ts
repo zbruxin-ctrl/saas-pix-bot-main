@@ -1,7 +1,7 @@
 // routes/admin/adminProducts.ts
 // FIX BUG2: rotas estáticas (/stock, /orders/:id/medias, /orders/medias/:id) ANTES de /:id
 // SORT: PATCH /reorder para drag-and-drop no painel admin
-// SORT: GET / agora ordena por sortOrder asc, createdAt asc
+// FIX PROD: sortOrder removido do orderBy até migration ser aplicada no Railway
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import { Prisma, StockItemStatus } from '@prisma/client';
@@ -148,54 +148,86 @@ adminProductsRouter.post(
   }
 );
 
-// ─── Listagem (ordenada por sortOrder) ─────────────────────────────────────────────
+// ─── Listagem ─────────────────────────────────────────────────────────────────
+// NOTA: sortOrder removido do orderBy até a migration ser aplicada no banco de produção.
+// Para aplicar a ordenação por sortOrder, execute no Railway:
+//   npx prisma migrate deploy
+// Depois remova este comentário e restaure: orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }]
 
 adminProductsRouter.get(
   '/',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const { page, perPage } = listQuerySchema.parse(req.query);
-    const skip = (page - 1) * perPage;
-    const [products, total] = await Promise.all([
-      prisma.product.findMany({
-        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
-        skip,
-        take: perPage,
-      }),
-      prisma.product.count(),
-    ]);
-    res.json({
-      success: true,
-      data: {
-        data: products.map((p) => ({ ...p, price: Number(p.price) })),
-        total,
-        page,
-        perPage,
-        totalPages: Math.ceil(total / perPage),
-      },
-    });
+    try {
+      const { page, perPage } = listQuerySchema.parse(req.query);
+      const skip = (page - 1) * perPage;
+
+      // Tenta ordenar por sortOrder; se a coluna não existir ainda, cai no fallback
+      let products: Prisma.ProductGetPayload<object>[];
+      let total: number;
+
+      try {
+        [products, total] = await Promise.all([
+          prisma.product.findMany({
+            orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+            skip,
+            take: perPage,
+          }),
+          prisma.product.count(),
+        ]);
+      } catch {
+        // Fallback: sortOrder ainda não existe no banco → ordena só por createdAt
+        [products, total] = await Promise.all([
+          prisma.product.findMany({
+            orderBy: { createdAt: 'asc' },
+            skip,
+            take: perPage,
+          }),
+          prisma.product.count(),
+        ]);
+      }
+
+      res.json({
+        success: true,
+        data: {
+          data: products.map((p) => ({ ...p, price: Number(p.price) })),
+          total,
+          page,
+          perPage,
+          totalPages: Math.ceil(total / perPage),
+        },
+      });
+    } catch (err) {
+      logger.error('[adminProducts] Erro ao listar produtos:', err);
+      res.status(500).json({ success: false, error: 'Erro ao listar produtos' });
+    }
   }
 );
 
-// ─── PATCH /reorder ───────────────────────────────────────────────────────────────
+// ─── PATCH /reorder ───────────────────────────────────────────────────────────
 
 adminProductsRouter.patch(
   '/reorder',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const { items } = reorderSchema.parse(req.body);
+    try {
+      const { items } = reorderSchema.parse(req.body);
 
-    await prisma.$transaction(
-      items.map(({ id, sortOrder }) =>
-        prisma.product.update({
-          where: { id },
-          data: { sortOrder },
-        })
-      )
-    );
+      await prisma.$transaction(
+        items.map(({ id, sortOrder }) =>
+          prisma.product.update({
+            where: { id },
+            data: { sortOrder },
+          })
+        )
+      );
 
-    logger.info(`[adminProducts] Ordem de ${items.length} produtos atualizada`);
-    res.json({ success: true, message: 'Ordem atualizada com sucesso' });
+      logger.info(`[adminProducts] Ordem de ${items.length} produtos atualizada`);
+      res.json({ success: true, message: 'Ordem atualizada com sucesso' });
+    } catch (err) {
+      logger.error('[adminProducts] Erro ao reordenar produtos:', err);
+      res.status(500).json({ success: false, error: 'Erro ao reordenar. Execute npx prisma migrate deploy no Railway.' });
+    }
   }
 );
 
