@@ -1,6 +1,6 @@
 {
   "installCommand": "cd ../.. && npm install",
-  "buildCommand": "cd ../../packages/shared && npx tsc && cd ../../apps/web && npx next build",
+  "buildCommand": "cd ../../packages/shared && ../../node_modules/.bin/tsc && cd ../../apps/web && ../../node_modules/.bin/next build",
   "outputDirectory": ".next",
   "framework": "nextjs"
 }
