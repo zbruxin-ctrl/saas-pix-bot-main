@@ -587,6 +587,7 @@ async function showHelp(ctx: Context): Promise<void> {
     `Entre em contato com nosso suporte informando o ID do pagamento.`,
     {
       reply_markup: Markup.inlineKeyboard([
+        [Markup.button.url('📞 Contatar Suporte', 'http://wa.me/+5511953699608')],
         [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')],
       ]).reply_markup,
     }
