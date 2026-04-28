@@ -174,6 +174,7 @@ export async function getPayments(
     startDate: string;
     endDate: string;
     search: string;
+    method: string;
   }>
 ): Promise<ApiResponse<PaginatedResponse<PaymentDTO>>> {
   const res = await api.get('/admin/payments', { params });
