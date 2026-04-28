@@ -4,7 +4,8 @@
 // FEATURE 3: animação de loading nos botões via answerCbQuery
 // FEATURE 4: escolha de método de pagamento (BALANCE | PIX | MIXED)
 // PERF #3: Promise.all para buscar produto + saldo em paralelo (era sequencial)
-// FIX WEBHOOK: bot registra handleUpdate na API via setBotHandler() — sem import cruzado
+// FIX WEBHOOK: bot registra handleUpdate na API via HTTP — sem import cruzado
+// FIX TS7016: removido node-fetch, usa fetch nativo do Node 20
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -635,41 +636,31 @@ bot.catch((err, ctx) => {
 });
 
 // ─── Inicialização ────────────────────────────────────────────────────
-// Em produção: registra o webhook no Telegram (URL pública da API)
-//             e registra o handleUpdate na API via HTTP interno.
-// Em desenvolvimento: usa polling normalmente.
+// Produção: webhook no Telegram + notifica API via fetch nativo (Node 20).
+// Desenvolvimento: polling.
 
 async function startBot(): Promise<void> {
   if (env.NODE_ENV === 'production' && env.BOT_WEBHOOK_URL) {
     const webhookUrl = `${env.BOT_WEBHOOK_URL}/telegram-webhook`;
 
-    // 1. Registra o webhook no Telegram
     await bot.telegram.setWebhook(webhookUrl, {
       secret_token: env.TELEGRAM_BOT_SECRET,
     });
     logger.info(`🤖 Webhook registrado no Telegram: ${webhookUrl}`);
 
-    // 2. Registra o handleUpdate na API para receber os updates
-    const { setBotHandler } = await import(`${env.API_URL.replace(/^https?:\/\/[^/]+/, '')}/lib/botHandler`)
-      .catch(() => null)
-      ?? {};
-
-    if (setBotHandler) {
-      setBotHandler((update: object) => bot.handleUpdate(update as Parameters<typeof bot.handleUpdate>[0]));
-      logger.info('📡 handleUpdate registrado na API via setBotHandler()');
-    } else {
-      // Fallback: o bot notifica a API via chamada HTTP interna no startup
-      const apiBase = env.API_URL;
-      try {
-        const fetch = (await import('node-fetch')).default;
-        await fetch(`${apiBase}/internal/register-bot`, {
-          method: 'POST',
-          headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET },
-        });
+    // Notifica a API para registrar o handleUpdate — usa fetch nativo do Node 20
+    try {
+      const res = await fetch(`${env.API_URL}/internal/register-bot`, {
+        method: 'POST',
+        headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET ?? '' },
+      });
+      if (res.ok) {
         logger.info('📡 Bot registrado na API via /internal/register-bot');
-      } catch (e) {
-        logger.warn(`Não foi possível registrar handleUpdate na API: ${e}`);
+      } else {
+        logger.warn(`/internal/register-bot respondeu ${res.status}`);
       }
+    } catch (e) {
+      logger.warn(`Não foi possível registrar na API: ${e}`);
     }
   } else {
     await bot.launch();
