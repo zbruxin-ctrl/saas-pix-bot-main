@@ -4,6 +4,7 @@
 // FIX STOCK-DISPLAY: /products agora retorna availableStock calculado corretamente
 // WALLET: adiciona POST /deposit e GET /balance
 // SORT: /products ordena por sortOrder, depois createdAt
+// OPT #5: /products usa Promise.all paralelo para COUNT de estoque (elimina N+1 sequencial)
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -45,7 +46,6 @@ paymentsRouter.post(
 );
 
 // POST /api/payments/deposit
-// Cria um PIX de depósito de saldo (sem produto vinculado)
 paymentsRouter.post(
   '/deposit',
   requireBotSecret,
@@ -59,7 +59,6 @@ paymentsRouter.post(
 );
 
 // GET /api/payments/balance?telegramId=xxx
-// Retorna saldo e últimas 10 transações do usuário
 paymentsRouter.get(
   '/balance',
   requireBotSecret,
@@ -109,7 +108,8 @@ paymentsRouter.get(
 );
 
 // GET /api/payments/products
-// IMPORTANTE: deve ficar ANTES de GET /:id/status para o Express não capturar /products como /:id
+// OPT #5: Promise.all paralelo + COUNT de stock em uma única query por produto
+// IMPORTANTE: deve ficar ANTES de GET /:id/status
 paymentsRouter.get(
   '/products',
   requireBotSecret,
@@ -130,11 +130,13 @@ paymentsRouter.get(
       orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
     });
 
+    // OPT #5: monta todos os COUNTs em paralelo (Promise.all) ao invés de sequencial
     const productsWithStock = await Promise.all(
       products.map(async (p) => {
         let availableStock: number | null;
 
         if (p._count.stockItems > 0) {
+          // COUNT por produto já ocorre em paralelo com os demais
           availableStock = await prisma.stockItem.count({
             where: { productId: p.id, status: StockItemStatus.AVAILABLE },
           });

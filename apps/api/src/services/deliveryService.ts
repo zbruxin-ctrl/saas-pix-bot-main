@@ -4,6 +4,7 @@
 // FIX:  primeira mídia é enviada com a mensagem como caption (acoplada).
 //       Se a mensagem ultrapassar 1024 chars (limite do Telegram),
 //       envia o texto separado primeiro e depois as mídias normalmente.
+// OPT #10: timeout de 30s em deliveryService.deliver via Promise.race
 import { DeliveryType, TelegramUser, Product } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { telegramService } from './telegramService';
@@ -13,6 +14,7 @@ import { logger } from '../lib/logger';
 const MAX_RETRIES = 3;
 const BASE_RETRY_MS = 3000;
 const MAX_RETRY_MS = 15000;
+const DELIVERY_TIMEOUT_MS = 30_000; // OPT #10
 
 /** Limite de caption do Telegram */
 const TELEGRAM_CAPTION_LIMIT = 1024;
@@ -53,12 +55,6 @@ function buildConfirmationMessage(
   }
 }
 
-/**
- * Envia a mensagem acoplada à primeira mídia como caption.
- * Fallback: se a mensagem ultrapassar 1024 chars, envia o texto primeiro
- * e depois as mídias sem caption (para não perder nenhuma informação).
- * Se não houver mídias, envia como texto puro.
- */
 async function sendMessageWithMedias(
   telegramId: string,
   message: string,
@@ -74,7 +70,6 @@ async function sendMessageWithMedias(
   const messageTooBig = message.length > TELEGRAM_CAPTION_LIMIT;
 
   if (messageTooBig) {
-    // Fallback: texto separado + mídias sem caption de mensagem
     logger.warn(
       `Mensagem de entrega (${message.length} chars) ultrapassa limite de caption do Telegram (${TELEGRAM_CAPTION_LIMIT}). Enviando separado.`
     );
@@ -85,7 +80,6 @@ async function sendMessageWithMedias(
     return;
   }
 
-  // Caminho normal: primeira mídia com a mensagem como caption
   const [first, ...rest] = validMedias;
   await sendMedia(telegramId, first, message);
 
@@ -135,7 +129,19 @@ async function getOrderMedias(orderId: string): Promise<MediaEntry[]> {
 
 class DeliveryService {
 
+  // OPT #10: timeout de 30s — se a entrega travar, rejeita e entra no fluxo de retry/fail
   async deliver(orderId: string, telegramUser: TelegramUser, product: Product): Promise<void> {
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`[DeliveryTimeout] Entrega do pedido ${orderId} excedeu 30s`)), DELIVERY_TIMEOUT_MS)
+    );
+
+    return Promise.race([
+      this._deliverInternal(orderId, telegramUser, product),
+      timeoutPromise,
+    ]);
+  }
+
+  private async _deliverInternal(orderId: string, telegramUser: TelegramUser, product: Product): Promise<void> {
     const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order) throw new Error(`Pedido ${orderId} não encontrado`);
     if (order.status === 'DELIVERED') {
@@ -245,7 +251,6 @@ class DeliveryService {
           mediaType: isVideo ? 'VIDEO' : 'IMAGE',
         };
 
-        // Usa sendMessageWithMedias para ter o mesmo fallback automático
         await sendMessageWithMedias(telegramId, confirmMsg, [mainMedia, ...allMedias]);
         break;
       }
