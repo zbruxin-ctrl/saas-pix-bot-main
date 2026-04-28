@@ -7,6 +7,7 @@ import type {
   WalletBalanceResponse,
   ProductDTO,
   ApiResponse,
+  PaymentMethod,
 } from '@saas-pix/shared';
 
 class ApiClient {
@@ -31,18 +32,17 @@ class ApiClient {
     );
   }
 
-  // Lista todos os produtos ativos (ordenados por sortOrder)
   async getProducts(): Promise<ProductDTO[]> {
     const { data } = await this.client.get<ApiResponse<ProductDTO[]>>('/api/payments/products');
     return data.data!;
   }
 
-  // Cria um pagamento PIX para produto
   async createPayment(params: {
     telegramId: string;
     productId: string;
     firstName?: string;
     username?: string;
+    paymentMethod?: PaymentMethod;
   }): Promise<CreatePaymentResponse> {
     const { data } = await this.client.post<ApiResponse<CreatePaymentResponse>>(
       '/api/payments/create',
@@ -51,7 +51,6 @@ class ApiClient {
     return data.data!;
   }
 
-  // Cria um PIX de depósito de saldo (sem produto vinculado)
   async createDeposit(
     telegramId: string,
     amount: number,
@@ -65,7 +64,6 @@ class ApiClient {
     return data.data!;
   }
 
-  // Retorna saldo e últimas transações do usuário
   async getBalance(telegramId: string): Promise<WalletBalanceResponse> {
     const { data } = await this.client.get<ApiResponse<WalletBalanceResponse>>(
       `/api/payments/balance?telegramId=${encodeURIComponent(telegramId)}`
@@ -73,7 +71,6 @@ class ApiClient {
     return data.data!;
   }
 
-  // Verifica status de um pagamento
   async getPaymentStatus(paymentId: string): Promise<{ status: string; paymentId: string }> {
     const { data } = await this.client.get<ApiResponse<{ status: string; paymentId: string }>>(
       `/api/payments/${paymentId}/status`
@@ -81,7 +78,6 @@ class ApiClient {
     return data.data!;
   }
 
-  // Cancela um pagamento PENDING a pedido do usuário
   async cancelPayment(paymentId: string): Promise<{ cancelled: boolean; message: string }> {
     const { data } = await this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
       `/api/payments/${paymentId}/cancel`

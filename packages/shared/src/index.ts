@@ -5,6 +5,7 @@
 //         WalletBalanceResponse, WalletAdjustRequest
 // PRODUCT: sortOrder em ProductDTO
 // PAYMENT: paidWithBalance em CreatePaymentResponse
+// PAYMENT METHOD: paymentMethod em CreatePaymentRequest (BALANCE | PIX | MIXED)
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -16,9 +17,9 @@ export type PaymentStatus =
   | 'EXPIRED'
   | 'REFUNDED';
 
-export type DeliveryType = 'TEXT' | 'LINK' | 'FILE_MEDIA' | 'ACCOUNT'; // TOKEN removido
+export type DeliveryType = 'TEXT' | 'LINK' | 'FILE_MEDIA' | 'ACCOUNT';
 
-export type OrderStatus = 'PROCESSING' | 'DELIVERED' | 'FAILED' | 'CANCELLED'; // CANCELLED adicionado
+export type OrderStatus = 'PROCESSING' | 'DELIVERED' | 'FAILED' | 'CANCELLED';
 
 export type AdminRole = 'SUPERADMIN' | 'ADMIN' | 'OPERATOR';
 
@@ -38,6 +39,9 @@ export type WebhookEventStatus =
   | 'IGNORED';
 
 export type WalletTransactionType = 'DEPOSIT' | 'PURCHASE' | 'REFUND';
+
+/** Método de pagamento escolhido pelo usuário no bot */
+export type PaymentMethod = 'BALANCE' | 'PIX' | 'MIXED';
 
 // ─── DTOs base ────────────────────────────────────────────────────────────────
 
@@ -145,11 +149,9 @@ export interface PaymentDTO {
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
 export interface DashboardStats {
-  // Receita
   totalRevenue: number;
   revenueToday: number;
   revenueThisMonth: number;
-  // Volume
   totalApproved: number;
   totalPending: number;
   totalRejected: number;
@@ -158,7 +160,6 @@ export interface DashboardStats {
   totalRefunded: number;
   paymentsToday: number;
   paymentsThisMonth: number;
-  // Métricas operacionais
   deliveriesFailedToday: number;
   webhooksFailedToday: number;
   ordersWithFailure: number;
@@ -180,16 +181,21 @@ export interface CreatePaymentRequest {
   productId: string;
   firstName?: string;
   username?: string;
+  /** Método de pagamento escolhido pelo usuário. Padrão: comportamento legado (saldo automático se suficiente). */
+  paymentMethod?: PaymentMethod;
 }
 
 export interface CreatePaymentResponse {
   paymentId: string;
   pixQrCode: string;       // base64 (vazio se paidWithBalance)
   pixQrCodeText: string;   // copia e cola (vazio se paidWithBalance)
-  amount: number;
+  amount: number;          // valor total do produto
+  pixAmount?: number;      // valor cobrado via PIX (MIXED: amount - balanceUsed)
+  balanceUsed?: number;    // valor debitado do saldo (MIXED ou BALANCE)
   expiresAt: string;
   productName: string;
-  paidWithBalance?: boolean; // true = debitado do saldo, sem necessidade de PIX
+  paidWithBalance?: boolean; // true = 100% debitado do saldo
+  isMixed?: boolean;         // true = saldo parcial + PIX pela diferença
 }
 
 export interface CreateDepositRequest {
@@ -213,7 +219,7 @@ export interface WalletBalanceResponse {
 }
 
 export interface WalletAdjustRequest {
-  amount: number;        // positivo = crédito, negativo = débito
+  amount: number;
   justification: string;
 }
 

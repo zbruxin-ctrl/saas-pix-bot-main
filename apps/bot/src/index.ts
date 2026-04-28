@@ -2,6 +2,7 @@
 // FEATURE 1: edit-in-place (editOrReply) — evita poluição visual
 // FEATURE 2: sistema de saldo (show_balance, deposit_balance, paidWithBalance)
 // FEATURE 3: animação de loading nos botões via answerCbQuery
+// FEATURE 4: escolha de método de pagamento (BALANCE | PIX | MIXED)
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -28,7 +29,7 @@ interface UserSession {
   selectedProductId?: string;
   paymentId?: string;
   products?: ProductDTO[];
-  mainMessageId?: number; // FEATURE 1: id da mensagem principal do fluxo
+  mainMessageId?: number;
 }
 
 const sessions = new Map<number, UserSession>();
@@ -45,7 +46,6 @@ function getSession(userId: number): UserSession {
 const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
 // ─── Helper: editar mensagem principal ou enviar nova se não existir ───
-// FEATURE 1: centraliza toda lógica de edit-in-place com fallback seguro
 async function editOrReply(
   ctx: Context,
   text: string,
@@ -67,16 +67,13 @@ async function editOrReply(
       return;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : '';
-      // Se a mensagem sumiu ou não mudou, envia nova normalmente
       if (
         !msg.includes('message is not modified') &&
         !msg.includes('message to edit not found') &&
         !msg.includes('MESSAGE_ID_INVALID')
       ) {
-        // Erro inesperado — loga mas não quebra o fluxo
         logger.warn(`[editOrReply] Erro inesperado ao editar: ${msg}`);
       }
-      // Cai no envio de nova mensagem abaixo
     }
   }
 
@@ -90,7 +87,6 @@ bot.command('start', async (ctx) => {
   const firstName = ctx.from?.first_name || 'visitante';
   const userId = ctx.from!.id;
 
-  // Zera sessão completamente em novo /start
   sessions.set(userId, { step: 'idle', mainMessageId: undefined });
 
   const sent = await ctx.replyWithMarkdown(
@@ -105,7 +101,6 @@ bot.command('start', async (ctx) => {
     ])
   );
 
-  // Salva o message_id como mensagem principal
   getSession(userId).mainMessageId = sent.message_id;
 });
 
@@ -133,7 +128,7 @@ bot.action('show_help', async (ctx) => {
   await showHelp(ctx);
 });
 
-// ─── FEATURE 2: Saldo ───────────────────────────────────────────────
+// ─── Saldo ───────────────────────────────────────────────────────────
 
 bot.action('show_balance', async (ctx) => {
   await ctx.answerCbQuery('⏳ Buscando saldo...');
@@ -171,7 +166,6 @@ bot.action('deposit_balance', async (ctx) => {
   await ctx.answerCbQuery();
   const session = getSession(ctx.from!.id);
   session.step = 'awaiting_deposit_amount';
-  // Depósito pede input de texto — precisa de nova mensagem (não edita)
   await ctx.replyWithMarkdown(
     `💳 *Adicionar Saldo*\n\n` +
     `Digite o valor em reais que deseja depositar:\n` +
@@ -180,7 +174,7 @@ bot.action('deposit_balance', async (ctx) => {
   );
 });
 
-// ─── Selecionar produto ───────────────────────────────────────────────
+// ─── Selecionar produto → tela de escolha de método ───────────────────
 
 bot.action(/^select_product_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('⏳ Carregando produto...');
@@ -214,29 +208,52 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   session.selectedProductId = productId;
   session.step = 'selecting_product';
 
+  await showPaymentMethodScreen(ctx, product);
+});
+
+// ─── Tela de escolha de método de pagamento ───────────────────────────
+
+async function showPaymentMethodScreen(ctx: Context, product: ProductDTO): Promise<void> {
+  const userId = ctx.from!.id;
+  let balance = 0;
+  try {
+    const walletData = await apiClient.getBalance(String(userId));
+    balance = Number(walletData.balance);
+  } catch {
+    // Se não conseguir buscar saldo, exibe R$ 0
+  }
+
+  const price = Number(product.price);
+  const balanceStr = balance.toFixed(2);
+  const pixDiff = Math.max(0, price - balance).toFixed(2);
+
   const confirmMessage =
     `📦 *${product.name}*\n\n` +
     `📝 ${product.description}\n\n` +
-    `💰 *Valor: R$ ${Number(product.price).toFixed(2)}*\n\n` +
-    `Deseja prosseguir com o pagamento?`;
+    `💰 *Valor:* R$ ${price.toFixed(2)}\n` +
+    `🏦 *Seu saldo:* R$ ${balanceStr}\n\n` +
+    `*Como deseja pagar?*`;
 
   await editOrReply(ctx, confirmMessage, {
     reply_markup: Markup.inlineKeyboard([
-      [Markup.button.callback('\u2705 Gerar PIX', `confirm_payment_${productId}`)],
+      [Markup.button.callback(`💰 Só Saldo  (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)],
+      [Markup.button.callback(`📱 Só PIX  (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)],
+      [Markup.button.callback(`🔀 Saldo + PIX  (saldo R$ ${balanceStr} + PIX R$ ${pixDiff})`, `pay_mixed_${product.id}`)],
       [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')],
     ]).reply_markup,
   });
-});
+}
 
-// ─── Confirmar e gerar PIX ─────────────────────────────────────────────
+// ─── Helpers para executar o pagamento após escolha do método ─────────
 
-bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('⏳ Processando pagamento...');
-  const productId = ctx.match[1];
+async function executePayment(
+  ctx: Context,
+  productId: string,
+  paymentMethod: 'BALANCE' | 'PIX' | 'MIXED'
+): Promise<void> {
   const userId = ctx.from!.id;
   const session = getSession(userId);
 
-  // Atualiza mensagem principal com loading
   await editOrReply(ctx, '\u23f3 Processando sua compra, aguarde...');
 
   try {
@@ -245,12 +262,13 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       productId,
       firstName: ctx.from?.first_name,
       username: ctx.from?.username,
+      paymentMethod,
     });
 
     session.paymentId = payment.paymentId;
     session.step = 'awaiting_payment';
 
-    // FEATURE 2: pago com saldo — não exibe QR Code
+    // ── 100% Saldo ──
     if (payment.paidWithBalance) {
       await editOrReply(
         ctx,
@@ -269,7 +287,7 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       return;
     }
 
-    // Fluxo PIX normal
+    // ── PIX (puro ou MIXED) ──
     const expiresAt = new Date(payment.expiresAt);
     const expiresStr = expiresAt.toLocaleTimeString('pt-BR', {
       hour: '2-digit',
@@ -277,12 +295,16 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       timeZone: 'America/Sao_Paulo',
     });
 
-    // Atualiza mensagem principal com instruções + ID do pagamento
+    const pixValue = payment.isMixed ? payment.pixAmount! : payment.amount;
+    const mixedLine = payment.isMixed
+      ? `\n💳 *Saldo usado:* R$ ${Number(payment.balanceUsed).toFixed(2)}\n📱 *PIX a pagar:* R$ ${Number(payment.pixAmount).toFixed(2)}`
+      : '';
+
     await editOrReply(
       ctx,
       `💳 *Pagamento PIX Gerado!*\n\n` +
       `📦 *Produto:* ${payment.productName}\n` +
-      `💰 *Valor:* R$ ${Number(payment.amount).toFixed(2)}\n` +
+      `💰 *Valor total:* R$ ${Number(payment.amount).toFixed(2)}${mixedLine}\n` +
       `\u23f0 *Válido até:* ${expiresStr}\n` +
       `🪪 *ID:* \`${payment.paymentId}\`\n\n` +
       `_Escaneie o QR Code ou use o código copia e cola abaixo:_`,
@@ -294,20 +316,34 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       }
     );
 
-    // QR Code e código PIX são SEMPRE novas mensagens (não editáveis)
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
     await ctx.replyWithPhoto(
       { source: qrBuffer },
-      { caption: `💰 R$ ${Number(payment.amount).toFixed(2)} | Válido até ${expiresStr}\n📷 Escaneie este QR Code no seu banco` }
+      { caption: `💰 R$ ${Number(pixValue).toFixed(2)} | Válido até ${expiresStr}\n📷 Escaneie este QR Code no seu banco` }
     );
 
     await ctx.reply(payment.pixQrCodeText);
 
-    logger.info(`PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
+    logger.info(`[${paymentMethod}] PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
 
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Erro desconhecido';
-    logger.error(`Erro ao gerar PIX para ${userId}:`, error);
+    logger.error(`Erro ao processar pagamento (${paymentMethod}) para ${userId}:`, error);
+
+    // Erros de saldo insuficiente — exibe alerta direto sem tentar novamente
+    if (errMsg.toLowerCase().includes('saldo insuficiente')) {
+      await editOrReply(
+        ctx,
+        `\u274c *${errMsg}*\n\nEscolha outra forma de pagamento ou adicione saldo.`,
+        {
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('\u2795 Adicionar Saldo', 'deposit_balance')],
+            [Markup.button.callback('\u25c0\ufe0f Voltar', `select_product_${productId}`)],
+          ]).reply_markup,
+        }
+      );
+      return;
+    }
 
     const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econnreset');
 
@@ -318,15 +354,32 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
         : `\u26a0\ufe0f *Algo deu errado ao gerar o PIX*\n\nSeu dinheiro não foi cobrado.\nClique em *Tentar Novamente*.`,
       {
         reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🔄 Tentar Novamente', `confirm_payment_${productId}`)],
+          [Markup.button.callback('🔄 Tentar Novamente', `select_product_${productId}`)],
           [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')],
         ]).reply_markup,
       }
     );
   }
+}
+
+// ─── Actions de pagamento por método ──────────────────────────────────
+
+bot.action(/^pay_balance_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('💰 Processando com saldo...');
+  await executePayment(ctx, ctx.match[1], 'BALANCE');
 });
 
-// ─── Verificar status do pagamento ─────────────────────────────────────────
+bot.action(/^pay_pix_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('⏳ Gerando PIX...');
+  await executePayment(ctx, ctx.match[1], 'PIX');
+});
+
+bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('🔀 Aplicando saldo + PIX...');
+  await executePayment(ctx, ctx.match[1], 'MIXED');
+});
+
+// ─── Verificar status do pagamento ─────────────────────────────────────
 
 bot.action(/^check_payment_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('🔍 Verificando pagamento...');
@@ -394,7 +447,7 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   );
 });
 
-// ─── Handler de mensagens de texto ────────────────────────────────────────
+// ─── Handler de mensagens de texto ────────────────────────────────────
 
 bot.on(message('text'), async (ctx) => {
   const text = ctx.message.text;
@@ -403,7 +456,6 @@ bot.on(message('text'), async (ctx) => {
   const userId = ctx.from!.id;
   const session = getSession(userId);
 
-  // FEATURE 2: aguardando valor do depósito
   if (session.step === 'awaiting_deposit_amount') {
     const valor = parseFloat(text.replace(',', '.'));
 
@@ -431,7 +483,6 @@ bot.on(message('text'), async (ctx) => {
         hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
       });
 
-      // QR Code de depósito — sempre nova mensagem, com ID do pagamento
       const qrBuffer = Buffer.from(deposit.pixQrCode, 'base64');
       await ctx.replyWithPhoto(
         { source: qrBuffer },
@@ -446,7 +497,6 @@ bot.on(message('text'), async (ctx) => {
         }
       );
 
-      // Código copia e cola
       await ctx.reply(deposit.pixQrCodeText);
 
       logger.info(`[Deposit] PIX de depósito gerado para ${userId} | valor: ${valor}`);
@@ -462,7 +512,6 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // Mensagem genérica
   await ctx.replyWithMarkdown(
     `Não entendi sua mensagem. Use os botões abaixo para navegar:`,
     Markup.inlineKeyboard([
@@ -496,7 +545,6 @@ async function showProducts(ctx: Context): Promise<void> {
       return [Markup.button.callback(label, `select_product_${p.id}`)];
     });
 
-    // Botões extras: Saldo e Ajuda
     buttons.push([Markup.button.callback('💰 Meu Saldo', 'show_balance')]);
     buttons.push([Markup.button.callback('\u2753 Ajuda', 'show_help')]);
 
@@ -529,10 +577,12 @@ async function showHelp(ctx: Context): Promise<void> {
     `\u2022 /ajuda \u2014 Esta mensagem\n\n` +
     `*Como funciona?*\n` +
     `1. Escolha um produto\n` +
-    `2. Pague via PIX ou use seu saldo\n` +
+    `2. Escolha como pagar: saldo, PIX ou os dois\n` +
     `3. Receba seu acesso automaticamente \u2705\n\n` +
     `*Saldo pré-pago:*\n` +
     `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
+    `*Modo Saldo + PIX:*\n` +
+    `Seu saldo cobre parte do valor e você paga o restante via PIX!\n\n` +
     `*Problemas com pagamento?*\n` +
     `Entre em contato com nosso suporte informando o ID do pagamento.`,
     {
