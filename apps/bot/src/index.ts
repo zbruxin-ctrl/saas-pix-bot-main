@@ -4,7 +4,7 @@
 // FEATURE 3: animação de loading nos botões via answerCbQuery
 // FEATURE 4: escolha de método de pagamento (BALANCE | PIX | MIXED)
 // PERF #3: Promise.all para buscar produto + saldo em paralelo (era sequencial)
-// FIX WEBHOOK: bot não sobe servidor HTTP próprio — API recebe e repassa updates
+// FIX WEBHOOK: bot registra handleUpdate na API via setBotHandler() — sem import cruzado
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -45,7 +45,7 @@ function getSession(userId: number): UserSession {
 
 // ─── Bot ─────────────────────────────────────────────────────────────
 
-export const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
+const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
 // ─── Helper: editar mensagem principal ou enviar nova se não existir ───
 async function editOrReply(
@@ -366,7 +366,6 @@ async function executePayment(
     );
 
     await ctx.reply(payment.pixQrCodeText);
-
     logger.info(`[${paymentMethod}] PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
 
   } catch (error) {
@@ -388,7 +387,6 @@ async function executePayment(
     }
 
     const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econnreset');
-
     await editOrReply(
       ctx,
       isTimeout
@@ -429,7 +427,6 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
 
   try {
     const { status } = await apiClient.getPaymentStatus(paymentId);
-
     const statusMessages: Record<string, string> = {
       PENDING: '\u23f3 *Pagamento pendente*\n\nAinda não identificamos seu pagamento. Se já pagou, aguarde alguns segundos e verifique novamente.',
       APPROVED: '\u2705 *Pagamento aprovado!*\n\nSeu acesso está sendo liberado. Você receberá uma mensagem em instantes.',
@@ -439,7 +436,6 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
     };
 
     const msg = statusMessages[status] || '\u2753 Status desconhecido';
-
     await editOrReply(
       ctx,
       msg,
@@ -476,7 +472,6 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   }
 
   sessions.set(userId, { step: 'idle' });
-
   await editOrReply(
     ctx,
     '\u274c *Pagamento cancelado.*\n\nVolte quando quiser!',
@@ -507,7 +502,6 @@ bot.on(message('text'), async (ctx) => {
     }
 
     session.step = 'idle';
-
     const processingMsg = await ctx.replyWithMarkdown('\u23f3 Gerando PIX de depósito, aguarde...');
 
     try {
@@ -540,7 +534,6 @@ bot.on(message('text'), async (ctx) => {
       );
 
       await ctx.reply(deposit.pixQrCodeText);
-
       logger.info(`[Deposit] PIX de depósito gerado para ${userId} | valor: ${valor}`);
 
     } catch (err) {
@@ -581,8 +574,7 @@ async function showProducts(ctx: Context): Promise<void> {
     }
 
     const buttons = products.map((p) => {
-      const stockLabel =
-        p.stock !== null && p.stock !== undefined ? ` (${p.stock} restantes)` : '';
+      const stockLabel = p.stock !== null && p.stock !== undefined ? ` (${p.stock} restantes)` : '';
       const label = `${p.name}${stockLabel} \u2014 R$ ${Number(p.price).toFixed(2)}`;
       return [Markup.button.callback(label, `select_product_${p.id}`)];
     });
@@ -643,19 +635,42 @@ bot.catch((err, ctx) => {
 });
 
 // ─── Inicialização ────────────────────────────────────────────────────
-// Em produção: apenas registra o webhook no Telegram apontando para a API.
-// A API sobe o servidor HTTP e repassa os updates via bot.handleUpdate().
+// Em produção: registra o webhook no Telegram (URL pública da API)
+//             e registra o handleUpdate na API via HTTP interno.
 // Em desenvolvimento: usa polling normalmente.
 
 async function startBot(): Promise<void> {
   if (env.NODE_ENV === 'production' && env.BOT_WEBHOOK_URL) {
-    // Registra o webhook no Telegram — a URL deve ser a pública da API
     const webhookUrl = `${env.BOT_WEBHOOK_URL}/telegram-webhook`;
+
+    // 1. Registra o webhook no Telegram
     await bot.telegram.setWebhook(webhookUrl, {
       secret_token: env.TELEGRAM_BOT_SECRET,
     });
-    logger.info(`🤖 Bot em modo WEBHOOK registrado: ${webhookUrl}`);
-    logger.info('📡 Updates serão recebidos pela API e repassados via handleUpdate()');
+    logger.info(`🤖 Webhook registrado no Telegram: ${webhookUrl}`);
+
+    // 2. Registra o handleUpdate na API para receber os updates
+    const { setBotHandler } = await import(`${env.API_URL.replace(/^https?:\/\/[^/]+/, '')}/lib/botHandler`)
+      .catch(() => null)
+      ?? {};
+
+    if (setBotHandler) {
+      setBotHandler((update: object) => bot.handleUpdate(update as Parameters<typeof bot.handleUpdate>[0]));
+      logger.info('📡 handleUpdate registrado na API via setBotHandler()');
+    } else {
+      // Fallback: o bot notifica a API via chamada HTTP interna no startup
+      const apiBase = env.API_URL;
+      try {
+        const fetch = (await import('node-fetch')).default;
+        await fetch(`${apiBase}/internal/register-bot`, {
+          method: 'POST',
+          headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET },
+        });
+        logger.info('📡 Bot registrado na API via /internal/register-bot');
+      } catch (e) {
+        logger.warn(`Não foi possível registrar handleUpdate na API: ${e}`);
+      }
+    }
   } else {
     await bot.launch();
     logger.info('🤖 Bot iniciado em modo POLLING (desenvolvimento)');
