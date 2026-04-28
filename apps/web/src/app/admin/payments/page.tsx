@@ -16,6 +16,13 @@ const STATUS_OPTIONS = [
   { value: 'EXPIRED', label: '⌛ Expirado' },
 ];
 
+// Retorna o nome do produto a exibir na coluna "Produto"
+function getProductLabel(p: PaymentDTO): string {
+  if (p.product?.name) return p.product.name;
+  // Sem produto vinculado = depósito de saldo
+  return '💰 Saldo';
+}
+
 export default function PaymentsPage() {
   const router = useRouter();
   const [result, setResult] = useState<PaginatedResponse<PaymentDTO> | null>(null);
@@ -107,7 +114,7 @@ export default function PaymentsPage() {
                       </div>
                       <div className="text-gray-400 text-xs">ID: {p.telegramUser?.telegramId}</div>
                     </td>
-                    <td className="px-4 py-3 text-gray-700">{p.product?.name}</td>
+                    <td className="px-4 py-3 text-gray-700">{getProductLabel(p)}</td>
                     <td className="px-4 py-3 font-semibold text-gray-900">
                       {formatCurrency(p.amount)}
                     </td>

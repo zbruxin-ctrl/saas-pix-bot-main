@@ -1,6 +1,7 @@
 // Bot do Telegram - Ponto de entrada principal
 // FEATURE 1: edit-in-place (editOrReply) — evita poluição visual
 // FEATURE 2: sistema de saldo (show_balance, deposit_balance, paidWithBalance)
+// FEATURE 3: animação de loading nos botões via answerCbQuery
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -123,7 +124,7 @@ bot.command('meus_pedidos', async (ctx) => {
 // ─── Actions de navegação ───────────────────────────────────────────────
 
 bot.action('show_products', async (ctx) => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery('⏳ Carregando produtos...');
   await showProducts(ctx);
 });
 
@@ -135,7 +136,7 @@ bot.action('show_help', async (ctx) => {
 // ─── FEATURE 2: Saldo ───────────────────────────────────────────────
 
 bot.action('show_balance', async (ctx) => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery('⏳ Buscando saldo...');
   const userId = ctx.from!.id;
   try {
     const { balance, transactions } = await apiClient.getBalance(String(userId));
@@ -182,7 +183,7 @@ bot.action('deposit_balance', async (ctx) => {
 // ─── Selecionar produto ───────────────────────────────────────────────
 
 bot.action(/^select_product_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery('⏳ Carregando produto...');
   const productId = ctx.match[1];
   const userId = ctx.from!.id;
   const session = getSession(userId);
@@ -230,7 +231,7 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
 // ─── Confirmar e gerar PIX ─────────────────────────────────────────────
 
 bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Processando...');
+  await ctx.answerCbQuery('⏳ Processando pagamento...');
   const productId = ctx.match[1];
   const userId = ctx.from!.id;
   const session = getSession(userId);
@@ -276,13 +277,14 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
       timeZone: 'America/Sao_Paulo',
     });
 
-    // Atualiza mensagem principal com instruções
+    // Atualiza mensagem principal com instruções + ID do pagamento
     await editOrReply(
       ctx,
       `💳 *Pagamento PIX Gerado!*\n\n` +
       `📦 *Produto:* ${payment.productName}\n` +
       `💰 *Valor:* R$ ${Number(payment.amount).toFixed(2)}\n` +
-      `\u23f0 *Válido até:* ${expiresStr}\n\n` +
+      `\u23f0 *Válido até:* ${expiresStr}\n` +
+      `🪪 *ID:* \`${payment.paymentId}\`\n\n` +
       `_Escaneie o QR Code ou use o código copia e cola abaixo:_`,
       {
         reply_markup: Markup.inlineKeyboard([
@@ -327,7 +329,7 @@ bot.action(/^confirm_payment_(.+)$/, async (ctx) => {
 // ─── Verificar status do pagamento ─────────────────────────────────────────
 
 bot.action(/^check_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Verificando pagamento...');
+  await ctx.answerCbQuery('🔍 Verificando pagamento...');
   const paymentId = ctx.match[1];
 
   try {
@@ -367,7 +369,7 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
 // ─── Cancelar pagamento ─────────────────────────────────────────────────
 
 bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Cancelando...');
+  await ctx.answerCbQuery('❌ Cancelando...');
   const paymentId = ctx.match[1];
   const userId = ctx.from!.id;
 
@@ -429,7 +431,7 @@ bot.on(message('text'), async (ctx) => {
         hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
       });
 
-      // QR Code de depósito — sempre nova mensagem
+      // QR Code de depósito — sempre nova mensagem, com ID do pagamento
       const qrBuffer = Buffer.from(deposit.pixQrCode, 'base64');
       await ctx.replyWithPhoto(
         { source: qrBuffer },
@@ -437,7 +439,8 @@ bot.on(message('text'), async (ctx) => {
           caption:
             `💳 *Depósito de Saldo*\n` +
             `Valor: *R$ ${valor.toFixed(2)}*\n` +
-            `Válido até: ${expiresStr}\n\n` +
+            `Válido até: ${expiresStr}\n` +
+            `🪪 ID: \`${deposit.paymentId}\`\n\n` +
             `Após o pagamento, o saldo será creditado automaticamente! \u2705`,
           parse_mode: 'Markdown',
         }

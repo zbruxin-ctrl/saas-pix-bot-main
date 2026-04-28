@@ -408,9 +408,18 @@ export class PaymentService {
       logger.info(`[Deposit] Saldo creditado para ${payment.telegramUserId}: R$ ${Number(payment.amount).toFixed(2)}`);
 
       try {
+        // Notificação com botão "Meu Saldo" automático e ID do pagamento
         await telegramService.sendMessage(
           payment.telegramUser.telegramId,
-          `✅ *Depósito confirmado!*\n\nR$ ${Number(payment.amount).toFixed(2)} foram adicionados ao seu saldo.\n\nUse o botão *💰 Meu Saldo* para ver seu extrato.`
+          `✅ *Depósito confirmado!*\n\nR$ ${Number(payment.amount).toFixed(2)} foram adicionados ao seu saldo.\n\n🪪 *ID do pagamento:* \`${payment.id}\`\n_Guarde este ID caso precise de suporte._`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '💰 Meu Saldo', callback_data: 'show_balance' }],
+              ],
+            },
+          }
         );
       } catch {
         logger.warn(`Não foi possível notificar usuário ${payment.telegramUser.telegramId} sobre depósito`);
