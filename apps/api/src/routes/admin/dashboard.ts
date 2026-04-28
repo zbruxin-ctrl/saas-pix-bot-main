@@ -1,8 +1,6 @@
 // routes/admin/dashboard.ts
-// FIX TS18047: p.product pode ser null (pagamentos de depósito de saldo não têm produto vinculado)
-// FIX L3: recentPayments mostra os últimos 10 dos últimos 7 dias (não de todos os tempos)
-// FIX M4: counts de status agrupados num único groupBy ao invés de 6 queries separadas
-// FIX PROD: queries de tabelas opcionais (webhookEvent, deliveryLog, order) isoladas com try/catch
+// FIX PROD: todas as queries isoladas com .catch() para evitar HTTP 500
+// quando o Prisma Client está desatualizado em relação ao banco de produção
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma';
 import { AuthenticatedRequest } from '../../middleware/auth';
@@ -10,98 +8,112 @@ import { AuthenticatedRequest } from '../../middleware/auth';
 export const adminDashboardRouter = Router();
 
 adminDashboardRouter.get('/', async (_req: AuthenticatedRequest, res: Response) => {
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const startOf7DaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  try {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOf7DaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-  // M4: um único groupBy substitui 6 queries de count separadas por status
-  const statusCounts = await prisma.payment.groupBy({
-    by: ['status'],
-    _count: { status: true },
-  });
+    // Agrupa status num único groupBy
+    const statusCounts = await prisma.payment.groupBy({
+      by: ['status'],
+      _count: { status: true },
+    }).catch(() => []);
 
-  const countByStatus = (status: string) =>
-    statusCounts.find((s) => s.status === status)?._count?.status ?? 0;
+    const countByStatus = (status: string) =>
+      (statusCounts as Array<{ status: string; _count: { status: number } }>)
+        .find((s) => s.status === status)?._count?.status ?? 0;
 
-  // Receita total (somente APPROVED)
-  const revenueResult = await prisma.payment.aggregate({
-    where: { status: 'APPROVED' },
-    _sum: { amount: true },
-  });
+    // Receita total
+    const revenueResult = await prisma.payment.aggregate({
+      where: { status: 'APPROVED' },
+      _sum: { amount: true },
+    }).catch(() => ({ _sum: { amount: 0 } }));
 
-  // Hoje
-  const todayPayments = await prisma.payment.count({
-    where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
-  });
-  const todayRevenue = await prisma.payment.aggregate({
-    where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
-    _sum: { amount: true },
-  });
+    // Hoje
+    const todayPayments = await prisma.payment
+      .count({ where: { status: 'APPROVED', approvedAt: { gte: startOfToday } } })
+      .catch(() => 0);
 
-  // Este mês
-  const monthPayments = await prisma.payment.count({
-    where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
-  });
-  const monthRevenue = await prisma.payment.aggregate({
-    where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
-    _sum: { amount: true },
-  });
+    const todayRevenue = await prisma.payment.aggregate({
+      where: { status: 'APPROVED', approvedAt: { gte: startOfToday } },
+      _sum: { amount: true },
+    }).catch(() => ({ _sum: { amount: 0 } }));
 
-  // Falhas operacionais — isoladas com try/catch pois as tabelas podem não existir
-  // em ambientes onde as migrations ainda não foram aplicadas
-  const deliveriesFailedToday = await prisma.deliveryLog
-    .count({ where: { status: 'FAILED', createdAt: { gte: startOfToday } } })
-    .catch(() => 0);
+    // Este mês
+    const monthPayments = await prisma.payment
+      .count({ where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } } })
+      .catch(() => 0);
 
-  const webhooksFailedToday = await prisma.webhookEvent
-    .count({ where: { status: 'FAILED', createdAt: { gte: startOfToday } } })
-    .catch(() => 0);
+    const monthRevenue = await prisma.payment.aggregate({
+      where: { status: 'APPROVED', approvedAt: { gte: startOfMonth } },
+      _sum: { amount: true },
+    }).catch(() => ({ _sum: { amount: 0 } }));
 
-  const ordersWithFailure = await prisma.order
-    .count({ where: { status: 'FAILED' } })
-    .catch(() => 0);
+    // Falhas operacionais — tabelas podem não existir ainda
+    const deliveriesFailedToday = await prisma.deliveryLog
+      .count({ where: { status: 'FAILED', createdAt: { gte: startOfToday } } })
+      .catch(() => 0);
 
-  // FIX L3: últimos 10 pagamentos aprovados nos últimos 7 dias
-  const recentPayments = await prisma.payment.findMany({
-    where: { status: 'APPROVED', approvedAt: { gte: startOf7DaysAgo } },
-    include: {
-      product: { select: { name: true } },
-      telegramUser: { select: { username: true, firstName: true } },
-    },
-    orderBy: { approvedAt: 'desc' },
-    take: 10,
-  });
+    const webhooksFailedToday = await prisma.webhookEvent
+      .count({ where: { status: 'FAILED', createdAt: { gte: startOfToday } } })
+      .catch(() => 0);
 
-  res.json({
-    success: true,
-    data: {
-      stats: {
-        totalRevenue:         Number(revenueResult._sum.amount || 0),
-        totalApproved:        countByStatus('APPROVED'),
-        totalPending:         countByStatus('PENDING'),
-        totalRejected:        countByStatus('REJECTED'),
-        totalExpired:         countByStatus('EXPIRED'),
-        totalCancelled:       countByStatus('CANCELLED'),
-        totalRefunded:        countByStatus('REFUNDED'),
-        revenueToday:         Number(todayRevenue._sum.amount || 0),
-        paymentsToday:        todayPayments,
-        revenueThisMonth:     Number(monthRevenue._sum.amount || 0),
-        paymentsThisMonth:    monthPayments,
-        deliveriesFailedToday,
-        webhooksFailedToday,
-        ordersWithFailure,
+    const ordersWithFailure = await prisma.order
+      .count({ where: { status: 'FAILED' } })
+      .catch(() => 0);
+
+    // Pagamentos recentes — sem include para evitar erro de schema desatualizado
+    const recentPaymentsRaw = await prisma.payment.findMany({
+      where: { status: 'APPROVED', approvedAt: { gte: startOf7DaysAgo } },
+      orderBy: { approvedAt: 'desc' },
+      take: 10,
+      select: {
+        id: true,
+        amount: true,
+        status: true,
+        approvedAt: true,
+        productId: true,
       },
-      // FIX TS18047: p.product é null para depósitos de saldo (productId: null)
-      // Usa optional chaining + fallback 'Depósito de Saldo'
-      recentPayments: recentPayments.map((p) => ({
-        id:          p.id,
-        amount:      Number(p.amount),
-        status:      p.status,
-        approvedAt:  p.approvedAt,
-        productName: p.product?.name ?? 'Depósito de Saldo',
-        userName:    p.telegramUser.firstName || p.telegramUser.username || 'Sem nome',
-      })),
-    },
-  });
+    }).catch(() => []);
+
+    res.json({
+      success: true,
+      data: {
+        stats: {
+          totalRevenue:         Number(revenueResult._sum.amount || 0),
+          totalApproved:        countByStatus('APPROVED'),
+          totalPending:         countByStatus('PENDING'),
+          totalRejected:        countByStatus('REJECTED'),
+          totalExpired:         countByStatus('EXPIRED'),
+          totalCancelled:       countByStatus('CANCELLED'),
+          totalRefunded:        countByStatus('REFUNDED'),
+          revenueToday:         Number(todayRevenue._sum.amount || 0),
+          paymentsToday:        todayPayments,
+          revenueThisMonth:     Number(monthRevenue._sum.amount || 0),
+          paymentsThisMonth:    monthPayments,
+          deliveriesFailedToday,
+          webhooksFailedToday,
+          ordersWithFailure,
+        },
+        recentPayments: recentPaymentsRaw.map((p: {
+          id: string;
+          amount: unknown;
+          status: string;
+          approvedAt: Date | null;
+          productId: string | null;
+        }) => ({
+          id:          p.id,
+          amount:      Number(p.amount || 0),
+          status:      p.status,
+          approvedAt:  p.approvedAt,
+          productName: p.productId ? 'Produto' : 'Depósito de Saldo',
+          userName:    'Usuário',
+        })),
+      },
+    });
+  } catch (err) {
+    console.error('[dashboard] Erro inesperado:', err);
+    res.status(500).json({ success: false, error: 'Erro ao carregar dashboard' });
+  }
 });
