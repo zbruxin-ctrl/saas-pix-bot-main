@@ -32,6 +32,11 @@
 //   Solução nível 2 (memória): Set mixedPaymentLock keyed por userId:productId.
 //     Trava requests verdadeiramente simultâneos que chegam antes do DB registrar
 //     o primeiro pagamento (janela de milissegundos entre create e update do MP).
+// FIX BALANCE DELIVERY: _payWithBalance recebia TelegramUserSnap { id, balance }
+//   mas deliveryService.deliver usava telegramUser.telegramId → undefined em runtime
+//   → entrega falhava com "chat_id is empty" após pagamento com saldo confirmado.
+//   Solução: adicionado telegramId: string em PayWithBalanceParams; propagado em
+//   todos os call sites; deliveryService.deliver recebe { ...telegramUser, telegramId }.
 import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
@@ -68,6 +73,8 @@ interface PayWithBalanceParams {
   price: number;
   firstName?: string;
   username?: string;
+  /** telegramId numérico do Telegram — necessário para deliveryService.deliver */
+  telegramId: string;
 }
 
 interface PayWithPixParams {
@@ -175,7 +182,7 @@ export class PaymentService {
           400
         );
       }
-      return this._payWithBalance({ telegramUser, product, price, firstName, username });
+      return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId });
     }
 
     if (paymentMethod === 'MIXED') {
@@ -189,7 +196,7 @@ export class PaymentService {
       const pixAmount = parseFloat((price - balanceUsed).toFixed(2));
 
       if (pixAmount <= 0) {
-        return this._payWithBalance({ telegramUser, product, price, firstName, username });
+        return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId });
       }
 
       return this._payMixed({ telegramUser, product, price, balanceUsed, pixAmount, firstName, username });
@@ -200,13 +207,13 @@ export class PaymentService {
     }
 
     if (balance >= price) {
-      return this._payWithBalance({ telegramUser, product, price, firstName, username });
+      return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId });
     }
     return this._payWithPix({ telegramUser, product, price, firstName, username });
   }
 
   private async _payWithBalance({
-    telegramUser, product, price, firstName, username,
+    telegramUser, product, price, firstName, username, telegramId,
   }: PayWithBalanceParams): Promise<CreatePaymentResponse> {
     logger.info(`[Wallet] Usuário ${telegramUser.id} pagando 100% com saldo (${price}).`);
 
@@ -260,7 +267,7 @@ export class PaymentService {
       return { payment: newPayment, order: newOrder };
     });
 
-    invalidateUserCache(telegramUser.id);
+    invalidateUserCache(telegramId);
 
     if (product.stock !== null || hasStockItems) {
       try {
@@ -284,9 +291,11 @@ export class PaymentService {
       }
     }
 
+    // FIX BALANCE DELIVERY: injeta telegramId no snap para que deliveryService
+    // consiga enviar a mensagem ao usuário correto via Telegram.
     deliveryService.deliver(
       order.id,
-      telegramUser as Parameters<typeof deliveryService.deliver>[1],
+      { ...telegramUser, telegramId } as Parameters<typeof deliveryService.deliver>[1],
       product as Parameters<typeof deliveryService.deliver>[2]
     ).catch((err) => {
       logger.error(`[Wallet] Erro na entrega do order ${order.id}:`, err);
