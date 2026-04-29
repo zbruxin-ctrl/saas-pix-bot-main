@@ -5,9 +5,12 @@
 // FEATURE 4: escolha de método de pagamento (BALANCE | PIX | MIXED)
 // PERF #3: Promise.all para buscar produto + saldo em paralelo (era sequencial)
 // PERF #7: limpeza de sessões idle antigas a cada 30min (evita vazamento de memória)
-// FEATURE 5: /meus_pedidos com histórico real via API
+// FEATURE 5: /meus_pedidos com histórico real via API + valor pago
 // FIX WEBHOOK: bot registra handleUpdate na API via HTTP — sem import cruzado
 // FIX TS7016: removido node-fetch, usa fetch nativo do Node 20
+// FIX #1: suporte via env.SUPPORT_PHONE (sem hardcode)
+// FIX #2: showOrders exibe valor pago + método em cada pedido
+// FIX #3: PIX consolidado em uma única mensagem (QR Code + copia-e-cola no caption)
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -370,15 +373,29 @@ async function executePayment(
       ? `\n💳 *Saldo usado:* R$ ${Number(payment.balanceUsed).toFixed(2)}\n📱 *PIX a pagar:* R$ ${Number(payment.pixAmount).toFixed(2)}`
       : '';
 
-    await editOrReply(
-      ctx,
+    // FIX #3: PIX consolidado — QR Code + copia-e-cola em única mensagem (caption)
+    // Elimina as 3 mensagens separadas que quebravam o padrão editOrReply
+    const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
+    const caption =
       `💳 *Pagamento PIX Gerado!*\n\n` +
       `📦 *Produto:* ${payment.productName}\n` +
       `💰 *Valor total:* R$ ${Number(payment.amount).toFixed(2)}${mixedLine}\n` +
       `\u23f0 *Válido até:* ${expiresStr}\n` +
       `🪪 *ID:* \`${payment.paymentId}\`\n\n` +
-      `_Escaneie o QR Code ou use o código copia e cola abaixo:_`,
+      `📋 *Copia e Cola:*\n\`${payment.pixQrCodeText}\``;
+
+    // Apaga a mensagem principal de "processando" e envia o QR Code como nova âncora
+    const chatId = ctx.chat?.id;
+    if (chatId && session.mainMessageId) {
+      await ctx.telegram.deleteMessage(chatId, session.mainMessageId).catch(() => {});
+      session.mainMessageId = undefined;
+    }
+
+    const qrMsg = await ctx.replyWithPhoto(
+      { source: qrBuffer },
       {
+        caption,
+        parse_mode: 'Markdown',
         reply_markup: Markup.inlineKeyboard([
           [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
           [Markup.button.callback('\u274c Cancelar', `cancel_payment_${payment.paymentId}`)],
@@ -386,13 +403,9 @@ async function executePayment(
       }
     );
 
-    const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
-    await ctx.replyWithPhoto(
-      { source: qrBuffer },
-      { caption: `💰 R$ ${Number(pixValue).toFixed(2)} | Válido até ${expiresStr}\n📷 Escaneie este QR Code no seu banco` }
-    );
+    // Salva o ID da foto como nova mensagem principal para edições futuras de status
+    session.mainMessageId = qrMsg.message_id;
 
-    await ctx.reply(payment.pixQrCodeText);
     logger.info(`[${paymentMethod}] PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
 
   } catch (error) {
@@ -547,6 +560,7 @@ bot.on(message('text'), async (ctx) => {
         hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
       });
 
+      // FIX #3 aplicado também ao depósito: QR Code + copia-e-cola unificados no caption
       const qrBuffer = Buffer.from(deposit.pixQrCode, 'base64');
       await ctx.replyWithPhoto(
         { source: qrBuffer },
@@ -556,12 +570,12 @@ bot.on(message('text'), async (ctx) => {
             `Valor: *R$ ${valor.toFixed(2)}*\n` +
             `Válido até: ${expiresStr}\n` +
             `🪪 ID: \`${deposit.paymentId}\`\n\n` +
+            `📋 *Copia e Cola:*\n\`${deposit.pixQrCodeText}\`\n\n` +
             `Após o pagamento, o saldo será creditado automaticamente! \u2705`,
           parse_mode: 'Markdown',
         }
       );
 
-      await ctx.reply(deposit.pixQrCodeText);
       logger.info(`[Deposit] PIX de depósito gerado para ${userId} | valor: ${valor}`);
 
     } catch (err) {
@@ -656,17 +670,28 @@ async function showOrders(ctx: Context): Promise<void> {
       PROCESSING: '🔄',
     };
 
+    // FIX #2: exibe valor pago e método de pagamento em cada pedido
     const lines = orders.slice(0, 10).map((o: {
       productName: string;
       status: string;
       createdAt: string;
+      amount?: number | string;
+      paymentMethod?: string;
     }) => {
       const emoji = statusEmoji[o.status] ?? '📦';
       const date = new Date(o.createdAt).toLocaleDateString('pt-BR', {
         day: '2-digit', month: '2-digit', year: '2-digit',
         timeZone: 'America/Sao_Paulo',
       });
-      return `${emoji} *${o.productName}* — ${date}`;
+      const valor = o.amount != null ? ` · R$ ${Number(o.amount).toFixed(2)}` : '';
+      const metodo = o.paymentMethod === 'BALANCE'
+        ? ' · 💰Saldo'
+        : o.paymentMethod === 'MIXED'
+          ? ' · 🔀Misto'
+          : o.paymentMethod === 'PIX'
+            ? ' · 📱PIX'
+            : '';
+      return `${emoji} *${o.productName}* — ${date}${valor}${metodo}`;
     });
 
     const total = orders.length;
@@ -699,6 +724,9 @@ async function showOrders(ctx: Context): Promise<void> {
 }
 
 async function showHelp(ctx: Context): Promise<void> {
+  // FIX #1: número de suporte via variável de ambiente (sem hardcode)
+  const supportUrl = `https://wa.me/${env.SUPPORT_PHONE}`;
+
   await editOrReply(
     ctx,
     `\u2753 *Central de Ajuda*\n\n` +
@@ -719,7 +747,7 @@ async function showHelp(ctx: Context): Promise<void> {
     `Entre em contato com nosso suporte informando o ID do pagamento.`,
     {
       reply_markup: Markup.inlineKeyboard([
-        [Markup.button.url('📞 Contatar Suporte', 'http://wa.me/+5511953699608')],
+        [Markup.button.url('📞 Contatar Suporte', supportUrl)],
         [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')],
       ]).reply_markup,
     }
