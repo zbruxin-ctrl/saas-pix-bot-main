@@ -14,6 +14,7 @@
 // FIX #4: removido tipo inline no .map() de showOrders — usa OrderSummary diretamente
 // FIX #5: bot.telegram.getMe() após setWebhook — popula botInfo em modo webhook
 // FIX #6: /internal/register-bot agora existe na API (era 404)
+// FIX #7: retry com backoff exponencial no register-bot (era 502 por race condition de startup)
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -755,6 +756,44 @@ bot.catch((err, ctx) => {
   logger.error(`Erro no bot para update ${ctx.update.update_id}:`, err);
 });
 
+// ─── FIX #7: retry com backoff exponencial ────────────────────────────
+// Problema: bot e API sobem em paralelo no Railway. O bot tentava registrar
+// na API imediatamente, mas a API ainda estava inicializando (Prisma, etc.)
+// e retornava 502. Agora o bot tenta até MAX_ATTEMPTS vezes com espera
+// crescente entre tentativas (1s → 2s → 4s → 8s → 16s).
+
+async function registerBotWithRetry(
+  apiUrl: string,
+  secret: string,
+  maxAttempts = 5
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(`${apiUrl}/internal/register-bot`, {
+        method: 'POST',
+        headers: { 'x-bot-secret': secret },
+      });
+
+      if (res.ok) {
+        logger.info('📡 Bot registrado na API via /internal/register-bot');
+        return;
+      }
+
+      logger.warn(`/internal/register-bot respondeu ${res.status} (tentativa ${attempt}/${maxAttempts})`);
+    } catch (e) {
+      logger.warn(`/internal/register-bot inacessível (tentativa ${attempt}/${maxAttempts}): ${e}`);
+    }
+
+    if (attempt < maxAttempts) {
+      const delayMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s, 8s, 16s
+      logger.info(`⏳ Aguardando ${delayMs / 1000}s antes da próxima tentativa...`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  logger.error(`❌ Não foi possível registrar na API após ${maxAttempts} tentativas. O bot continua funcionando normalmente.`);
+}
+
 // ─── Inicialização ────────────────────────────────────────────────────
 
 async function startBot(): Promise<void> {
@@ -771,19 +810,9 @@ async function startBot(): Promise<void> {
     const me = await bot.telegram.getMe();
     logger.info(`📌 Bot username: @${me.username}`);
 
-    try {
-      const res = await fetch(`${env.API_URL}/internal/register-bot`, {
-        method: 'POST',
-        headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET ?? '' },
-      });
-      if (res.ok) {
-        logger.info('📡 Bot registrado na API via /internal/register-bot');
-      } else {
-        logger.warn(`/internal/register-bot respondeu ${res.status}`);
-      }
-    } catch (e) {
-      logger.warn(`Não foi possível registrar na API: ${e}`);
-    }
+    // FIX #7: retry com backoff — API pode ainda estar inicializando
+    await registerBotWithRetry(env.API_URL, env.TELEGRAM_BOT_SECRET ?? '');
+
   } else {
     await bot.launch();
     // Em polling, botInfo é populado automaticamente pelo bot.launch()
