@@ -20,6 +20,7 @@
 // FEATURE 6: setMyCommands registra menu de comandos no Telegram (botão ☰ na caixa de texto)
 // FIX #12: showHelp usa Markdown simples (sem escapes MarkdownV2) — remove barras inversas
 // FIX #13: escapeMd() em todos os campos dinâmicos — corrige Bad Request: can't parse entities
+// FIX #14: removidos \_ e \- do showHelp — Markdown v1 não suporta escape de caracteres
 
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
@@ -788,13 +789,13 @@ async function showHelp(ctx: Context): Promise<void> {
     `/start — Tela inicial\n` +
     `/produtos — Ver produtos\n` +
     `/saldo — Ver e adicionar saldo\n` +
-    `/meus\_pedidos — Histórico de pedidos\n` +
+    `/meus_pedidos — Histórico de pedidos\n` +
     `/ajuda — Esta mensagem\n\n` +
     `*Como funciona?*\n` +
     `1. Escolha um produto\n` +
     `2. Escolha como pagar: saldo, PIX ou os dois\n` +
     `3. Receba seu acesso automaticamente ✅\n\n` +
-    `*Saldo pré\-pago:*\n` +
+    `*Saldo pre-pago:*\n` +
     `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
     `*Modo Saldo + PIX:*\n` +
     `Seu saldo cobre parte do valor e você paga o restante via PIX!\n\n` +
