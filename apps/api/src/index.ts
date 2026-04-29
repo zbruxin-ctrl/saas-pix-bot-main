@@ -18,7 +18,7 @@ import adminRouter from './routes/admin';
 import { telegramRouter } from './routes/telegram';
 import { startExpireJob, stopExpireJob } from './jobs/expirePayments';
 
-// build: 2026-04-28
+// build: 2026-04-29
 const app = express();
 app.set('trust proxy', 1);
 
@@ -40,7 +40,7 @@ const allowedOrigins = [
 
 function isOriginAllowed(origin: string | undefined): boolean {
   if (!origin) return true;
-  if (/^https:\/\/[a-z0-9-]+-[a-z0-9-]+-[a-z0-9]+-projects\.vercel\.app$/.test(origin)) return true;
+  if (/^\/https:\/\/[a-z0-9-]+-[a-z0-9-]+-[a-z0-9]+-projects\.vercel\.app$/.test(origin)) return true;
   if (/^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/.test(origin)) return true;
   return allowedOrigins.includes(origin);
 }
@@ -92,6 +92,19 @@ app.post('/setup-admin', async (req, res) => {
 
   logger.info(`[setup-admin] Admin criado/atualizado: ${admin.email}`);
   res.json({ success: true, message: `Admin ${admin.email} pronto. Remova SETUP_SECRET do Railway agora.` });
+});
+
+// --- Rota interna: bot notifica que subiu e está pronto ---
+// Não há lógica de estado aqui — apenas health-check de conectividade bot→API.
+// O handler de updates do Telegram roda dentro do processo do bot (via webhook HTTP direto).
+app.post('/internal/register-bot', (req, res) => {
+  const secret = req.headers['x-bot-secret'];
+  if (env.TELEGRAM_BOT_SECRET && secret !== env.TELEGRAM_BOT_SECRET) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+  logger.info('[internal] Bot registrado e online.');
+  res.json({ ok: true });
 });
 
 app.use('/api/auth', authRouter);

@@ -12,6 +12,8 @@
 // FIX #2: showOrders exibe valor pago + método em cada pedido
 // FIX #3: PIX consolidado em uma única mensagem (QR Code + copia-e-cola no caption)
 // FIX #4: removido tipo inline no .map() de showOrders — usa OrderSummary diretamente
+// FIX #5: bot.telegram.getMe() após setWebhook — popula botInfo em modo webhook
+// FIX #6: /internal/register-bot agora existe na API (era 404)
 
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -559,7 +561,7 @@ bot.on(message('text'), async (ctx) => {
         hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
       });
 
-      // FIX #3 aplicado também ao depósito: QR Code + copia-e-cola unificados no caption
+      // FIX #3 aplicado também ao depósito
       const qrBuffer = Buffer.from(deposit.pixQrCode, 'base64');
       await ctx.replyWithPhoto(
         { source: qrBuffer },
@@ -669,8 +671,7 @@ async function showOrders(ctx: Context): Promise<void> {
       PROCESSING: '🔄',
     };
 
-    // FIX #2: usa OrderSummary diretamente — sem tipo inline incompatível
-    // FIX #4: amount é number | null; usa null-check em vez de != null para clareza
+    // FIX #2 + #4: usa OrderSummary diretamente (sem tipo inline)
     const lines = orders.slice(0, 10).map((o: OrderSummary) => {
       const emoji = statusEmoji[o.status] ?? '📦';
       const date = new Date(o.createdAt).toLocaleDateString('pt-BR', {
@@ -765,6 +766,11 @@ async function startBot(): Promise<void> {
     });
     logger.info(`🤖 Webhook registrado no Telegram: ${webhookUrl}`);
 
+    // FIX #5: em modo webhook o Telegraf não popula botInfo automaticamente.
+    // É necessário chamar getMe() explicitamente após setWebhook.
+    const me = await bot.telegram.getMe();
+    logger.info(`📌 Bot username: @${me.username}`);
+
     try {
       const res = await fetch(`${env.API_URL}/internal/register-bot`, {
         method: 'POST',
@@ -780,9 +786,10 @@ async function startBot(): Promise<void> {
     }
   } else {
     await bot.launch();
+    // Em polling, botInfo é populado automaticamente pelo bot.launch()
+    logger.info(`📌 Bot username: @${bot.botInfo?.username}`);
     logger.info('🤖 Bot iniciado em modo POLLING (desenvolvimento)');
   }
-  logger.info(`📌 Bot username: @${bot.botInfo?.username}`);
 }
 
 startBot().catch((err) => {
