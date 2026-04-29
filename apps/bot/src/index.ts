@@ -19,6 +19,7 @@
 // FIX #11: todos os botões "Voltar" agora vão para show_home (menu inicial do /start), não show_products
 // FEATURE 6: setMyCommands registra menu de comandos no Telegram (botão ☰ na caixa de texto)
 // FIX #12: showHelp usa Markdown simples (sem escapes MarkdownV2) — remove barras inversas
+// FIX #13: escapeMd() em todos os campos dinâmicos — corrige Bad Request: can't parse entities
 
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
@@ -39,6 +40,13 @@ const logger = winston.createLogger({
   ),
   transports: [new winston.transports.Console()],
 });
+
+// ─── Escape Markdown v1 (evita Bad Request: can't parse entities) ──────
+// Escapa apenas os caracteres que o Markdown v1 do Telegram interpreta:
+// _ * ` [
+function escapeMd(text: string): string {
+  return String(text ?? '').replace(/[_*`[]/g, '\\$&');
+}
 
 // ─── Sessão em memória ─────────────────────────────────────────────────
 
@@ -139,7 +147,7 @@ async function editOrReply(
 async function showHome(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const session = getSession(userId);
-  const firstName = session.firstName || ctx.from?.first_name || 'visitante';
+  const firstName = escapeMd(session.firstName || ctx.from?.first_name || 'visitante');
 
   await editOrReply(
     ctx,
@@ -161,10 +169,10 @@ async function showHome(ctx: Context): Promise<void> {
 // ─── /start ──────────────────────────────────────────────────────────
 
 bot.command('start', async (ctx) => {
-  const firstName = ctx.from?.first_name || 'visitante';
+  const firstName = escapeMd(ctx.from?.first_name || 'visitante');
   const userId = ctx.from!.id;
 
-  sessions.set(userId, { step: 'idle', mainMessageId: undefined, firstName, lastActivityAt: Date.now() });
+  sessions.set(userId, { step: 'idle', mainMessageId: undefined, firstName: ctx.from?.first_name || 'visitante', lastActivityAt: Date.now() });
 
   const sent = await ctx.replyWithMarkdown(
     `👋 Olá, *${firstName}*! Bem-vindo!\n\n` +
@@ -222,7 +230,7 @@ async function showBalance(ctx: Context): Promise<void> {
       .slice(0, 5)
       .map((t) => {
         const sinal = t.type === 'DEPOSIT' ? '\u2795' : '\u2796';
-        return `${sinal} R$ ${Number(t.amount).toFixed(2)} \u2014 ${t.description}`;
+        return `${sinal} R$ ${Number(t.amount).toFixed(2)} \u2014 ${escapeMd(t.description)}`;
       })
       .join('\n');
 
@@ -337,8 +345,8 @@ async function showPaymentMethodScreen(
   const balanceStr = balance.toFixed(2);
 
   const confirmMessage =
-    `📦 *${product.name}*\n\n` +
-    `📝 ${product.description}\n\n` +
+    `📦 *${escapeMd(product.name)}*\n\n` +
+    `📝 ${escapeMd(product.description)}\n\n` +
     `💰 *Valor:* R$ ${price.toFixed(2)}\n` +
     `🏦 *Seu saldo:* R$ ${balanceStr}\n\n` +
     `*Como deseja pagar?*`;
@@ -406,7 +414,7 @@ async function executePayment(
       await editOrReply(
         ctx,
         `\u2705 *Compra realizada com saldo!*\n\n` +
-        `📦 *Produto:* ${payment.productName}\n` +
+        `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
         `💰 *Valor debitado:* R$ ${Number(payment.amount).toFixed(2)}\n\n` +
         `Seu produto será entregue em instantes! 🚀`,
         {
@@ -434,7 +442,7 @@ async function executePayment(
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
     const caption =
       `💳 *Pagamento PIX Gerado!*\n\n` +
-      `📦 *Produto:* ${payment.productName}\n` +
+      `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
       `💰 *Valor total:* R$ ${Number(payment.amount).toFixed(2)}${mixedLine}\n` +
       `\u23f0 *Válido até:* ${expiresStr}\n` +
       `🪪 *ID:* \`${payment.paymentId}\`\n\n` +
@@ -468,7 +476,7 @@ async function executePayment(
     if (errMsg.toLowerCase().includes('saldo insuficiente')) {
       await editOrReply(
         ctx,
-        `\u274c *${errMsg}*\n\nEscolha outra forma de pagamento ou adicione saldo.`,
+        `\u274c *${escapeMd(errMsg)}*\n\nEscolha outra forma de pagamento ou adicione saldo.`,
         {
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('\u2795 Adicionar Saldo', 'deposit_balance')],
@@ -739,7 +747,7 @@ async function showOrders(ctx: Context): Promise<void> {
           : o.paymentMethod === 'PIX'
             ? ' · 📱PIX'
             : '';
-      return `${emoji} *${o.productName}* — ${date}${valor}${metodo}`;
+      return `${emoji} *${escapeMd(o.productName)}* — ${date}${valor}${metodo}`;
     });
 
     const total = orders.length;
@@ -770,8 +778,6 @@ async function showOrders(ctx: Context): Promise<void> {
   }
 }
 
-// FIX #12: usa Markdown simples — sem escapes MarkdownV2 (\\. \\+ etc)
-// que causavam barras inversas visíveis na mensagem
 async function showHelp(ctx: Context): Promise<void> {
   const supportUrl = `https://wa.me/${env.SUPPORT_PHONE}`;
 
@@ -782,13 +788,13 @@ async function showHelp(ctx: Context): Promise<void> {
     `/start — Tela inicial\n` +
     `/produtos — Ver produtos\n` +
     `/saldo — Ver e adicionar saldo\n` +
-    `/meus_pedidos — Histórico de pedidos\n` +
+    `/meus\_pedidos — Histórico de pedidos\n` +
     `/ajuda — Esta mensagem\n\n` +
     `*Como funciona?*\n` +
     `1. Escolha um produto\n` +
     `2. Escolha como pagar: saldo, PIX ou os dois\n` +
     `3. Receba seu acesso automaticamente ✅\n\n` +
-    `*Saldo pré-pago:*\n` +
+    `*Saldo pré\-pago:*\n` +
     `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
     `*Modo Saldo + PIX:*\n` +
     `Seu saldo cobre parte do valor e você paga o restante via PIX!\n\n` +
