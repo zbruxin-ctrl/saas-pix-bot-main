@@ -15,6 +15,11 @@
 // OPT #9: grava paymentMethod, balanceUsed, pixAmount em colunas reais (não mais só metadata)
 // FIX STOCK CACHE: productHasStockItems conta apenas AVAILABLE (não todos os StockItems)
 // FIX STOCK CACHE: invalida stockItemCache após reserveStock para evitar falso-negativo
+// FIX B9: _payWithPix usa randomUUID() como externalReference
+//   → string anterior "pending_UUID_UUID_timestamp" continha underscores (_)
+//   → MP rejeita underscore no local-part do email → erro 4050
+//   → randomUUID() gera UUID puro; buildPayerEmail remove hifens → email limpo
+import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -245,7 +250,6 @@ export class PaymentService {
     if (product.stock !== null || hasStockItems) {
       try {
         await stockService.reserveStock(product.id, telegramUser.id, payment.id);
-        // Invalida cache após reserva bem-sucedida
         invalidateStockItemCache(product.id);
         await stockService.confirmReservation(payment.id);
       } catch (err) {
@@ -308,7 +312,6 @@ export class PaymentService {
     if (product.stock !== null || hasStockItems) {
       try {
         await stockService.reserveStock(product.id, telegramUser.id, payment.id);
-        // Invalida cache após reserva bem-sucedida para evitar cache stale
         invalidateStockItemCache(product.id);
       } catch (err) {
         await prisma.payment.delete({ where: { id: payment.id } });
@@ -391,7 +394,6 @@ export class PaymentService {
         logger.error(`[Mixed] CRÍTICO: falha no estorno do payment ${payment.id} — intervenção manual necessária`, estornoErr);
       }
       await stockService.releaseReservation(payment.id, 'falha_criacao_mp_misto');
-      // Após liberar a reserva, invalida o cache para refletir o estoque disponível
       invalidateStockItemCache(product.id);
       await prisma.payment.delete({ where: { id: payment.id } });
       throw error;
@@ -428,12 +430,18 @@ export class PaymentService {
     let mpPayment: Awaited<ReturnType<typeof mercadoPagoService.createPixPayment>>;
     let pixExpiresAt: Date;
 
+    // FIX B9: usa randomUUID() como externalReference em vez de
+    // `pending_${userId}_${productId}_${Date.now()}` que continha underscores (_).
+    // O MP rejeita underscore no local-part do email gerado pelo buildPayerEmail → erro 4050.
+    // randomUUID() gera UUID puro; buildPayerEmail remove apenas os hifens → email limpo.
+    const mpExternalRef = randomUUID();
+
     try {
       mpPayment = await mercadoPagoService.createPixPayment({
         transactionAmount: price,
         description: `${product.name} - SaaS PIX Bot`,
         payerName: firstName || username || 'Usuário Telegram',
-        externalReference: `pending_${telegramUser.id}_${product.id}_${Date.now()}`,
+        externalReference: mpExternalRef,
         notificationUrl: `${env.API_URL}/api/webhooks/mercadopago`,
       });
 
@@ -458,7 +466,7 @@ export class PaymentService {
         pixExpiresAt,
         paymentMethod: PaymentMethod.PIX,
         pixAmount: price,
-        metadata: { firstName, username, productName: product.name, paymentMethod: 'PIX' },
+        metadata: { firstName, username, productName: product.name, paymentMethod: 'PIX', mpExternalRef },
       },
     });
 
@@ -565,9 +573,6 @@ export class PaymentService {
     }
   }
 
-  // FIX: conta apenas StockItems com status AVAILABLE
-  // O bug anterior contava TODOS os StockItems (RESERVED, CONFIRMED, DELIVERED)
-  // causando hasStockItems=true mesmo quando não havia unidades disponíveis
   private async productHasStockItems(productId: string): Promise<boolean> {
     const now = Date.now();
     const cached = stockItemCache.get(productId);
