@@ -19,15 +19,9 @@ else
   MIGRATE_URL="$DATABASE_URL"
 fi
 
-echo '>>> [1/4] Resolvendo migrations com falha (se houver)'
-DATABASE_URL="$MIGRATE_URL" npx prisma migrate resolve --schema=./prisma/schema.prisma --rolled-back 20260428140000_add_missing_columns 2>/dev/null || true
-DATABASE_URL="$MIGRATE_URL" npx prisma migrate resolve --schema=./prisma/schema.prisma --rolled-back 20260428160000_add_balance_and_missing_cols 2>/dev/null || true
-DATABASE_URL="$MIGRATE_URL" npx prisma migrate resolve --schema=./prisma/schema.prisma --rolled-back 20260428170000_sync_all_missing_columns 2>/dev/null || true
-DATABASE_URL="$MIGRATE_URL" npx prisma migrate resolve --schema=./prisma/schema.prisma --rolled-back 20260428200000_opt9_payment_method_columns 2>/dev/null || true
-
-echo '>>> [2/4] Rodando migrations'
+echo '>>> [1/3] Rodando migrations'
 DATABASE_URL="$MIGRATE_URL" npx prisma migrate deploy --schema=./prisma/schema.prisma
-echo '>>> [3/4] Migrations OK'
+echo '>>> [2/3] Migrations OK'
 
-echo '>>> [4/4] Iniciando node'
+echo '>>> [3/3] Iniciando node'
 exec node apps/api/dist/index.js
