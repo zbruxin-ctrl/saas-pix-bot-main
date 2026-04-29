@@ -33,8 +33,6 @@ const envSchema = z.object({
   COOKIE_SECRET: z.string().min(32, 'COOKIE_SECRET deve ter pelo menos 32 caracteres'),
 
   MERCADO_PAGO_ACCESS_TOKEN: z.string().min(1, 'MERCADO_PAGO_ACCESS_TOKEN é obrigatório'),
-  // FIX BUG3: sem default — se não configurado em produção, o sistema detecta e avisa
-  // no lugar de silenciosamente descartar todos os webhooks com assinatura "inválida".
   MERCADO_PAGO_WEBHOOK_SECRET: z.string().optional(),
 
   TELEGRAM_BOT_TOKEN: z.string().min(1, 'TELEGRAM_BOT_TOKEN é obrigatório'),
@@ -44,13 +42,18 @@ const envSchema = z.object({
   ADMIN_URL: z.string().url().default('http://localhost:3000'),
   BOT_WEBHOOK_URL: z.string().url().optional(),
 
-  // CORS extra: domínios adicionais separados por vírgula (ex: previews do Vercel específicos)
   ALLOWED_ORIGINS: z.string().optional(),
-
-  // Cloudinary: configure CLOUDINARY_URL no Railway para usar Cloudinary.
   CLOUDINARY_URL: z.string().optional(),
-
   REDIS_URL: z.string().optional(),
+
+  // ─── FEAT #3: Configurações do bot via env var (Railway) ──────────────────
+  // Todas opcionais — o painel admin sobrescreve via banco quando não definidas aqui.
+  // Defina no Railway para fixar um valor independente do banco de dados.
+  SUPPORT_PHONE_NUMBER: z.string().optional(),  // Ex: "5511999990000" (sem + ou espaços)
+  BOT_WELCOME_MESSAGE:  z.string().optional(),  // Mensagem de boas-vindas do /start
+  BOT_START_MESSAGE:    z.string().optional(),  // Mensagem após o primeiro /start
+  BOT_MAINTENANCE_MODE: z.enum(['true', 'false']).optional(), // Modo manutenção
+  BOT_MAINTENANCE_MESSAGE: z.string().optional(), // Mensagem durante manutenção
 });
 
 function validateEnv() {
