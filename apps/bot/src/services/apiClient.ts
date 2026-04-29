@@ -4,6 +4,7 @@
 // PERF #4: retry automático 1x em timeout/network error
 // PERF #5: cache de saldo por usuário TTL 15s — evita 2 roundtrips na tela de seleção de produto
 // PERF #6: invalidação do cache de saldo após depósito
+// FEATURE: getOrders(telegramId) — histórico de pedidos para /meus_pedidos
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
 import type {
@@ -37,6 +38,15 @@ const BALANCE_CACHE_TTL = 15_000; // 15 segundos
 
 export function invalidateBalanceCache(telegramId: string): void {
   balanceCache.delete(telegramId);
+}
+
+export interface OrderSummary {
+  id: string;
+  status: string;
+  createdAt: string;
+  deliveredAt: string | null;
+  productName: string;
+  amount: number | null;
 }
 
 class ApiClient {
@@ -107,6 +117,16 @@ class ApiClient {
     );
     balanceCache.set(telegramId, { data: data.data!, expiresAt: now + BALANCE_CACHE_TTL });
     return data.data!;
+  }
+
+  // Retorna os últimos 20 pedidos do usuário — usado por /meus_pedidos e show_orders
+  async getOrders(telegramId: string): Promise<OrderSummary[]> {
+    const { data } = await this.withRetry(() =>
+      this.client.get<ApiResponse<OrderSummary[]>>(
+        `/api/payments/orders?telegramId=${encodeURIComponent(telegramId)}`
+      )
+    );
+    return data.data ?? [];
   }
 
   async createPayment(params: {
