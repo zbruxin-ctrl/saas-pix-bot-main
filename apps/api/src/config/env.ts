@@ -42,6 +42,12 @@ const envSchema = z.object({
   ADMIN_URL: z.string().url().default('http://localhost:3000'),
   BOT_WEBHOOK_URL: z.string().url().optional(),
 
+  // URL pública ou interna do bot — usada pela API para invalidar o cache de produtos
+  // instantaneamente após create/update/delete no painel admin.
+  // Exemplo Railway: https://saas-pix-bot-production.up.railway.app
+  // Sem essa var, o fallback de TTL 30s ainda funciona automaticamente.
+  BOT_INTERNAL_URL: z.string().url().optional(),
+
   ALLOWED_ORIGINS: z.string().optional(),
   CLOUDINARY_URL: z.string().optional(),
   REDIS_URL: z.string().optional(),

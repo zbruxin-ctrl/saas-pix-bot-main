@@ -1,6 +1,6 @@
 // Cliente HTTP para comunicacao do bot com a API interna
 // PERF #1: timeout reduzido para 8s (era 15s)
-// PERF #2: cache global de produtos TTL 5min
+// PERF #2: cache global de produtos TTL 30s (era 5min — reduzido para refletir edições do admin)
 // PERF #4: retry automatico 1x em timeout/network error
 // PERF #5: cache de saldo por usuario TTL 15s
 // PERF #6: invalidacao do cache de saldo apos deposito
@@ -16,13 +16,17 @@ import type {
   PaymentMethod,
 } from '@saas-pix/shared';
 
-// PERF #2: cache global de produtos (TTL 5min)
+// PERF #2: cache global de produtos
+// TTL reduzido de 5min → 30s para que edições feitas no painel admin
+// apareçam no bot em no máximo 30s sem precisar reiniciar o serviço.
+// A invalidação instantânea (< 1s) é feita via endpoint /internal/cache/invalidate-products
+// quando a API notifica o bot após mutações de produto.
 interface ProductCache {
   products: ProductDTO[];
   expiresAt: number;
 }
 let productCache: ProductCache | null = null;
-const PRODUCT_CACHE_TTL = 5 * 60_000;
+const PRODUCT_CACHE_TTL = 30_000; // 30s — fallback de segurança
 
 export function invalidateProductCache(): void {
   productCache = null;
