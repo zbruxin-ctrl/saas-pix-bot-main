@@ -2,20 +2,21 @@
 // FEAT #6: Broadcast de mensagens — enviar mensagem para todos os usuarios ativos
 // POST /api/admin/broadcast
 // Requer SUPERADMIN. Executa em background (não trava o request).
+// FIX: lê TELEGRAM_BOT_TOKEN (padrão da API) em vez de BOT_TOKEN
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import { Telegraf } from 'telegraf';
 import { prisma } from '../../lib/prisma';
 import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
 import { logger } from '../../lib/logger';
+import { env } from '../../config/env';
 
 export const broadcastRouter = Router();
 
 // Instancia Telegraf apenas para envio HTTP — sem iniciar polling/webhook
 function getTelegraf(): Telegraf {
-  const token = process.env.BOT_TOKEN;
-  if (!token) throw new Error('BOT_TOKEN não configurado');
-  return new Telegraf(token);
+  // Usa env.TELEGRAM_BOT_TOKEN (já validado no startup da API)
+  return new Telegraf(env.TELEGRAM_BOT_TOKEN);
 }
 
 const broadcastSchema = z.object({
@@ -64,13 +65,7 @@ broadcastRouter.post(
       const BATCH = 25;
       const DELAY_MS = 1100;
 
-      let tg: Telegraf;
-      try {
-        tg = getTelegraf();
-      } catch (err) {
-        logger.error(`[broadcast] jobId=${jobId} abortado: ${(err as Error).message}`);
-        return;
-      }
+      const tg = getTelegraf();
 
       for (let i = 0; i < users.length; i += BATCH) {
         const batch = users.slice(i, i + BATCH);
