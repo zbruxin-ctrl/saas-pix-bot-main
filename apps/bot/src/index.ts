@@ -24,6 +24,7 @@
 // FIX #15: showHelp migrado para HTML — o _ em /meus_pedidos não é especial em HTML
 // CACHE: endpoint POST /internal/cache/invalidate-products — chamado pela API após mutations de produto
 // FIX B13: paymentInProgress Set em executePayment — bloqueia 2º request duplicado do Telegram
+// FIX B14: res.sendStatus(200) ANTES do await bot.handleUpdate — evita retry do Telegram por timeout
 
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
@@ -841,18 +842,18 @@ async function startBot(): Promise<void> {
     const app = express();
     app.use(express.json());
 
-    app.post(webhookPath, async (req, res) => {
+    app.post(webhookPath, (req, res) => {
       const secretToken = req.headers['x-telegram-bot-api-secret-token'];
       if (env.TELEGRAM_BOT_SECRET && secretToken !== env.TELEGRAM_BOT_SECRET) {
         res.sendStatus(403);
         return;
       }
-      try {
-        await bot.handleUpdate(req.body);
-      } catch (err) {
-        logger.error('[webhook] Erro ao processar update:', err);
-      }
+      // FIX B14: responde 200 IMEDIATAMENTE — evita que o Telegram faça retry
+      // por timeout e envie o mesmo update duas vezes (causa do bug de pagamento duplo)
       res.sendStatus(200);
+      bot.handleUpdate(req.body).catch((err) => {
+        logger.error('[webhook] Erro ao processar update:', err);
+      });
     });
 
     app.get('/health', (_req, res) => res.json({ status: 'ok', bot: me.username }));
