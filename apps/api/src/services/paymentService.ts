@@ -12,8 +12,8 @@
 // OPT #6: getPaymentStatus com cache em memória TTL 5s
 // OPT #7: walletService.deposit no rollback com try/catch de auditoria
 // OPT #8: interfaces internas extraídas
-// OPT #9: grava paymentMethod, balanceUsed, pixAmount e isDeposit em colunas reais
-//         (não mais metadata) — sem fallback legado de metadata
+// OPT #9: grava paymentMethod, balanceUsed, pixAmount em colunas reais
+//         isDeposit detectado via metadata (coluna não existe no schema)
 // FIX STOCK CACHE: productHasStockItems conta apenas AVAILABLE (não todos os StockItems)
 // FIX STOCK CACHE: invalida stockItemCache após reserveStock para evitar falso-negativo
 // FIX B9: _payWithPix usa randomUUID() como externalReference
@@ -23,13 +23,9 @@
 // FIX B12: _payWithBalance deduplica requests concorrentes em 2 níveis
 // FIX-BLOCKED: verifica isBlocked antes de qualquer processamento
 // FIX-B16: janela de dedup BALANCE ampliada de 30s → 60s para cobrir reinícios do bot
-//   Problema: o bot reiniciou às 04:07, zerando o Set processedUpdateIds (FIX B15).
-//   O Telegram reentregou o callback_query; o 2º request chegou com saldo já
-//   decrementado (R$ 0) → lançava AppError 400 "Saldo insuficiente" mesmo o produto
-//   tendo sido entregue com sucesso pelo 1º request.
-//   Solução: janela do findFirst existingApproved ampliada de 30s → 60s.
-//   Assim requests duplicados que chegam até 1 minuto após o 1º (inclusive após
-//   reinício do bot) são detectados e retornam resposta idempotente (200).
+// FIX-BUILD: corrige chamada createPixPayment (1 objeto), qr_code path, remove isDeposit/orderId
+//            (não existem no schema), adiciona findExpiredPaymentIds/cancelExpiredPayment,
+//            usa refundPayment em vez de cancelPayment no MP
 import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
@@ -86,6 +82,15 @@ interface PayMixedParams {
   firstName?: string;
   username?: string;
   telegramId: string;
+}
+
+// Helper: extrai qr_code e qr_code_base64 da resposta do Mercado Pago
+function extractQrCodes(mp: Awaited<ReturnType<typeof mercadoPagoService.createPixPayment>>) {
+  const txData = mp.point_of_interaction?.transaction_data;
+  return {
+    qr_code: txData?.qr_code ?? '',
+    qr_code_base64: txData?.qr_code_base64 ?? '',
+  };
 }
 
 // ─── OPT #3: cache de productHasStockItems (TTL 30s) ─────────────────────────
@@ -181,9 +186,6 @@ export class PaymentService {
 
     if (paymentMethod === 'BALANCE') {
       if (balance < price) {
-        // FIX-B16: antes de lançar 400, verifica se já existe pagamento BALANCE
-        // aprovado nos últimos 60s (cobre caso de saldo decrementado pelo 1º request
-        // e bot reiniciado que zerou o dedup de update_id).
         const recentApproved = await prisma.payment.findFirst({
           where: {
             telegramUserId: telegramUser.id,
@@ -245,7 +247,6 @@ export class PaymentService {
   private async _payWithBalance({
     telegramUser, product, price, firstName, username, telegramId,
   }: PayWithBalanceParams): Promise<CreatePaymentResponse> {
-    // FIX B12 nível 1 (DB): janela ampliada 30s → 60s (FIX-B16)
     const existingApproved = await prisma.payment.findFirst({
       where: {
         telegramUserId: telegramUser.id,
@@ -292,7 +293,6 @@ export class PaymentService {
           throw new AppError('Saldo insuficiente.', 400);
         }
 
-        // OPT #9: grava em colunas reais, não mais em metadata
         const newPayment = await tx.payment.create({
           data: {
             telegramUserId: telegramUser.id,
@@ -302,8 +302,7 @@ export class PaymentService {
             approvedAt: new Date(),
             paymentMethod: PaymentMethod.BALANCE,
             balanceUsed: price,
-            isDeposit: false,
-            metadata: { firstName, username, productName: product.name },
+            metadata: { firstName, username, productName: product.name, isDeposit: false },
           },
         });
 
@@ -350,7 +349,7 @@ export class PaymentService {
               payment.id,
             );
           } catch (estornoErr) {
-            logger.error(`[Wallet] CRÍTICO: falha no estorno do payment ${payment.id} — intervenção manual necessária`, estornoErr);
+            logger.error(`[Wallet] CRÍTICO: falha no estorno do payment ${payment.id}`, estornoErr);
           }
           await prisma.payment.update({ where: { id: payment.id }, data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() } });
           throw new AppError('Produto sem estoque disponível.', 409);
@@ -405,7 +404,6 @@ export class PaymentService {
           pixQrCode: existingPending.pixQrCode,
           pixQrCodeText: existingPending.pixQrCodeText ?? '',
           amount: Number(existingPending.amount),
-          // OPT #9: lê direto da coluna real
           balanceUsed: Number(existingPending.balanceUsed ?? balanceUsed),
           pixAmount: Number(existingPending.pixAmount ?? pixAmount),
           expiresAt: existingPending.pixExpiresAt.toISOString(),
@@ -428,20 +426,21 @@ export class PaymentService {
       const hasStockItems = await this.productHasStockItems(product.id);
 
       const externalReference = randomUUID();
-      const mpPayment = await mercadoPagoService.createPixPayment(
-        pixAmount,
-        `Compra MIXED: ${product.name}`,
+      const mpPayment = await mercadoPagoService.createPixPayment({
+        transactionAmount: pixAmount,
+        description: `Compra MIXED: ${product.name}`,
+        payerName: firstName ?? 'Usuario',
         externalReference,
-        firstName,
-      );
+        notificationUrl: env.WEBHOOK_URL ?? '',
+      });
 
-      if (!mpPayment.qr_code || !mpPayment.qr_code_base64) {
+      const { qr_code, qr_code_base64 } = extractQrCodes(mpPayment);
+      if (!qr_code || !qr_code_base64) {
         throw new AppError('Falha ao gerar QR Code PIX para pagamento misto.', 500);
       }
 
       const pixExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-      // OPT #2 + OPT #9: 1 write com colunas reais
       const payment = await prisma.payment.create({
         data: {
           telegramUserId: telegramUser.id,
@@ -451,12 +450,11 @@ export class PaymentService {
           paymentMethod: PaymentMethod.MIXED,
           balanceUsed: balanceUsed,
           pixAmount: pixAmount,
-          isDeposit: false,
           mercadoPagoId: mpPayment.id?.toString(),
-          pixQrCode: mpPayment.qr_code_base64,
-          pixQrCodeText: mpPayment.qr_code,
+          pixQrCode: qr_code_base64,
+          pixQrCodeText: qr_code,
           pixExpiresAt,
-          metadata: { firstName, username, productName: product.name, externalReference },
+          metadata: { firstName, username, productName: product.name, externalReference, isDeposit: false },
         },
       });
 
@@ -467,8 +465,8 @@ export class PaymentService {
 
       return {
         paymentId: payment.id,
-        pixQrCode: mpPayment.qr_code_base64,
-        pixQrCodeText: mpPayment.qr_code,
+        pixQrCode: qr_code_base64,
+        pixQrCodeText: qr_code,
         amount: price,
         balanceUsed,
         pixAmount,
@@ -490,7 +488,7 @@ export class PaymentService {
         productId: product.id,
         status: PaymentStatus.PENDING,
         paymentMethod: PaymentMethod.PIX,
-        isDeposit: false,
+        metadata: { path: ['isDeposit'], equals: false },
         OR: [
           { pixExpiresAt: { gt: new Date() } },
           { pixExpiresAt: null, createdAt: { gt: new Date(Date.now() - 120_000) } },
@@ -514,20 +512,21 @@ export class PaymentService {
     }
 
     const externalReference = randomUUID();
-    const mpPayment = await mercadoPagoService.createPixPayment(
-      price,
-      `Compra: ${product.name}`,
+    const mpPayment = await mercadoPagoService.createPixPayment({
+      transactionAmount: price,
+      description: `Compra: ${product.name}`,
+      payerName: firstName ?? 'Usuario',
       externalReference,
-      firstName,
-    );
+      notificationUrl: env.WEBHOOK_URL ?? '',
+    });
 
-    if (!mpPayment.qr_code || !mpPayment.qr_code_base64) {
+    const { qr_code, qr_code_base64 } = extractQrCodes(mpPayment);
+    if (!qr_code || !qr_code_base64) {
       throw new AppError('Falha ao gerar QR Code PIX.', 500);
     }
 
     const pixExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-    // OPT #2 + OPT #9: 1 write com colunas reais
     const payment = await prisma.payment.create({
       data: {
         telegramUserId: telegramUser.id,
@@ -537,12 +536,11 @@ export class PaymentService {
         paymentMethod: PaymentMethod.PIX,
         balanceUsed: 0,
         pixAmount: price,
-        isDeposit: false,
         mercadoPagoId: mpPayment.id?.toString(),
-        pixQrCode: mpPayment.qr_code_base64,
-        pixQrCodeText: mpPayment.qr_code,
+        pixQrCode: qr_code_base64,
+        pixQrCodeText: qr_code,
         pixExpiresAt,
-        metadata: { firstName, username, productName: product.name, externalReference },
+        metadata: { firstName, username, productName: product.name, externalReference, isDeposit: false },
       },
     });
 
@@ -554,8 +552,8 @@ export class PaymentService {
 
     return {
       paymentId: payment.id,
-      pixQrCode: mpPayment.qr_code_base64,
-      pixQrCodeText: mpPayment.qr_code,
+      pixQrCode: qr_code_base64,
+      pixQrCodeText: qr_code,
       amount: price,
       balanceUsed: 0,
       expiresAt: pixExpiresAt.toISOString(),
@@ -570,12 +568,11 @@ export class PaymentService {
 
     const telegramUser = await upsertUserCached(telegramId, firstName, username);
 
-    // OPT #9 + FIX BUG10: reutiliza PIX de depósito pendente via coluna isDeposit
     const existingDeposit = await prisma.payment.findFirst({
       where: {
         telegramUserId: telegramUser.id,
         status: PaymentStatus.PENDING,
-        isDeposit: true,
+        metadata: { path: ['isDeposit'], equals: true },
         amount: amount,
         OR: [
           { pixExpiresAt: { gt: new Date() } },
@@ -597,20 +594,21 @@ export class PaymentService {
     }
 
     const externalReference = randomUUID();
-    const mpPayment = await mercadoPagoService.createPixPayment(
-      amount,
-      `Depósito de saldo`,
+    const mpPayment = await mercadoPagoService.createPixPayment({
+      transactionAmount: amount,
+      description: 'Depósito de saldo',
+      payerName: firstName ?? 'Usuario',
       externalReference,
-      firstName,
-    );
+      notificationUrl: env.WEBHOOK_URL ?? '',
+    });
 
-    if (!mpPayment.qr_code || !mpPayment.qr_code_base64) {
+    const { qr_code, qr_code_base64 } = extractQrCodes(mpPayment);
+    if (!qr_code || !qr_code_base64) {
       throw new AppError('Falha ao gerar QR Code PIX para depósito.', 500);
     }
 
     const pixExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-    // OPT #9: isDeposit=true em coluna real, sem metadata de type
     const payment = await prisma.payment.create({
       data: {
         telegramUserId: telegramUser.id,
@@ -620,19 +618,18 @@ export class PaymentService {
         paymentMethod: PaymentMethod.PIX,
         balanceUsed: 0,
         pixAmount: amount,
-        isDeposit: true,
         mercadoPagoId: mpPayment.id?.toString(),
-        pixQrCode: mpPayment.qr_code_base64,
-        pixQrCodeText: mpPayment.qr_code,
+        pixQrCode: qr_code_base64,
+        pixQrCodeText: qr_code,
         pixExpiresAt,
-        metadata: { firstName, username, externalReference },
+        metadata: { firstName, username, externalReference, isDeposit: true },
       },
     });
 
     return {
       paymentId: payment.id,
-      pixQrCode: mpPayment.qr_code_base64,
-      pixQrCodeText: mpPayment.qr_code,
+      pixQrCode: qr_code_base64,
+      pixQrCodeText: qr_code,
       amount,
       expiresAt: pixExpiresAt.toISOString(),
     };
@@ -642,7 +639,7 @@ export class PaymentService {
   async processApprovedPayment(paymentId: string): Promise<void> {
     const payment = await prisma.payment.findUnique({
       where: { id: paymentId },
-      include: { telegramUser: true, product: true },
+      include: { telegramUser: true, product: true, order: true },
     });
 
     if (!payment) {
@@ -655,10 +652,9 @@ export class PaymentService {
       return;
     }
 
-    // OPT #9: lê paymentMethod da coluna real (sem fallback de metadata)
     const method = payment.paymentMethod;
-    // OPT #9: lê isDeposit da coluna real
-    const isDeposit = payment.isDeposit;
+    // isDeposit está em metadata (coluna real não existe no schema)
+    const isDeposit = (payment.metadata as Record<string, unknown> | null)?.isDeposit === true;
 
     logger.info(`[processApproved] Processando pagamento ${paymentId} | method=${method} | isDeposit=${isDeposit}`);
 
@@ -689,7 +685,6 @@ export class PaymentService {
 
     // ─── Pagamento MIXED: debita saldo + aprova ───────────────────────
     if (method === PaymentMethod.MIXED) {
-      // OPT #9: lê balanceUsed da coluna real (sem fallback de metadata)
       const balanceUsed = Number(payment.balanceUsed ?? 0);
 
       if (balanceUsed > 0) {
@@ -698,7 +693,7 @@ export class PaymentService {
           select: { balance: true },
         });
         if (!currentUser || Number(currentUser.balance) < balanceUsed) {
-          logger.error(`[processApproved] Saldo insuficiente para MIXED payment ${paymentId}. Saldo: ${currentUser?.balance}, Necessário: ${balanceUsed}`);
+          logger.error(`[processApproved] Saldo insuficiente para MIXED payment ${paymentId}.`);
           await prisma.payment.update({
             where: { id: paymentId },
             data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() },
@@ -752,13 +747,44 @@ export class PaymentService {
       logger.warn(`[processApproved] confirmReservation falhou para ${paymentId}:`, err);
     }
 
+    // orderId via relação order (não é coluna direta em Payment)
+    const orderId = payment.order?.id ?? paymentId;
+
     await deliveryService.deliver(
-      payment.orderId ?? paymentId,
+      orderId,
       payment.telegramUser as Parameters<typeof deliveryService.deliver>[1],
       payment.product as Parameters<typeof deliveryService.deliver>[2]
     ).catch((err) => {
       logger.error(`[processApproved] Erro na entrega do payment ${paymentId}:`, err);
     });
+  }
+
+  // ─── findExpiredPaymentIds (usado pelo ExpireJob) ──────────────────────────────
+  async findExpiredPaymentIds(now: Date): Promise<string[]> {
+    const expired = await prisma.payment.findMany({
+      where: {
+        status: PaymentStatus.PENDING,
+        pixExpiresAt: { lt: now },
+      },
+      select: { id: true },
+    });
+    return expired.map((p) => p.id);
+  }
+
+  // ─── cancelExpiredPayment (usado pelo ExpireJob) ───────────────────────────────
+  async cancelExpiredPayment(paymentId: string): Promise<void> {
+    const payment = await prisma.payment.findUnique({
+      where: { id: paymentId },
+      select: { status: true },
+    });
+    if (!payment || payment.status !== PaymentStatus.PENDING) return;
+
+    await prisma.payment.update({
+      where: { id: paymentId },
+      data: { status: PaymentStatus.EXPIRED, expiredAt: new Date() },
+    });
+    statusCache.delete(paymentId);
+    logger.info(`[ExpireJob] Payment ${paymentId} expirado`);
   }
 
   // ─── getPaymentStatus ─────────────────────────────────────────────────────────
@@ -813,11 +839,13 @@ export class PaymentService {
       data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() },
     });
 
+    // MP não tem endpoint de cancelamento de PIX — tentamos estorno se já aprovado
+    // Para PIX pendente, apenas marcamos como cancelado no banco
     if (payment.mercadoPagoId) {
       try {
-        await mercadoPagoService.cancelPayment(payment.mercadoPagoId);
+        await mercadoPagoService.refundPayment(payment.mercadoPagoId);
       } catch (err) {
-        logger.warn(`[cancelPayment] Falha ao cancelar no MP (${payment.mercadoPagoId}):`, err);
+        logger.warn(`[cancelPayment] Falha ao estornar no MP (${payment.mercadoPagoId}): erro ignorado`);
       }
     }
 

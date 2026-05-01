@@ -5,6 +5,7 @@
  * FIX #1: ao receber /start, re-agenda o timer de expiração do PIX para
  *         usuários com pagamento em aberto (resistência a restarts via Redis).
  * BUG FIX: todos os handlers têm try/catch global para nunca silenciar o bot.
+ * FIX-BUILD: fallback do getSession usa UserSession para firstName.
  */
 
 // Sentry DEVE ser o primeiro import — captura erros desde o início
@@ -12,11 +13,12 @@ import { initSentry, captureError } from './config/sentry';
 initSentry();
 
 import express from 'express';
-import { Telegraf, Markup } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { env } from './config/env';
 import { apiClient, invalidateProductCache, invalidateBotConfigCache } from './services/apiClient';
-import { getSession, saveSession, clearSession } from './services/session';
+import { getSession, saveSession } from './services/session';
+import type { UserSession } from './services/session';
 import { markUpdateProcessed } from './services/locks';
 
 // Handlers
@@ -34,6 +36,8 @@ import {
 
 import type { ProductDTO } from '@saas-pix/shared';
 
+const emptySession = (): UserSession => ({ step: 'idle', lastActivityAt: Date.now() });
+
 const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 initPaymentHandlers(bot);
 
@@ -44,7 +48,7 @@ bot.use(globalMiddleware);
 bot.command('start', async (ctx) => {
   try {
     const userId = ctx.from!.id;
-    const existing = await getSession(userId).catch(() => ({ step: 'idle' as const, lastActivityAt: Date.now() }));
+    const existing = await getSession(userId).catch(emptySession);
 
     if (existing.step === 'awaiting_payment' && existing.paymentId) {
       // FIX #1: re-agenda o timer de expiração usando o tempo restante do Redis
@@ -187,7 +191,6 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
 
 // ─── Ações de pagamento ───────────────────────────────────────────────────────
 bot.action(/^pay_pix_(.+)$/, async (ctx) => {
-  // answerCbQuery é feito dentro de executePayment
   await executePayment(ctx, ctx.match[1], 'PIX');
 });
 
@@ -200,12 +203,10 @@ bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^check_payment_(.+)$/, async (ctx) => {
-  // answerCbQuery é feito DENTRO de handleCheckPayment (primeiro passo)
   await handleCheckPayment(ctx, ctx.match[1]);
 });
 
 bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
-  // answerCbQuery é feito DENTRO de handleCancelPayment (primeiro passo)
   await handleCancelPayment(ctx, ctx.match[1]);
 });
 
@@ -221,7 +222,6 @@ bot.on(message('text'), async (ctx) => {
       return;
     }
 
-    // Mensagem de texto não reconhecida
     await ctx.reply(
       'Use /start para acessar o menu principal\.',
       { parse_mode: 'MarkdownV2' }
@@ -256,7 +256,6 @@ app.post('/invalidate-cache', (req, res) => {
 const webhookPath = '/telegram-webhook';
 
 app.post(webhookPath, async (req, res) => {
-  // Validação do secret_token do Telegram
   if (env.TELEGRAM_BOT_SECRET) {
     const incoming = req.headers['x-telegram-bot-api-secret-token'];
     if (incoming !== env.TELEGRAM_BOT_SECRET) {
@@ -268,7 +267,6 @@ app.post(webhookPath, async (req, res) => {
 
   const update = req.body as { update_id?: number };
 
-  // Idempotência: ignora updates duplicados
   if (update.update_id) {
     const isNew = await markUpdateProcessed(update.update_id).catch(() => true);
     if (!isNew) {

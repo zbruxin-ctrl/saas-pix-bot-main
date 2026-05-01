@@ -6,11 +6,13 @@
  * BUG FIX: updates sem ctx.from (edited_message, channel_post, etc.) são
  *          ignorados com segurança — antes causavam falha silenciosa no bot.
  * BUG FIX: try/catch total no middleware para nunca travar o pipeline.
+ * FIX-BUILD: tipo do fallback getSession agora usa UserSession para firstName.
  */
 import { Context, Middleware } from 'telegraf';
 import { escapeMd } from '../utils/escape';
 import { editOrReply } from '../utils/helpers';
 import { getSession, saveSession } from '../services/session';
+import type { UserSession } from '../services/session';
 import { apiClient } from '../services/apiClient';
 import { showBlockedMessage } from './navigation';
 import { env } from '../config/env';
@@ -34,6 +36,8 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+const emptySession = (): UserSession => ({ step: 'idle', lastActivityAt: Date.now() });
+
 export const globalMiddleware: Middleware<Context> = async (ctx, next) => {
   // BUG FIX: updates sem from (edited_message, channel_post, inline_query, etc.)
   // não têm userId — ignorar silenciosamente em vez de travar o pipeline.
@@ -41,7 +45,7 @@ export const globalMiddleware: Middleware<Context> = async (ctx, next) => {
   if (!userId) return next();
 
   try {
-    // ── Rate limit ───────────────────────────────────────────────────────────
+    // ── Rate limit ────────────────────────────────────────────────────────────
     const lastRequest = rateLimitMap.get(userId) ?? 0;
     const now = Date.now();
     if (now - lastRequest < RATE_LIMIT_MS) {
@@ -60,9 +64,9 @@ export const globalMiddleware: Middleware<Context> = async (ctx, next) => {
       return next();
     }
 
-    // ── Modo manutenção ──────────────────────────────────────────────────────
+    // ── Modo manutenção ───────────────────────────────────────────────────────
     if (config.maintenanceMode) {
-      const session = await getSession(userId).catch(() => ({ step: 'idle' as const, lastActivityAt: Date.now() }));
+      const session = await getSession(userId).catch(emptySession);
       const firstName = escapeMd(session.firstName || ctx.from?.first_name || 'visitante');
       const maintMsg = config.maintenanceMessage || 'Estamos em manutenção. Voltamos em breve!';
       const text =
@@ -79,7 +83,7 @@ export const globalMiddleware: Middleware<Context> = async (ctx, next) => {
       return;
     }
 
-    // ── Conta bloqueada ──────────────────────────────────────────────────────
+    // ── Conta bloqueada ───────────────────────────────────────────────────────
     if (config.isBlocked) {
       const msgText = (ctx.message as { text?: string } | undefined)?.text;
       const isStartCommand = msgText === '/start';
@@ -87,14 +91,14 @@ export const globalMiddleware: Middleware<Context> = async (ctx, next) => {
       const callbackData = isCallbackQuery ? ('data' in ctx.callbackQuery! ? ctx.callbackQuery!.data : '') : '';
 
       if (isStartCommand) {
-        const session = await getSession(userId).catch(() => ({ step: 'idle' as const, lastActivityAt: Date.now(), mainMessageId: undefined, firstName: undefined }));
+        const session = await getSession(userId).catch(emptySession);
         session.firstName = ctx.from?.first_name;
         const chatId = ctx.chat?.id;
         if (session.mainMessageId && chatId) {
           await ctx.telegram.deleteMessage(chatId, session.mainMessageId).catch(() => {});
           session.mainMessageId = undefined;
         }
-        await saveSession(userId, session as never).catch(() => {});
+        await saveSession(userId, session).catch(() => {});
         await showBlockedMessage(ctx);
         return;
       }
