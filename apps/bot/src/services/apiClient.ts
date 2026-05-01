@@ -5,9 +5,11 @@
 // PERF #5: cache de saldo por usuario TTL 15s
 // PERF #6: invalidacao do cache de saldo apos deposito
 // FEATURE: getOrders(telegramId)
-// FIX-B17: createPayment distingue erro real de idempotência
+// FIX-B17: createPayment distingue erro real de idempotencia
 // FEAT-MAINT: getBotConfig() busca maintenance_mode + maintenance_message
-//   com cache em memória TTL 10s para não bater na API a cada update
+//   com cache em memoria TTL 10s
+// FEAT-BLOCKED: getBotConfig(telegramId) tambem retorna isBlocked do usuario
+//   Cache invalidado apos cada chamada com telegramId diferente
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
 import type {
@@ -41,16 +43,22 @@ export function invalidateBalanceCache(telegramId: string): void {
   balanceCache.delete(telegramId);
 }
 
-// FEAT-MAINT: cache do bot-config com TTL 10s
+// FEAT-MAINT + FEAT-BLOCKED: cache do bot-config por telegramId, TTL 10s
+// Chave: telegramId ou '__global__' quando nao ha telegramId
 interface BotConfigCache {
-  data: { maintenanceMode: boolean; maintenanceMessage: string };
+  data: { maintenanceMode: boolean; maintenanceMessage: string; isBlocked: boolean };
   expiresAt: number;
 }
-let botConfigCache: BotConfigCache | null = null;
+const botConfigCache = new Map<string, BotConfigCache>();
 const BOT_CONFIG_CACHE_TTL = 10_000;
 
-export function invalidateBotConfigCache(): void {
-  botConfigCache = null;
+export function invalidateBotConfigCache(telegramId?: string): void {
+  if (telegramId) {
+    botConfigCache.delete(telegramId);
+    botConfigCache.delete('__global__');
+  } else {
+    botConfigCache.clear();
+  }
 }
 
 export interface OrderSummary {
@@ -111,21 +119,27 @@ class ApiClient {
     }
   }
 
-  async getBotConfig(): Promise<{ maintenanceMode: boolean; maintenanceMessage: string }> {
+  async getBotConfig(
+    telegramId?: string
+  ): Promise<{ maintenanceMode: boolean; maintenanceMessage: string; isBlocked: boolean }> {
+    const cacheKey = telegramId ?? '__global__';
     const now = Date.now();
-    if (botConfigCache && botConfigCache.expiresAt > now) {
-      return botConfigCache.data;
+    const cached = botConfigCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.data;
     }
     try {
+      const qs = telegramId ? `?telegramId=${encodeURIComponent(telegramId)}` : '';
       const { data } = await this.withRetry(() =>
-        this.client.get<ApiResponse<{ maintenanceMode: boolean; maintenanceMessage: string }>>('/api/payments/bot-config')
+        this.client.get<ApiResponse<{ maintenanceMode: boolean; maintenanceMessage: string; isBlocked: boolean }>>(
+          `/api/payments/bot-config${qs}`
+        )
       );
-      const result = data.data ?? { maintenanceMode: false, maintenanceMessage: '' };
-      botConfigCache = { data: result, expiresAt: now + BOT_CONFIG_CACHE_TTL };
+      const result = data.data ?? { maintenanceMode: false, maintenanceMessage: '', isBlocked: false };
+      botConfigCache.set(cacheKey, { data: result, expiresAt: now + BOT_CONFIG_CACHE_TTL });
       return result;
     } catch {
-      // Se falhar, assume sem manutenção para não bloquear o bot
-      return { maintenanceMode: false, maintenanceMessage: '' };
+      return { maintenanceMode: false, maintenanceMessage: '', isBlocked: false };
     }
   }
 
@@ -207,7 +221,7 @@ class ApiClient {
             };
           }
         } catch {
-          // fallback falhou, deixa propagar erro original
+          // fallback falhou
         }
       }
       throw err;

@@ -1,25 +1,10 @@
 // Bot do Telegram - Ponto de entrada principal
-// FEATURE 1: edit-in-place (editOrReply)
-// FEATURE 2: sistema de saldo
-// FEATURE 3: animação de loading nos botões
-// FEATURE 4: escolha de método de pagamento
-// PERF #3: Promise.all para buscar produto + saldo em paralelo
-// PERF #7: limpeza de sessões idle a cada 30min
-// FEATURE 5: /meus_pedidos com histórico real
-// FIX WEBHOOK: bot sobe servidor Express próprio na porta 8080
-// FIX TS7016: usa fetch nativo do Node 20
-// FIX #1 a #15: vários fixes anteriores
-// FIX B13: paymentInProgress Set em executePayment
-// FIX B14: res.sendStatus(200) ANTES do await bot.handleUpdate
-// FIX B15: dedup por update_id no webhook
-// FEAT-MAINT: middleware global de manutenção — consulta /bot-config (TTL 10s)
-//   Quando maintenance_mode=true, QUALQUER interação (comando ou callback) recebe
-//   a mensagem de manutenção configurada no painel admin. O usuário não consegue
-//   navegar nem comprar. Apenas /start exibe a mensagem (sem menu).
-// FEAT-BLOCKED: quando a API retorna 403 (usuário bloqueado), o bot exibe
-//   mensagem amigável explicando que a conta está suspensa.
-// FEAT-DESC: tela de produto exibe descrição rica (igual à de boas-vindas do /start)
-//   Descrição do produto é exibida em destaque + ícone, linha separadora visual.
+// FEAT-MAINT: middleware global de manutencao
+// FEAT-BLOCKED: middleware global de bloqueio de usuario
+//   Acoes bloqueadas: ver produtos, comprar, adicionar saldo
+//   Acoes permitidas: /start (mostra msg), /ajuda, /meus_pedidos, ver saldo
+// FEAT-DESC: descricao rica dos produtos
+// FEAT-CANCEL-DEPOSIT: botao cancelar PIX de deposito
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -55,6 +40,7 @@ interface UserSession {
   step: 'idle' | 'selecting_product' | 'awaiting_payment' | 'awaiting_deposit_amount';
   selectedProductId?: string;
   paymentId?: string;
+  depositPaymentId?: string; // FEAT-CANCEL-DEPOSIT: ID do PIX de deposito ativo
   products?: ProductDTO[];
   mainMessageId?: number;
   firstName?: string;
@@ -84,22 +70,12 @@ function cleanupSessions(): void {
       removed++;
     }
   }
-  if (removed > 0) {
-    logger.info(`[cleanup] ${removed} sessão(ões) idle removida(s). Total ativo: ${sessions.size}`);
-  }
+  if (removed > 0) logger.info(`[cleanup] ${removed} sessao(oes) idle removida(s). Total ativo: ${sessions.size}`);
 }
-
 setInterval(cleanupSessions, SESSION_CLEANUP_INTERVAL_MS);
 
-// FIX B15: dedup de update_id
 const processedUpdateIds = new Set<number>();
-const UPDATE_DEDUP_CLEANUP_MS = 5 * 60_000;
-setInterval(() => {
-  if (processedUpdateIds.size > 0) {
-    processedUpdateIds.clear();
-    logger.info('[dedup] Cache de update_ids limpo');
-  }
-}, UPDATE_DEDUP_CLEANUP_MS);
+setInterval(() => { processedUpdateIds.clear(); }, 5 * 60_000);
 
 const paymentInProgress = new Set<number>();
 
@@ -107,13 +83,13 @@ const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
 async function registerCommands(): Promise<void> {
   await bot.telegram.setMyCommands([
-    { command: 'start', description: '🏠 Menu inicial' },
-    { command: 'produtos', description: '🛍️ Ver produtos disponíveis' },
-    { command: 'saldo', description: '💰 Ver meu saldo e adicionar' },
-    { command: 'meus_pedidos', description: '📦 Histórico de pedidos' },
-    { command: 'ajuda', description: '❓ Central de ajuda e suporte' },
+    { command: 'start', description: '\ud83c\udfe0 Menu inicial' },
+    { command: 'produtos', description: '\ud83d\udecd\ufe0f Ver produtos disponíveis' },
+    { command: 'saldo', description: '\ud83d\udcb0 Ver meu saldo e adicionar' },
+    { command: 'meus_pedidos', description: '\ud83d\udce6 Histórico de pedidos' },
+    { command: 'ajuda', description: '\u2753 Central de ajuda e suporte' },
   ]);
-  logger.info('✅ Menu de comandos registrado no Telegram');
+  logger.info('\u2705 Menu de comandos registrado no Telegram');
 }
 
 async function editOrReply(
@@ -127,7 +103,6 @@ async function editOrReply(
     await ctx.replyWithMarkdown(text, extra as object);
     return;
   }
-
   if (session.mainMessageId) {
     try {
       await ctx.telegram.editMessageText(chatId, session.mainMessageId, undefined, text, {
@@ -142,11 +117,10 @@ async function editOrReply(
         !msg.includes('message to edit not found') &&
         !msg.includes('MESSAGE_ID_INVALID')
       ) {
-        logger.warn(`[editOrReply] Erro inesperado ao editar: ${msg}`);
+        logger.warn(`[editOrReply] Erro ao editar: ${msg}`);
       }
     }
   }
-
   const sent = await ctx.replyWithMarkdown(text, extra as object);
   session.mainMessageId = sent.message_id;
 }
@@ -162,7 +136,6 @@ async function editOrReplyHtml(
     await ctx.telegram.sendMessage(ctx.from!.id, text, { parse_mode: 'HTML', ...(extra as object) });
     return;
   }
-
   if (session.mainMessageId) {
     try {
       await ctx.telegram.editMessageText(chatId, session.mainMessageId, undefined, text, {
@@ -177,63 +150,145 @@ async function editOrReplyHtml(
         !msg.includes('message to edit not found') &&
         !msg.includes('MESSAGE_ID_INVALID')
       ) {
-        logger.warn(`[editOrReplyHtml] Erro inesperado ao editar: ${msg}`);
+        logger.warn(`[editOrReplyHtml] Erro ao editar: ${msg}`);
       }
     }
   }
-
   const sent = await ctx.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', ...(extra as object) });
   session.mainMessageId = sent.message_id;
 }
 
-// ─── FEAT-MAINT: helper de verificação de manutenção ─────────────────────────
-// Retorna null se não está em manutenção, ou a mensagem configurada se estiver.
-async function getMaintenanceMessage(): Promise<string | null> {
-  try {
-    const config = await apiClient.getBotConfig();
-    if (config.maintenanceMode) {
-      return config.maintenanceMessage || 'Estamos em manutenção. Voltamos em breve! 🛠️';
+// ─── Mensagem de conta suspensa ──────────────────────────────────────────
+// Exibe a mensagem de conta suspensa e para a execucao
+async function showBlockedMessage(ctx: Context): Promise<void> {
+  const supportUrl = `https://wa.me/${escapeHtml(env.SUPPORT_PHONE)}`;
+  await editOrReply(
+    ctx,
+    `\ud83d\udea8 *Conta Suspensa*\n\n` +
+      `Sua conta foi *suspensa* e o acesso a compras e dep\u00f3sitos est\u00e1 restrito.\n\n` +
+      `Voc\u00ea ainda pode:\n` +
+      `\u2705 Ver seu saldo\n` +
+      `\u2705 Consultar seus pedidos\n` +
+      `\u2705 Acessar a ajuda\n\n` +
+      `Se acredita que isso \u00e9 um erro, entre em contato com o suporte.`,
+    {
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.url('\ud83d\udcde Falar com Suporte', supportUrl)],
+        [Markup.button.callback('\ud83d\udcb0 Ver Saldo', 'show_balance')],
+        [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
+        [Markup.button.callback('\u2753 Ajuda', 'show_help')],
+      ]).reply_markup,
     }
-  } catch {
-    // Se não conseguir checar, não bloqueia
-  }
-  return null;
+  );
 }
 
-// ─── FEAT-MAINT: middleware global ────────────────────────────────────────────
-// Intercepta QUALQUER update (mensagem, callback, comando) e bloqueia
-// quando modo manutenção está ativo. Exibe mensagem configurada no admin.
+// ─── Middleware global (manutencao + bloqueio) ──────────────────────────────
+// Ordem de prioridade:
+// 1. Manutencao ativa -> bloqueia TUDO sem excecao
+// 2. Usuario bloqueado -> bloqueia apenas acoes restritas
+//    Permitido: /start (mostra msg suspensa), /ajuda, /meus_pedidos,
+//               show_balance, show_orders, show_help, show_home
+//    Bloqueado: /produtos, show_products, select_product_*, pay_*, deposit_balance,
+//               awaiting_deposit_amount (texto livre)
+const BLOCKED_ALLOWED_ACTIONS = new Set([
+  'show_balance',
+  'show_orders',
+  'show_help',
+  'show_home',
+]);
+
+function isBlockedAllowedAction(callbackData: string): boolean {
+  return BLOCKED_ALLOWED_ACTIONS.has(callbackData);
+}
+
 bot.use(async (ctx, next) => {
-  const maintMsg = await getMaintenanceMessage();
-  if (maintMsg) {
-    const userId = ctx.from?.id;
-    if (userId) {
-      const session = getSession(userId);
-      const firstName = escapeMd(session.firstName || ctx.from?.first_name || 'visitante');
-      const text =
-        `🛠️ *Manutenção em Andamento*\n\n` +
-        `Olá, *${firstName}*!\n\n` +
-        `${escapeMd(maintMsg)}\n\n` +
-        `_Pedimos desculpas pelo inconveniente. Em breve estaremos de volta!_ 😊`;
+  const userId = ctx.from?.id;
+  if (!userId) return next();
 
-      if ('callbackQuery' in ctx && ctx.callbackQuery) {
-        await ctx.answerCbQuery('🛠️ Bot em manutenção', { show_alert: true }).catch(() => {});
-      }
+  const telegramId = String(userId);
+  let config: { maintenanceMode: boolean; maintenanceMessage: string; isBlocked: boolean };
 
-      if (session.mainMessageId && ctx.chat?.id) {
-        await ctx.telegram.editMessageText(ctx.chat.id, session.mainMessageId, undefined, text, {
-          parse_mode: 'Markdown',
-        }).catch(async () => {
-          const sent = await ctx.replyWithMarkdown(text).catch(() => null);
-          if (sent) session.mainMessageId = sent.message_id;
-        });
-      } else {
-        const sent = await ctx.replyWithMarkdown(text).catch(() => null);
-        if (sent && userId) getSession(userId).mainMessageId = sent.message_id;
-      }
-    }
-    return; // não chama next() — bloqueia completamente
+  try {
+    config = await apiClient.getBotConfig(telegramId);
+  } catch {
+    return next();
   }
+
+  // 1. Manutencao bloqueia tudo
+  if (config.maintenanceMode) {
+    const session = getSession(userId);
+    const firstName = escapeMd(session.firstName || ctx.from?.first_name || 'visitante');
+    const maintMsg = config.maintenanceMessage || 'Estamos em manutenção. Voltamos em breve!';
+    const text =
+      `\ud83d\udee0\ufe0f *Manuten\u00e7\u00e3o em Andamento*\n\n` +
+      `Ol\u00e1, *${firstName}*!\n\n` +
+      `${escapeMd(maintMsg)}\n\n` +
+      `_Pedimos desculpas pelo inconveniente. Em breve estaremos de volta!_ \ud83d\ude0a`;
+
+    if ('callbackQuery' in ctx && ctx.callbackQuery) {
+      await ctx.answerCbQuery('\ud83d\udee0\ufe0f Bot em manutenção', { show_alert: true }).catch(() => {});
+    }
+
+    if (session.mainMessageId && ctx.chat?.id) {
+      await ctx.telegram.editMessageText(ctx.chat.id, session.mainMessageId, undefined, text, {
+        parse_mode: 'Markdown',
+      }).catch(async () => {
+        const sent = await ctx.replyWithMarkdown(text).catch(() => null);
+        if (sent) session.mainMessageId = sent.message_id;
+      });
+    } else {
+      const sent = await ctx.replyWithMarkdown(text).catch(() => null);
+      if (sent) getSession(userId).mainMessageId = sent.message_id;
+    }
+    return; // nao chama next()
+  }
+
+  // 2. Usuario bloqueado: verifica o tipo de acao
+  if (config.isBlocked) {
+    // Detecta o tipo de interacao
+    const isStartCommand = 'message' in ctx && (ctx.message as { text?: string })?.text === '/start';
+    const isCallbackQuery = 'callbackQuery' in ctx && ctx.callbackQuery;
+    const callbackData = isCallbackQuery ? ('data' in ctx.callbackQuery! ? ctx.callbackQuery!.data : '') : '';
+
+    // /start -> exibe mensagem de suspensao direto (sem navegar ao menu normal)
+    if (isStartCommand) {
+      const session = getSession(userId);
+      session.firstName = ctx.from?.first_name;
+      if (session.mainMessageId && ctx.chat?.id) {
+        await ctx.telegram.deleteMessage(ctx.chat.id, session.mainMessageId).catch(() => {});
+        session.mainMessageId = undefined;
+      }
+      await showBlockedMessage(ctx);
+      return;
+    }
+
+    // Comandos permitidos explicitamente
+    const isAllowedCommand =
+      'message' in ctx &&
+      ['/ajuda', '/meus_pedidos', '/saldo'].some(
+        (cmd) => (ctx.message as { text?: string })?.text?.startsWith(cmd)
+      );
+    if (isAllowedCommand) return next();
+
+    // Callbacks permitidos
+    if (isCallbackQuery) {
+      if (isBlockedAllowedAction(callbackData)) return next();
+      // Bloqueia qualquer outro callback
+      await ctx.answerCbQuery('\ud83d\udea8 Conta suspensa — acao nao permitida', { show_alert: true }).catch(() => {});
+      await showBlockedMessage(ctx);
+      return;
+    }
+
+    // Mensagens de texto (ex: digitando valor de deposito) -> bloqueia
+    if ('message' in ctx && (ctx.message as { text?: string })?.text) {
+      await showBlockedMessage(ctx);
+      return;
+    }
+
+    // Qualquer outra coisa nao identificada -> deixa passar por seguranca
+    return next();
+  }
+
   return next();
 });
 
@@ -244,16 +299,16 @@ async function showHome(ctx: Context): Promise<void> {
 
   await editOrReply(
     ctx,
-    `👋 Olá, *${firstName}*! Bem-vindo!\n\n` +
-      `🛒 Aqui você pode adquirir nossos produtos e planos de forma rápida e segura.\n\n` +
-      `💳 Aceitamos pagamento via *PIX* (confirmação instantânea) ou via *saldo* pré-carregado.\n\n` +
-      `Para ver nossos produtos, clique no botão abaixo:`,
+    `\ud83d\udc4b Ol\u00e1, *${firstName}*! Bem-vindo!\n\n` +
+      `\ud83d\uded2 Aqui voc\u00ea pode adquirir nossos produtos e planos de forma r\u00e1pida e segura.\n\n` +
+      `\ud83d\udcb3 Aceitamos pagamento via *PIX* (confirma\u00e7\u00e3o instant\u00e2nea) ou via *saldo* pr\u00e9-carregado.\n\n` +
+      `Para ver nossos produtos, clique no bot\u00e3o abaixo:`,
     {
       reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('🛍️ Ver Produtos', 'show_products')],
-        [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
-        [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
-        [Markup.button.callback('❓ Ajuda', 'show_help')],
+        [Markup.button.callback('\ud83d\udecd\ufe0f Ver Produtos', 'show_products')],
+        [Markup.button.callback('\ud83d\udcb0 Meu Saldo', 'show_balance')],
+        [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
+        [Markup.button.callback('\u2753 Ajuda', 'show_help')],
       ]).reply_markup,
     }
   );
@@ -271,33 +326,25 @@ bot.command('start', async (ctx) => {
   });
 
   const sent = await ctx.replyWithMarkdown(
-    `👋 Olá, *${firstName}*! Bem-vindo!\n\n` +
-      `🛒 Aqui você pode adquirir nossos produtos e planos de forma rápida e segura.\n\n` +
-      `💳 Aceitamos pagamento via *PIX* (confirmação instantânea) ou via *saldo* pré-carregado.\n\n` +
-      `Para ver nossos produtos, clique no botão abaixo:`,
+    `\ud83d\udc4b Ol\u00e1, *${firstName}*! Bem-vindo!\n\n` +
+      `\ud83d\uded2 Aqui voc\u00ea pode adquirir nossos produtos e planos de forma r\u00e1pida e segura.\n\n` +
+      `\ud83d\udcb3 Aceitamos pagamento via *PIX* (confirma\u00e7\u00e3o instant\u00e2nea) ou via *saldo* pr\u00e9-carregado.\n\n` +
+      `Para ver nossos produtos, clique no bot\u00e3o abaixo:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('🛍️ Ver Produtos', 'show_products')],
-      [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
-      [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
-      [Markup.button.callback('❓ Ajuda', 'show_help')],
+      [Markup.button.callback('\ud83d\udecd\ufe0f Ver Produtos', 'show_products')],
+      [Markup.button.callback('\ud83d\udcb0 Meu Saldo', 'show_balance')],
+      [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
+      [Markup.button.callback('\u2753 Ajuda', 'show_help')],
     ])
   );
 
   getSession(userId).mainMessageId = sent.message_id;
 });
 
-bot.command('produtos', async (ctx) => {
-  await showProducts(ctx);
-});
-bot.command('saldo', async (ctx) => {
-  await showBalance(ctx);
-});
-bot.command('ajuda', async (ctx) => {
-  await showHelp(ctx);
-});
-bot.command('meus_pedidos', async (ctx) => {
-  await showOrders(ctx);
-});
+bot.command('produtos', async (ctx) => { await showProducts(ctx); });
+bot.command('saldo', async (ctx) => { await showBalance(ctx); });
+bot.command('ajuda', async (ctx) => { await showHelp(ctx); });
+bot.command('meus_pedidos', async (ctx) => { await showOrders(ctx); });
 
 bot.action('show_home', async (ctx) => {
   await ctx.answerCbQuery();
@@ -305,7 +352,7 @@ bot.action('show_home', async (ctx) => {
 });
 
 bot.action('show_products', async (ctx) => {
-  await ctx.answerCbQuery('⏳ Carregando produtos...');
+  await ctx.answerCbQuery('\u23f3 Carregando produtos...');
   await showProducts(ctx);
 });
 
@@ -315,7 +362,7 @@ bot.action('show_help', async (ctx) => {
 });
 
 bot.action('show_orders', async (ctx) => {
-  await ctx.answerCbQuery('📦 Carregando pedidos...');
+  await ctx.answerCbQuery('\ud83d\udce6 Carregando pedidos...');
   await showOrders(ctx);
 });
 
@@ -333,27 +380,36 @@ async function showBalance(ctx: Context): Promise<void> {
       .join('\n');
 
     const texto =
-      `💰 *Seu Saldo*\n\n` +
+      `\ud83d\udcb0 *Seu Saldo*\n\n` +
       `Disponível: *R$ ${Number(balance).toFixed(2)}*\n\n` +
       (txLines ? `*Últimas transações:*\n${txLines}\n\n` : '_Nenhuma transação ainda._\n\n') +
       `Use seu saldo para comprar sem precisar fazer PIX toda hora!`;
 
+    // FEAT-BLOCKED: se usuario esta bloqueado, nao mostra botao de adicionar saldo
+    const config = await apiClient.getBotConfig(String(userId)).catch(() => ({ isBlocked: false }));
+    const buttons = config.isBlocked
+      ? [
+          [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
+          [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
+        ]
+      : [
+          [Markup.button.callback('\u2795 Adicionar Saldo', 'deposit_balance')],
+          [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
+        ];
+
     await editOrReply(ctx, texto, {
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('\u2795 Adicionar Saldo', 'deposit_balance')],
-        [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
-      ]).reply_markup,
+      reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
     });
   } catch (err) {
     logger.error(`Erro ao buscar saldo para ${userId}:`, err);
-    await editOrReply(ctx, '❌ Erro ao buscar saldo. Tente novamente.', {
+    await editOrReply(ctx, '\u274c Erro ao buscar saldo. Tente novamente.', {
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
     });
   }
 }
 
 bot.action('show_balance', async (ctx) => {
-  await ctx.answerCbQuery('⏳ Buscando saldo...');
+  await ctx.answerCbQuery('\u23f3 Buscando saldo...');
   await showBalance(ctx);
 });
 
@@ -362,7 +418,7 @@ bot.action('deposit_balance', async (ctx) => {
   const session = getSession(ctx.from!.id);
   session.step = 'awaiting_deposit_amount';
   await ctx.replyWithMarkdown(
-    `💳 *Adicionar Saldo*\n\n` +
+    `\ud83d\udcb3 *Adicionar Saldo*\n\n` +
       `Digite o valor em reais que deseja depositar:\n` +
       `_(mínimo R$ 1,00 | máximo R$ 10.000,00)_\n\n` +
       `Exemplo: \`25\` ou \`50.00\``
@@ -370,7 +426,7 @@ bot.action('deposit_balance', async (ctx) => {
 });
 
 bot.action(/^select_product_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('⏳ Carregando produto...');
+  await ctx.answerCbQuery('\u23f3 Carregando produto...');
   const productId = ctx.match[1];
   const userId = ctx.from!.id;
   const session = getSession(userId);
@@ -432,30 +488,29 @@ async function showPaymentMethodScreen(ctx: Context, product: ProductDTO, preloa
   const price = Number(product.price);
   const balanceStr = balance.toFixed(2);
 
-  // FEAT-DESC: descrição rica do produto com linha visual separadora
   const descLine = product.description
-    ? `\n📝 _${escapeMd(product.description)}_\n`
+    ? `\n\ud83d\udcdd _${escapeMd(product.description)}_\n`
     : '';
 
   const confirmMessage =
-    `📦 *${escapeMd(product.name)}*` +
+    `\ud83d\udce6 *${escapeMd(product.name)}*` +
     descLine +
-    `\n━━━━━━━━━━━━━━━━━━━━\n` +
-    `💰 *Valor:* R$ ${price.toFixed(2)}\n` +
-    `🏦 *Seu saldo:* R$ ${balanceStr}\n\n` +
+    `\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n` +
+    `\ud83d\udcb0 *Valor:* R$ ${price.toFixed(2)}\n` +
+    `\ud83c\udfe6 *Seu saldo:* R$ ${balanceStr}\n\n` +
     `*Como deseja pagar?*`;
 
   const buttons = [];
 
   if (balance >= price) {
-    buttons.push([Markup.button.callback(`💰 Só Saldo  (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]);
+    buttons.push([Markup.button.callback(`\ud83d\udcb0 Só Saldo  (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]);
   }
 
-  buttons.push([Markup.button.callback(`📱 Só PIX  (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)]);
+  buttons.push([Markup.button.callback(`\ud83d\udcf1 Só PIX  (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)]);
 
   if (balance > 0 && balance < price) {
     const pixDiff = (price - balance).toFixed(2);
-    buttons.push([Markup.button.callback(`🔀 Saldo + PIX  (saldo R$ ${balanceStr} + PIX R$ ${pixDiff})`, `pay_mixed_${product.id}`)]);
+    buttons.push([Markup.button.callback(`\ud83d\udd00 Saldo + PIX  (saldo R$ ${balanceStr} + PIX R$ ${pixDiff})`, `pay_mixed_${product.id}`)]);
   }
 
   buttons.push([Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')]);
@@ -474,7 +529,7 @@ async function executePayment(
   const session = getSession(userId);
 
   if (paymentInProgress.has(userId)) {
-    logger.warn(`[B13] Pagamento já em andamento para ${userId} (${paymentMethod}) — request duplicado ignorado`);
+    logger.warn(`[B13] Pagamento ja em andamento para ${userId}`);
     return;
   }
   paymentInProgress.add(userId);
@@ -497,13 +552,13 @@ async function executePayment(
       await editOrReply(
         ctx,
         `\u2705 *Compra realizada com saldo!*\n\n` +
-          `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
-          `💰 *Valor debitado:* R$ ${Number(payment.amount).toFixed(2)}\n\n` +
-          `Seu produto será entregue em instantes! 🚀`,
+          `\ud83d\udce6 *Produto:* ${escapeMd(payment.productName)}\n` +
+          `\ud83d\udcb0 *Valor debitado:* R$ ${Number(payment.amount).toFixed(2)}\n\n` +
+          `Seu produto será entregue em instantes! \ud83d\ude80`,
         {
           reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
-            [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+            [Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')],
+            [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
           ]).reply_markup,
         }
       );
@@ -519,17 +574,17 @@ async function executePayment(
     });
 
     const mixedLine = payment.isMixed
-      ? `\n💳 *Saldo usado:* R$ ${Number(payment.balanceUsed).toFixed(2)}\n📱 *PIX a pagar:* R$ ${Number(payment.pixAmount).toFixed(2)}`
+      ? `\n\ud83d\udcb3 *Saldo usado:* R$ ${Number(payment.balanceUsed).toFixed(2)}\n\ud83d\udcf1 *PIX a pagar:* R$ ${Number(payment.pixAmount).toFixed(2)}`
       : '';
 
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
     const caption =
-      `💳 *Pagamento PIX Gerado!*\n\n` +
-      `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
-      `💰 *Valor total:* R$ ${Number(payment.amount).toFixed(2)}${mixedLine}\n` +
+      `\ud83d\udcb3 *Pagamento PIX Gerado!*\n\n` +
+      `\ud83d\udce6 *Produto:* ${escapeMd(payment.productName)}\n` +
+      `\ud83d\udcb0 *Valor total:* R$ ${Number(payment.amount).toFixed(2)}${mixedLine}\n` +
       `\u23f0 *Válido até:* ${expiresStr}\n` +
-      `🪪 *ID:* \`${payment.paymentId}\`\n\n` +
-      `📋 *Copia e Cola:*\n\`${payment.pixQrCodeText}\``;
+      `\ud83e\udeaa *ID:* \`${payment.paymentId}\`\n\n` +
+      `\ud83d\udccb *Copia e Cola:*\n\`${payment.pixQrCodeText}\``;
 
     const chatId = ctx.chat?.id;
     if (chatId && session.mainMessageId) {
@@ -543,46 +598,29 @@ async function executePayment(
         caption,
         parse_mode: 'Markdown',
         reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
+          [Markup.button.callback('\ud83d\udd04 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
           [Markup.button.callback('\u274c Cancelar', `cancel_payment_${payment.paymentId}`)],
         ]).reply_markup,
       }
     );
 
     session.mainMessageId = qrMsg.message_id;
-    logger.info(`[${paymentMethod}] PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
+    logger.info(`[${paymentMethod}] PIX gerado para usuario ${userId} | Pagamento: ${payment.paymentId}`);
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Erro desconhecido';
     const errStatus = (error as { statusCode?: number }).statusCode ?? 0;
     logger.error(`Erro ao processar pagamento (${paymentMethod}) para ${userId}:`, error);
 
-    // FEAT-BLOCKED: usuário bloqueado — 403 retornado pela API
     if (errStatus === 403 || errMsg.toLowerCase().includes('suspensa') || errMsg.toLowerCase().includes('bloqueada') || errMsg.toLowerCase().includes('bloqueado')) {
-      await editOrReply(
-        ctx,
-        `🚫 *Conta Suspensa*\n\n` +
-          `Sua conta foi suspensa e não é possível realizar compras no momento.\n\n` +
-          `Se acredita que isso é um erro, entre em contato com o suporte.`,
-        {
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.url('📞 Falar com Suporte', `https://wa.me/${env.SUPPORT_PHONE}`)],
-            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
-          ]).reply_markup,
-        }
-      );
+      await showBlockedMessage(ctx);
       return;
     }
 
-    // FEAT-MAINT: manutenção retornada pela API (503) mesmo sem o middleware ter interceptado
     if (errStatus === 503 || errMsg.toLowerCase().includes('manutenção') || errMsg.toLowerCase().includes('manutencao')) {
       await editOrReply(
         ctx,
-        `🛠️ *Manutenção em Andamento*\n\n${escapeMd(errMsg)}\n\n_Tente novamente em alguns instantes!_ 😊`,
-        {
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
-          ]).reply_markup,
-        }
+        `\ud83d\udee0\ufe0f *Manutenção em Andamento*\n\n${escapeMd(errMsg)}\n\n_Tente novamente em alguns instantes!_ \ud83d\ude0a`,
+        { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')]]).reply_markup }
       );
       return;
     }
@@ -601,18 +639,14 @@ async function executePayment(
       return;
     }
 
-    if (
-      errMsg.toLowerCase().includes('processamento') ||
-      errMsg.toLowerCase().includes('aguarde') ||
-      errStatus === 429
-    ) {
+    if (errMsg.toLowerCase().includes('processamento') || errMsg.toLowerCase().includes('aguarde') || errStatus === 429) {
       await editOrReply(
         ctx,
-        `\u23f3 *Seu pagamento já está sendo processado!*\n\nAguarde um instante e verifique seus pedidos. 😊`,
+        `\u23f3 *Seu pagamento já está sendo processado!*\n\nAguarde um instante e verifique seus pedidos. \ud83d\ude0a`,
         {
           reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
-            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
+            [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
+            [Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')],
           ]).reply_markup,
         }
       );
@@ -623,11 +657,11 @@ async function executePayment(
     await editOrReply(
       ctx,
       isTimeout
-        ? `\u23f3 *Demorou um pouquinho mais que o esperado...*\n\nNão se preocupe! Clique em *Tentar Novamente* abaixo 😊`
+        ? `\u23f3 *Demorou um pouquinho mais que o esperado...*\n\nNão se preocupe! Clique em *Tentar Novamente* abaixo \ud83d\ude0a`
         : `\u26a0\ufe0f *Algo deu errado ao gerar o PIX*\n\nSeu dinheiro não foi cobrado.\nClique em *Tentar Novamente*.`,
       {
         reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🔄 Tentar Novamente', `select_product_${productId}`)],
+          [Markup.button.callback('\ud83d\udd04 Tentar Novamente', `select_product_${productId}`)],
           [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_products')],
         ]).reply_markup,
       }
@@ -638,22 +672,22 @@ async function executePayment(
 }
 
 bot.action(/^pay_balance_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('💰 Processando com saldo...');
+  await ctx.answerCbQuery('\ud83d\udcb0 Processando com saldo...');
   await executePayment(ctx, ctx.match[1], 'BALANCE');
 });
 
 bot.action(/^pay_pix_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('⏳ Gerando PIX...');
+  await ctx.answerCbQuery('\u23f3 Gerando PIX...');
   await executePayment(ctx, ctx.match[1], 'PIX');
 });
 
 bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('🔀 Aplicando saldo + PIX...');
+  await ctx.answerCbQuery('\ud83d\udd00 Aplicando saldo + PIX...');
   await executePayment(ctx, ctx.match[1], 'MIXED');
 });
 
 bot.action(/^check_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('🔍 Verificando pagamento...');
+  await ctx.answerCbQuery('\ud83d\udd0d Verificando pagamento...');
   const paymentId = ctx.match[1];
 
   try {
@@ -673,14 +707,14 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
       status === 'PENDING'
         ? {
             reply_markup: Markup.inlineKeyboard([
-              [Markup.button.callback('🔄 Verificar Novamente', `check_payment_${paymentId}`)],
+              [Markup.button.callback('\ud83d\udd04 Verificar Novamente', `check_payment_${paymentId}`)],
               [Markup.button.callback('\u274c Cancelar', `cancel_payment_${paymentId}`)],
             ]).reply_markup,
           }
         : {
             reply_markup: Markup.inlineKeyboard([
-              [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
-              [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+              [Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')],
+              [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
             ]).reply_markup,
           }
     );
@@ -690,20 +724,22 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('❌ Cancelando...');
+  await ctx.answerCbQuery('\u274c Cancelando...');
   const paymentId = ctx.match[1];
   const userId = ctx.from!.id;
 
   try {
     await apiClient.cancelPayment(paymentId);
-    logger.info(`Pagamento ${paymentId} cancelado pelo usuário ${userId}`);
+    logger.info(`Pagamento ${paymentId} cancelado pelo usuario ${userId}`);
   } catch (error) {
-    logger.warn(`Não foi possível cancelar pagamento ${paymentId}: ${error instanceof Error ? error.message : error}`);
+    logger.warn(`Nao foi possivel cancelar pagamento ${paymentId}: ${error instanceof Error ? error.message : error}`);
   }
 
+  const session = getSession(userId);
+  session.depositPaymentId = undefined; // limpa deposito ativo tambem
   sessions.set(userId, { step: 'idle', lastActivityAt: Date.now() });
   await editOrReply(ctx, '\u274c *Pagamento cancelado.*\n\nVolte quando quiser!', {
-    reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
+    reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')]]).reply_markup,
   });
 });
 
@@ -728,6 +764,9 @@ bot.on(message('text'), async (ctx) => {
     try {
       const deposit = await apiClient.createDeposit(String(userId), valor, ctx.from?.first_name, ctx.from?.username);
 
+      // FEAT-CANCEL-DEPOSIT: salva o paymentId do deposito na sessao
+      session.depositPaymentId = deposit.paymentId;
+
       await ctx.deleteMessage(processingMsg.message_id).catch(() => {});
 
       const expiresAt = new Date(deposit.expiresAt);
@@ -738,31 +777,44 @@ bot.on(message('text'), async (ctx) => {
       });
 
       const qrBuffer = Buffer.from(deposit.pixQrCode, 'base64');
-      await ctx.replyWithPhoto(
+      const depositMsg = await ctx.replyWithPhoto(
         { source: qrBuffer },
         {
           caption:
-            `💳 *Depósito de Saldo*\n` +
+            `\ud83d\udcb3 *Depósito de Saldo*\n` +
             `Valor: *R$ ${valor.toFixed(2)}*\n` +
             `Válido até: ${expiresStr}\n` +
-            `🪪 ID: \`${deposit.paymentId}\`\n\n` +
-            `📋 *Copia e Cola:*\n\`${deposit.pixQrCodeText}\`\n\n` +
+            `\ud83e\udeaa ID: \`${deposit.paymentId}\`\n\n` +
+            `\ud83d\udccb *Copia e Cola:*\n\`${deposit.pixQrCodeText}\`\n\n` +
             `Após o pagamento, o saldo será creditado automaticamente! \u2705`,
           parse_mode: 'Markdown',
+          // FEAT-CANCEL-DEPOSIT: botao de cancelar deposito
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('\ud83d\udd04 Verificar Pagamento', `check_payment_${deposit.paymentId}`)],
+            [Markup.button.callback('\u274c Cancelar Depósito', `cancel_payment_${deposit.paymentId}`)],
+          ]).reply_markup,
         }
       );
 
-      logger.info(`[Deposit] PIX de depósito gerado para ${userId} | valor: ${valor}`);
+      // Atualiza mainMessageId para o QR de deposito
+      session.mainMessageId = depositMsg.message_id;
+
+      logger.info(`[Deposit] PIX de deposito gerado para ${userId} | valor: ${valor} | id: ${deposit.paymentId}`);
     } catch (err) {
       await ctx.deleteMessage(processingMsg.message_id).catch(() => {});
-      logger.error(`Erro ao gerar depósito para ${userId}:`, err);
+      logger.error(`Erro ao gerar deposito para ${userId}:`, err);
 
-      // FEAT-MAINT: bloqueia depósito também durante manutenção
       const depositErrMsg = err instanceof Error ? err.message : '';
       const depositErrStatus = (err as { statusCode?: number }).statusCode ?? 0;
+
+      if (depositErrStatus === 403 || depositErrMsg.toLowerCase().includes('suspensa')) {
+        await showBlockedMessage(ctx);
+        return;
+      }
+
       if (depositErrStatus === 503 || depositErrMsg.toLowerCase().includes('manutenção')) {
         await ctx.replyWithMarkdown(
-          `🛠️ *Manutenção em Andamento*\n\n${escapeMd(depositErrMsg)}\n\n_Tente novamente em alguns instantes!_ 😊`
+          `\ud83d\udee0\ufe0f *Manutenção em Andamento*\n\n${escapeMd(depositErrMsg)}\n\n_Tente novamente em alguns instantes!_ \ud83d\ude0a`
         );
         return;
       }
@@ -778,9 +830,9 @@ bot.on(message('text'), async (ctx) => {
   await ctx.replyWithMarkdown(
     `Não entendi sua mensagem. Use os botões abaixo para navegar:`,
     Markup.inlineKeyboard([
-      [Markup.button.callback('🛍️ Ver Produtos', 'show_products')],
-      [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
-      [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+      [Markup.button.callback('\ud83d\udecd\ufe0f Ver Produtos', 'show_products')],
+      [Markup.button.callback('\ud83d\udcb0 Meu Saldo', 'show_balance')],
+      [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
       [Markup.button.callback('\u2753 Ajuda', 'show_help')],
     ])
   );
@@ -796,7 +848,7 @@ async function showProducts(ctx: Context): Promise<void> {
     session.products = products;
 
     if (products.length === 0) {
-      await editOrReply(ctx, '😔 Nenhum produto disponível no momento. Volte em breve!', {
+      await editOrReply(ctx, '\ud83d\ude14 Nenhum produto disponível no momento. Volte em breve!', {
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
       });
       return;
@@ -810,14 +862,14 @@ async function showProducts(ctx: Context): Promise<void> {
 
     buttons.push([Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]);
 
-    await editOrReply(ctx, `🛍️ *Nossos Produtos*\n\nEscolha um produto abaixo:`, {
+    await editOrReply(ctx, `\ud83d\udecd\ufe0f *Nossos Produtos*\n\nEscolha um produto abaixo:`, {
       reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
     });
   } catch (error) {
     logger.error('Erro ao buscar produtos:', error);
     await editOrReply(ctx, '\u274c Erro ao buscar produtos. Tente novamente em instantes.', {
       reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('🔄 Tentar Novamente', 'show_products')],
+        [Markup.button.callback('\ud83d\udd04 Tentar Novamente', 'show_products')],
         [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
       ]).reply_markup,
     });
@@ -832,10 +884,10 @@ async function showOrders(ctx: Context): Promise<void> {
     if (!orders || orders.length === 0) {
       await editOrReply(
         ctx,
-        `📦 *Meus Pedidos*\n\n_Você ainda não fez nenhum pedido._\n\nCompre um produto e ele aparecerá aqui!`,
+        `\ud83d\udce6 *Meus Pedidos*\n\n_Você ainda não fez nenhum pedido._\n\nCompre um produto e ele aparecerá aqui!`,
         {
           reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🛍️ Ver Produtos', 'show_products')],
+            [Markup.button.callback('\ud83d\udecd\ufe0f Ver Produtos', 'show_products')],
             [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
           ]).reply_markup,
         }
@@ -844,14 +896,14 @@ async function showOrders(ctx: Context): Promise<void> {
     }
 
     const statusEmoji: Record<string, string> = {
-      DELIVERED: '✅',
-      PENDING: '⏳',
-      FAILED: '❌',
-      PROCESSING: '🔄',
+      DELIVERED: '\u2705',
+      PENDING: '\u23f3',
+      FAILED: '\u274c',
+      PROCESSING: '\ud83d\udd04',
     };
 
     const lines = orders.slice(0, 10).map((o: OrderSummary) => {
-      const emoji = statusEmoji[o.status] ?? '📦';
+      const emoji = statusEmoji[o.status] ?? '\ud83d\udce6';
       const date = new Date(o.createdAt).toLocaleDateString('pt-BR', {
         day: '2-digit',
         month: '2-digit',
@@ -861,11 +913,11 @@ async function showOrders(ctx: Context): Promise<void> {
       const valor = o.amount !== null ? ` · R$ ${Number(o.amount).toFixed(2)}` : '';
       const metodo =
         o.paymentMethod === 'BALANCE'
-          ? ' · 💰Saldo'
+          ? ' · \ud83d\udcb0Saldo'
           : o.paymentMethod === 'MIXED'
-            ? ' · 🔀Misto'
+            ? ' · \ud83d\udd00Misto'
             : o.paymentMethod === 'PIX'
-              ? ' · 📱PIX'
+              ? ' · \ud83d\udcf1PIX'
               : '';
       return `${emoji} *${escapeMd(o.productName)}* — ${date}${valor}${metodo}`;
     });
@@ -875,7 +927,7 @@ async function showOrders(ctx: Context): Promise<void> {
 
     await editOrReply(
       ctx,
-      `📦 *Meus Pedidos* (${total} no total)\n\n${lines.join('\n')}${hasMore ? `\n\n_...e mais ${total - 10} pedidos anteriores._` : ''}\n\n` +
+      `\ud83d\udce6 *Meus Pedidos* (${total} no total)\n\n${lines.join('\n')}${hasMore ? `\n\n_...e mais ${total - 10} pedidos anteriores._` : ''}\n\n` +
         `_Para suporte sobre um pedido específico, entre em contato informando o nome do produto e a data._`,
       {
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
@@ -885,7 +937,7 @@ async function showOrders(ctx: Context): Promise<void> {
     logger.error(`Erro ao buscar pedidos para ${userId}:`, err);
     await editOrReply(ctx, '\u274c Erro ao buscar seus pedidos. Tente novamente.', {
       reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('🔄 Tentar Novamente', 'show_orders')],
+        [Markup.button.callback('\ud83d\udd04 Tentar Novamente', 'show_orders')],
         [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
       ]).reply_markup,
     });
@@ -897,7 +949,7 @@ async function showHelp(ctx: Context): Promise<void> {
 
   await editOrReplyHtml(
     ctx,
-    `❓ <b>Central de Ajuda</b>\n\n` +
+    `\u2753 <b>Central de Ajuda</b>\n\n` +
       `<b>Comandos disponíveis:</b>\n` +
       `/start — Tela inicial\n` +
       `/produtos — Ver produtos\n` +
@@ -907,7 +959,7 @@ async function showHelp(ctx: Context): Promise<void> {
       `<b>Como funciona?</b>\n` +
       `1. Escolha um produto\n` +
       `2. Escolha como pagar: saldo, PIX ou os dois\n` +
-      `3. Receba seu acesso automaticamente ✅\n\n` +
+      `3. Receba seu acesso automaticamente \u2705\n\n` +
       `<b>Saldo pré-pago:</b>\n` +
       `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
       `<b>Modo Saldo + PIX:</b>\n` +
@@ -916,7 +968,7 @@ async function showHelp(ctx: Context): Promise<void> {
       `Entre em contato informando o ID do pagamento.`,
     {
       reply_markup: Markup.inlineKeyboard([
-        [Markup.button.url('📞 Contatar Suporte', supportUrl)],
+        [Markup.button.url('\ud83d\udcde Contatar Suporte', supportUrl)],
         [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
       ]).reply_markup,
     }
@@ -936,10 +988,10 @@ async function startBot(): Promise<void> {
     await bot.telegram.setWebhook(webhookUrl, {
       secret_token: env.TELEGRAM_BOT_SECRET,
     });
-    logger.info(`🤖 Webhook registrado no Telegram: ${webhookUrl}`);
+    logger.info(`\ud83e\udd16 Webhook registrado no Telegram: ${webhookUrl}`);
 
     const me = await bot.telegram.getMe();
-    logger.info(`📌 Bot username: @${me.username}`);
+    logger.info(`\ud83d\udccc Bot username: @${me.username}`);
 
     await registerCommands();
 
@@ -978,20 +1030,18 @@ async function startBot(): Promise<void> {
         return;
       }
       invalidateProductCache();
-      // Invalida também o config cache para que a mudança de manutenção
-      // seja refletida imediatamente sem esperar o TTL de 10s
       invalidateBotConfigCache();
       logger.info('[cache] Cache de produtos + bot-config invalidado via API admin');
       res.json({ ok: true });
     });
 
     app.listen(PORT, () => {
-      logger.info(`🚀 Servidor webhook do bot escutando na porta ${PORT}`);
+      logger.info(`\ud83d\ude80 Servidor webhook do bot escutando na porta ${PORT}`);
     });
   } else {
     await bot.launch();
-    logger.info(`📌 Bot username: @${bot.botInfo?.username}`);
-    logger.info('🤖 Bot iniciado em modo POLLING (desenvolvimento)');
+    logger.info(`\ud83d\udccc Bot username: @${bot.botInfo?.username}`);
+    logger.info('\ud83e\udd16 Bot iniciado em modo POLLING (desenvolvimento)');
 
     await registerCommands();
   }

@@ -1,14 +1,16 @@
 // Rotas de pagamento (usadas pelo bot)
 // FIX BUG8: GET /products movido para ANTES de GET /:id/status
-// FIX BUG1: adiciona POST /:id/cancel
+// FIX BUG1: POST /:id/cancel
 // FIX STOCK-DISPLAY: /products retorna availableStock calculado corretamente
 // WALLET: POST /deposit e GET /balance
 // SORT: /products ordena por sortOrder, depois createdAt
-// OPT #5 v2: /products usa 1 groupBy para todos os COUNTs
+// OPT #5 v2: 1 groupBy para todos os COUNTs
 // OPT #11: /balance resolve com include em 1 query
 // FEATURE: GET /orders?telegramId=xxx
-// FEAT-MAINT: GET /bot-config expe maintenance_mode + maintenance_message para o bot
+// FEAT-MAINT: GET /bot-config expe maintenance_mode + maintenance_message + isBlocked
 //   POST /create e POST /deposit retornam 503 quando maintenance_mode=true
+//   POST /create e POST /deposit retornam 403 quando usuario esta bloqueado
+// FEAT-BLOCKED: /bot-config inclui isBlocked do usuario (por telegramId query param)
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -36,7 +38,7 @@ const createDepositSchema = z.object({
   username: z.string().optional(),
 });
 
-// ─── Helper: verifica modo manutenção ────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────
 async function isMaintenanceActive(): Promise<{ active: boolean; message: string }> {
   const [mode, msg] = await Promise.all([
     getSetting('maintenance_mode'),
@@ -45,25 +47,42 @@ async function isMaintenanceActive(): Promise<{ active: boolean; message: string
   return { active: mode === 'true', message: msg };
 }
 
+async function isUserBlocked(telegramId: string): Promise<boolean> {
+  const user = await prisma.telegramUser.findUnique({
+    where: { telegramId },
+    select: { isBlocked: true },
+  });
+  return user?.isBlocked ?? false;
+}
+
 // ─── Rotas estáticas PRIMEIRO ─────────────────────────────────────────────────
 
-// GET /api/payments/bot-config — consumido pelo bot para checar manutenção
+// GET /api/payments/bot-config?telegramId=xxx
+// Retorna maintenance_mode, maintenance_message e isBlocked do usuario
 paymentsRouter.get(
   '/bot-config',
   requireBotSecret,
-  async (_req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
-      const [maintenanceMode, maintenanceMessage] = await Promise.all([
+      const telegramId = req.query.telegramId as string | undefined;
+
+      const [maintenanceMode, maintenanceMessage, blocked] = await Promise.all([
         getSetting('maintenance_mode'),
         getSetting('maintenance_message'),
+        telegramId ? isUserBlocked(telegramId) : Promise.resolve(false),
       ]);
+
       res.json({
         success: true,
-        data: { maintenanceMode: maintenanceMode === 'true', maintenanceMessage },
+        data: {
+          maintenanceMode: maintenanceMode === 'true',
+          maintenanceMessage,
+          isBlocked: blocked,
+        },
       });
     } catch (err) {
       logger.error('[bot-config] Erro:', err);
-      res.json({ success: true, data: { maintenanceMode: false, maintenanceMessage: '' } });
+      res.json({ success: true, data: { maintenanceMode: false, maintenanceMessage: '', isBlocked: false } });
     }
   }
 );
@@ -79,7 +98,13 @@ paymentsRouter.post(
       res.status(503).json({ success: false, error: message || 'Estamos em manutenção. Voltamos em breve!' });
       return;
     }
+    // Verifica bloqueio antes de criar pagamento
     const data = createPaymentSchema.parse(req.body);
+    const blocked = await isUserBlocked(data.telegramId);
+    if (blocked) {
+      res.status(403).json({ success: false, error: 'Sua conta está suspensa. Entre em contato com o suporte.' });
+      return;
+    }
     const result = await paymentService.createPayment(data as Parameters<typeof paymentService.createPayment>[0]);
     logger.info(`Pagamento criado via API: ${result.paymentId}`);
     res.status(201).json({ success: true, data: result });
@@ -98,6 +123,11 @@ paymentsRouter.post(
       return;
     }
     const data = createDepositSchema.parse(req.body);
+    const blocked = await isUserBlocked(data.telegramId);
+    if (blocked) {
+      res.status(403).json({ success: false, error: 'Sua conta está suspensa. Entre em contato com o suporte.' });
+      return;
+    }
     const result = await paymentService.createDepositPayment(data);
     logger.info(`[Deposit] PIX de depósito criado via API: ${result.paymentId}`);
     res.status(201).json({ success: true, data: result });
