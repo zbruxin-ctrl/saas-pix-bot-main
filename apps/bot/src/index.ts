@@ -5,6 +5,7 @@
 //   Acoes permitidas: /start (mostra msg), /ajuda, /meus_pedidos, ver saldo
 // FEAT-DESC: descricao rica dos produtos
 // FEAT-CANCEL-DEPOSIT: botao cancelar PIX de deposito
+// FIX-CANCEL: editMessageCaption para foto + lock anti-duplo-clique
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
@@ -40,7 +41,8 @@ interface UserSession {
   step: 'idle' | 'selecting_product' | 'awaiting_payment' | 'awaiting_deposit_amount';
   selectedProductId?: string;
   paymentId?: string;
-  depositPaymentId?: string; // FEAT-CANCEL-DEPOSIT: ID do PIX de deposito ativo
+  depositPaymentId?: string;
+  depositMessageId?: number; // ID da mensagem com foto do QR de deposito
   products?: ProductDTO[];
   mainMessageId?: number;
   firstName?: string;
@@ -79,14 +81,17 @@ setInterval(() => { processedUpdateIds.clear(); }, 5 * 60_000);
 
 const paymentInProgress = new Set<number>();
 
+// FIX-CANCEL: lock para evitar duplo clique em cancelamentos
+const cancelInProgress = new Set<string>(); // chave: paymentId
+
 const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
 async function registerCommands(): Promise<void> {
   await bot.telegram.setMyCommands([
     { command: 'start', description: '\ud83c\udfe0 Menu inicial' },
-    { command: 'produtos', description: '\ud83d\udecd\ufe0f Ver produtos disponíveis' },
+    { command: 'produtos', description: '\ud83d\udecd\ufe0f Ver produtos dispon\u00edveis' },
     { command: 'saldo', description: '\ud83d\udcb0 Ver meu saldo e adicionar' },
-    { command: 'meus_pedidos', description: '\ud83d\udce6 Histórico de pedidos' },
+    { command: 'meus_pedidos', description: '\ud83d\udce6 Hist\u00f3rico de pedidos' },
     { command: 'ajuda', description: '\u2753 Central de ajuda e suporte' },
   ]);
   logger.info('\u2705 Menu de comandos registrado no Telegram');
@@ -158,8 +163,57 @@ async function editOrReplyHtml(
   session.mainMessageId = sent.message_id;
 }
 
+// ─── Cancela e substitui mensagem do QR (funciona tanto para foto quanto para texto) ───
+// Para fotos: edita a caption e remove os botões
+// Para texto: usa editOrReply normalmente
+async function replaceCancelledMessage(
+  ctx: Context,
+  session: UserSession,
+  text: string,
+  extra?: ExtraEditMessageText
+): Promise<void> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    await editOrReply(ctx, text, extra);
+    return;
+  }
+
+  // Se era uma mensagem de foto (depositMessageId), edita a caption
+  const photoMsgId = session.depositMessageId ?? session.mainMessageId;
+  if (photoMsgId) {
+    try {
+      await ctx.telegram.editMessageCaption(chatId, photoMsgId, undefined, text, {
+        parse_mode: 'Markdown',
+        reply_markup: extra?.reply_markup as ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] | undefined,
+      });
+      session.mainMessageId = photoMsgId;
+      session.depositMessageId = undefined;
+      return;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '';
+      // Se falhou por nao ser foto, tenta editMessageText
+      if (!msg.includes('message is not modified')) {
+        try {
+          await ctx.telegram.editMessageText(chatId, photoMsgId, undefined, text, {
+            parse_mode: 'Markdown',
+            ...extra,
+          });
+          session.mainMessageId = photoMsgId;
+          session.depositMessageId = undefined;
+          return;
+        } catch {
+          // ignora e manda nova mensagem
+        }
+      }
+    }
+  }
+
+  const sent = await ctx.replyWithMarkdown(text, extra as object);
+  session.mainMessageId = sent.message_id;
+  session.depositMessageId = undefined;
+}
+
 // ─── Mensagem de conta suspensa ──────────────────────────────────────────
-// Exibe a mensagem de conta suspensa e para a execucao
 async function showBlockedMessage(ctx: Context): Promise<void> {
   const supportUrl = `https://wa.me/${escapeHtml(env.SUPPORT_PHONE)}`;
   await editOrReply(
@@ -183,13 +237,6 @@ async function showBlockedMessage(ctx: Context): Promise<void> {
 }
 
 // ─── Middleware global (manutencao + bloqueio) ──────────────────────────────
-// Ordem de prioridade:
-// 1. Manutencao ativa -> bloqueia TUDO sem excecao
-// 2. Usuario bloqueado -> bloqueia apenas acoes restritas
-//    Permitido: /start (mostra msg suspensa), /ajuda, /meus_pedidos,
-//               show_balance, show_orders, show_help, show_home
-//    Bloqueado: /produtos, show_products, select_product_*, pay_*, deposit_balance,
-//               awaiting_deposit_amount (texto livre)
 const BLOCKED_ALLOWED_ACTIONS = new Set([
   'show_balance',
   'show_orders',
@@ -214,11 +261,10 @@ bot.use(async (ctx, next) => {
     return next();
   }
 
-  // 1. Manutencao bloqueia tudo
   if (config.maintenanceMode) {
     const session = getSession(userId);
     const firstName = escapeMd(session.firstName || ctx.from?.first_name || 'visitante');
-    const maintMsg = config.maintenanceMessage || 'Estamos em manutenção. Voltamos em breve!';
+    const maintMsg = config.maintenanceMessage || 'Estamos em manuten\u00e7\u00e3o. Voltamos em breve!';
     const text =
       `\ud83d\udee0\ufe0f *Manuten\u00e7\u00e3o em Andamento*\n\n` +
       `Ol\u00e1, *${firstName}*!\n\n` +
@@ -226,7 +272,7 @@ bot.use(async (ctx, next) => {
       `_Pedimos desculpas pelo inconveniente. Em breve estaremos de volta!_ \ud83d\ude0a`;
 
     if ('callbackQuery' in ctx && ctx.callbackQuery) {
-      await ctx.answerCbQuery('\ud83d\udee0\ufe0f Bot em manutenção', { show_alert: true }).catch(() => {});
+      await ctx.answerCbQuery('\ud83d\udee0\ufe0f Bot em manuten\u00e7\u00e3o', { show_alert: true }).catch(() => {});
     }
 
     if (session.mainMessageId && ctx.chat?.id) {
@@ -240,17 +286,14 @@ bot.use(async (ctx, next) => {
       const sent = await ctx.replyWithMarkdown(text).catch(() => null);
       if (sent) getSession(userId).mainMessageId = sent.message_id;
     }
-    return; // nao chama next()
+    return;
   }
 
-  // 2. Usuario bloqueado: verifica o tipo de acao
   if (config.isBlocked) {
-    // Detecta o tipo de interacao
     const isStartCommand = 'message' in ctx && (ctx.message as { text?: string })?.text === '/start';
     const isCallbackQuery = 'callbackQuery' in ctx && ctx.callbackQuery;
     const callbackData = isCallbackQuery ? ('data' in ctx.callbackQuery! ? ctx.callbackQuery!.data : '') : '';
 
-    // /start -> exibe mensagem de suspensao direto (sem navegar ao menu normal)
     if (isStartCommand) {
       const session = getSession(userId);
       session.firstName = ctx.from?.first_name;
@@ -262,7 +305,6 @@ bot.use(async (ctx, next) => {
       return;
     }
 
-    // Comandos permitidos explicitamente
     const isAllowedCommand =
       'message' in ctx &&
       ['/ajuda', '/meus_pedidos', '/saldo'].some(
@@ -270,22 +312,18 @@ bot.use(async (ctx, next) => {
       );
     if (isAllowedCommand) return next();
 
-    // Callbacks permitidos
     if (isCallbackQuery) {
       if (isBlockedAllowedAction(callbackData)) return next();
-      // Bloqueia qualquer outro callback
-      await ctx.answerCbQuery('\ud83d\udea8 Conta suspensa — acao nao permitida', { show_alert: true }).catch(() => {});
+      await ctx.answerCbQuery('\ud83d\udea8 Conta suspensa \u2014 a\u00e7\u00e3o n\u00e3o permitida', { show_alert: true }).catch(() => {});
       await showBlockedMessage(ctx);
       return;
     }
 
-    // Mensagens de texto (ex: digitando valor de deposito) -> bloqueia
     if ('message' in ctx && (ctx.message as { text?: string })?.text) {
       await showBlockedMessage(ctx);
       return;
     }
 
-    // Qualquer outra coisa nao identificada -> deixa passar por seguranca
     return next();
   }
 
@@ -381,11 +419,10 @@ async function showBalance(ctx: Context): Promise<void> {
 
     const texto =
       `\ud83d\udcb0 *Seu Saldo*\n\n` +
-      `Disponível: *R$ ${Number(balance).toFixed(2)}*\n\n` +
-      (txLines ? `*Últimas transações:*\n${txLines}\n\n` : '_Nenhuma transação ainda._\n\n') +
+      `Dispon\u00edvel: *R$ ${Number(balance).toFixed(2)}*\n\n` +
+      (txLines ? `*\u00daltimas transa\u00e7\u00f5es:*\n${txLines}\n\n` : '_Nenhuma transa\u00e7\u00e3o ainda._\n\n') +
       `Use seu saldo para comprar sem precisar fazer PIX toda hora!`;
 
-    // FEAT-BLOCKED: se usuario esta bloqueado, nao mostra botao de adicionar saldo
     const config = await apiClient.getBotConfig(String(userId)).catch(() => ({ isBlocked: false }));
     const buttons = config.isBlocked
       ? [
@@ -420,7 +457,7 @@ bot.action('deposit_balance', async (ctx) => {
   await ctx.replyWithMarkdown(
     `\ud83d\udcb3 *Adicionar Saldo*\n\n` +
       `Digite o valor em reais que deseja depositar:\n` +
-      `_(mínimo R$ 1,00 | máximo R$ 10.000,00)_\n\n` +
+      `_(m\u00ednimo R$ 1,00 | m\u00e1ximo R$ 10.000,00)_\n\n` +
       `Exemplo: \`25\` ou \`50.00\``
   );
 });
@@ -457,12 +494,12 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   }
 
   if (!product) {
-    await editOrReply(ctx, '\u274c Produto não encontrado.');
+    await editOrReply(ctx, '\u274c Produto n\u00e3o encontrado.');
     return;
   }
 
   if (product.stock !== null && product.stock !== undefined && product.stock <= 0) {
-    await editOrReply(ctx, '\u26a0\ufe0f Este produto está esgotado no momento.');
+    await editOrReply(ctx, '\u26a0\ufe0f Este produto est\u00e1 esgotado no momento.');
     return;
   }
 
@@ -503,10 +540,10 @@ async function showPaymentMethodScreen(ctx: Context, product: ProductDTO, preloa
   const buttons = [];
 
   if (balance >= price) {
-    buttons.push([Markup.button.callback(`\ud83d\udcb0 Só Saldo  (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]);
+    buttons.push([Markup.button.callback(`\ud83d\udcb0 S\u00f3 Saldo  (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]);
   }
 
-  buttons.push([Markup.button.callback(`\ud83d\udcf1 Só PIX  (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)]);
+  buttons.push([Markup.button.callback(`\ud83d\udcf1 S\u00f3 PIX  (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)]);
 
   if (balance > 0 && balance < price) {
     const pixDiff = (price - balance).toFixed(2);
@@ -554,7 +591,7 @@ async function executePayment(
         `\u2705 *Compra realizada com saldo!*\n\n` +
           `\ud83d\udce6 *Produto:* ${escapeMd(payment.productName)}\n` +
           `\ud83d\udcb0 *Valor debitado:* R$ ${Number(payment.amount).toFixed(2)}\n\n` +
-          `Seu produto será entregue em instantes! \ud83d\ude80`,
+          `Seu produto ser\u00e1 entregue em instantes! \ud83d\ude80`,
         {
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')],
@@ -582,7 +619,7 @@ async function executePayment(
       `\ud83d\udcb3 *Pagamento PIX Gerado!*\n\n` +
       `\ud83d\udce6 *Produto:* ${escapeMd(payment.productName)}\n` +
       `\ud83d\udcb0 *Valor total:* R$ ${Number(payment.amount).toFixed(2)}${mixedLine}\n` +
-      `\u23f0 *Válido até:* ${expiresStr}\n` +
+      `\u23f0 *V\u00e1lido at\u00e9:* ${expiresStr}\n` +
       `\ud83e\udeaa *ID:* \`${payment.paymentId}\`\n\n` +
       `\ud83d\udccb *Copia e Cola:*\n\`${payment.pixQrCodeText}\``;
 
@@ -616,10 +653,10 @@ async function executePayment(
       return;
     }
 
-    if (errStatus === 503 || errMsg.toLowerCase().includes('manutenção') || errMsg.toLowerCase().includes('manutencao')) {
+    if (errStatus === 503 || errMsg.toLowerCase().includes('manuten\u00e7\u00e3o') || errMsg.toLowerCase().includes('manutencao')) {
       await editOrReply(
         ctx,
-        `\ud83d\udee0\ufe0f *Manutenção em Andamento*\n\n${escapeMd(errMsg)}\n\n_Tente novamente em alguns instantes!_ \ud83d\ude0a`,
+        `\ud83d\udee0\ufe0f *Manuten\u00e7\u00e3o em Andamento*\n\n${escapeMd(errMsg)}\n\n_Tente novamente em alguns instantes!_ \ud83d\ude0a`,
         { reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')]]).reply_markup }
       );
       return;
@@ -642,7 +679,7 @@ async function executePayment(
     if (errMsg.toLowerCase().includes('processamento') || errMsg.toLowerCase().includes('aguarde') || errStatus === 429) {
       await editOrReply(
         ctx,
-        `\u23f3 *Seu pagamento já está sendo processado!*\n\nAguarde um instante e verifique seus pedidos. \ud83d\ude0a`,
+        `\u23f3 *Seu pagamento j\u00e1 est\u00e1 sendo processado!*\n\nAguarde um instante e verifique seus pedidos. \ud83d\ude0a`,
         {
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('\ud83d\udce6 Meus Pedidos', 'show_orders')],
@@ -657,8 +694,8 @@ async function executePayment(
     await editOrReply(
       ctx,
       isTimeout
-        ? `\u23f3 *Demorou um pouquinho mais que o esperado...*\n\nNão se preocupe! Clique em *Tentar Novamente* abaixo \ud83d\ude0a`
-        : `\u26a0\ufe0f *Algo deu errado ao gerar o PIX*\n\nSeu dinheiro não foi cobrado.\nClique em *Tentar Novamente*.`,
+        ? `\u23f3 *Demorou um pouquinho mais que o esperado...*\n\nN\u00e3o se preocupe! Clique em *Tentar Novamente* abaixo \ud83d\ude0a`
+        : `\u26a0\ufe0f *Algo deu errado ao gerar o PIX*\n\nSeu dinheiro n\u00e3o foi cobrado.\nClique em *Tentar Novamente*.`,
       {
         reply_markup: Markup.inlineKeyboard([
           [Markup.button.callback('\ud83d\udd04 Tentar Novamente', `select_product_${productId}`)],
@@ -693,11 +730,11 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
   try {
     const { status } = await apiClient.getPaymentStatus(paymentId);
     const statusMessages: Record<string, string> = {
-      PENDING: '\u23f3 *Pagamento pendente*\n\nAinda não identificamos seu pagamento. Se já pagou, aguarde alguns segundos e verifique novamente.',
-      APPROVED: '\u2705 *Pagamento aprovado!*\n\nSeu acesso está sendo liberado. Você receberá uma mensagem em instantes.',
+      PENDING: '\u23f3 *Pagamento pendente*\n\nAinda n\u00e3o identificamos seu pagamento. Se j\u00e1 pagou, aguarde alguns segundos e verifique novamente.',
+      APPROVED: '\u2705 *Pagamento aprovado!*\n\nSeu acesso est\u00e1 sendo liberado. Voc\u00ea receber\u00e1 uma mensagem em instantes.',
       REJECTED: '\u274c *Pagamento rejeitado*\n\nHouve um problema com seu pagamento. Por favor, tente novamente.',
       CANCELLED: '\u274c *Pagamento cancelado*\n\nEste pagamento foi cancelado.',
-      EXPIRED: '\u231b *Pagamento expirado*\n\nO código PIX expirou. Gere um novo pagamento.',
+      EXPIRED: '\u231b *Pagamento expirado*\n\nO c\u00f3digo PIX expirou. Gere um novo pagamento.',
     };
 
     const msg = statusMessages[status] || '\u2753 Status desconhecido';
@@ -724,9 +761,17 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
 });
 
 bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('\u274c Cancelando...');
   const paymentId = ctx.match[1];
   const userId = ctx.from!.id;
+
+  // FIX-CANCEL: lock anti-duplo-clique por paymentId
+  if (cancelInProgress.has(paymentId)) {
+    await ctx.answerCbQuery('\u23f3 Cancelamento j\u00e1 em andamento...', { show_alert: false }).catch(() => {});
+    return;
+  }
+  cancelInProgress.add(paymentId);
+
+  await ctx.answerCbQuery('\u274c Cancelando...').catch(() => {});
 
   try {
     await apiClient.cancelPayment(paymentId);
@@ -736,11 +781,25 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   }
 
   const session = getSession(userId);
-  session.depositPaymentId = undefined; // limpa deposito ativo tambem
-  sessions.set(userId, { step: 'idle', lastActivityAt: Date.now() });
-  await editOrReply(ctx, '\u274c *Pagamento cancelado.*\n\nVolte quando quiser!', {
-    reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')]]).reply_markup,
-  });
+
+  // FIX-CANCEL: substitui a mensagem (foto ou texto) com a msg de cancelamento
+  // Usa replaceCancelledMessage que sabe editar caption de foto
+  await replaceCancelledMessage(
+    ctx,
+    session,
+    '\u274c *Pagamento cancelado.*\n\nVolte quando quiser!',
+    {
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('\ud83c\udfe0 Menu Inicial', 'show_home')],
+      ]).reply_markup,
+    }
+  );
+
+  // Reseta a sessao
+  const firstName = session.firstName;
+  sessions.set(userId, { step: 'idle', firstName, lastActivityAt: Date.now() });
+
+  cancelInProgress.delete(paymentId);
 });
 
 bot.on(message('text'), async (ctx) => {
@@ -754,17 +813,16 @@ bot.on(message('text'), async (ctx) => {
     const valor = parseFloat(text.replace(',', '.'));
 
     if (isNaN(valor) || valor < 1 || valor > 10000) {
-      await ctx.reply('\u274c Valor inválido. Digite um valor entre R$ 1,00 e R$ 10.000,00.\n\nExemplo: `25` ou `50.00`');
+      await ctx.reply('\u274c Valor inv\u00e1lido. Digite um valor entre R$ 1,00 e R$ 10.000,00.\n\nExemplo: `25` ou `50.00`');
       return;
     }
 
     session.step = 'idle';
-    const processingMsg = await ctx.replyWithMarkdown('\u23f3 Gerando PIX de depósito, aguarde...');
+    const processingMsg = await ctx.replyWithMarkdown('\u23f3 Gerando PIX de dep\u00f3sito, aguarde...');
 
     try {
       const deposit = await apiClient.createDeposit(String(userId), valor, ctx.from?.first_name, ctx.from?.username);
 
-      // FEAT-CANCEL-DEPOSIT: salva o paymentId do deposito na sessao
       session.depositPaymentId = deposit.paymentId;
 
       await ctx.deleteMessage(processingMsg.message_id).catch(() => {});
@@ -781,22 +839,22 @@ bot.on(message('text'), async (ctx) => {
         { source: qrBuffer },
         {
           caption:
-            `\ud83d\udcb3 *Depósito de Saldo*\n` +
+            `\ud83d\udcb3 *Dep\u00f3sito de Saldo*\n` +
             `Valor: *R$ ${valor.toFixed(2)}*\n` +
-            `Válido até: ${expiresStr}\n` +
+            `V\u00e1lido at\u00e9: ${expiresStr}\n` +
             `\ud83e\udeaa ID: \`${deposit.paymentId}\`\n\n` +
             `\ud83d\udccb *Copia e Cola:*\n\`${deposit.pixQrCodeText}\`\n\n` +
-            `Após o pagamento, o saldo será creditado automaticamente! \u2705`,
+            `Ap\u00f3s o pagamento, o saldo ser\u00e1 creditado automaticamente! \u2705`,
           parse_mode: 'Markdown',
-          // FEAT-CANCEL-DEPOSIT: botao de cancelar deposito
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('\ud83d\udd04 Verificar Pagamento', `check_payment_${deposit.paymentId}`)],
-            [Markup.button.callback('\u274c Cancelar Depósito', `cancel_payment_${deposit.paymentId}`)],
+            [Markup.button.callback('\u274c Cancelar Dep\u00f3sito', `cancel_payment_${deposit.paymentId}`)],
           ]).reply_markup,
         }
       );
 
-      // Atualiza mainMessageId para o QR de deposito
+      // FIX-CANCEL: guarda ID separado para a mensagem de foto do deposito
+      session.depositMessageId = depositMsg.message_id;
       session.mainMessageId = depositMsg.message_id;
 
       logger.info(`[Deposit] PIX de deposito gerado para ${userId} | valor: ${valor} | id: ${deposit.paymentId}`);
@@ -812,15 +870,15 @@ bot.on(message('text'), async (ctx) => {
         return;
       }
 
-      if (depositErrStatus === 503 || depositErrMsg.toLowerCase().includes('manutenção')) {
+      if (depositErrStatus === 503 || depositErrMsg.toLowerCase().includes('manuten\u00e7\u00e3o')) {
         await ctx.replyWithMarkdown(
-          `\ud83d\udee0\ufe0f *Manutenção em Andamento*\n\n${escapeMd(depositErrMsg)}\n\n_Tente novamente em alguns instantes!_ \ud83d\ude0a`
+          `\ud83d\udee0\ufe0f *Manuten\u00e7\u00e3o em Andamento*\n\n${escapeMd(depositErrMsg)}\n\n_Tente novamente em alguns instantes!_ \ud83d\ude0a`
         );
         return;
       }
 
       await ctx.replyWithMarkdown(
-        '\u274c Erro ao gerar PIX de depósito. Tente novamente.',
+        '\u274c Erro ao gerar PIX de dep\u00f3sito. Tente novamente.',
         Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_balance')]])
       );
     }
@@ -828,7 +886,7 @@ bot.on(message('text'), async (ctx) => {
   }
 
   await ctx.replyWithMarkdown(
-    `Não entendi sua mensagem. Use os botões abaixo para navegar:`,
+    `N\u00e3o entendi sua mensagem. Use os bot\u00f5es abaixo para navegar:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('\ud83d\udecd\ufe0f Ver Produtos', 'show_products')],
       [Markup.button.callback('\ud83d\udcb0 Meu Saldo', 'show_balance')],
@@ -848,7 +906,7 @@ async function showProducts(ctx: Context): Promise<void> {
     session.products = products;
 
     if (products.length === 0) {
-      await editOrReply(ctx, '\ud83d\ude14 Nenhum produto disponível no momento. Volte em breve!', {
+      await editOrReply(ctx, '\ud83d\ude14 Nenhum produto dispon\u00edvel no momento. Volte em breve!', {
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
       });
       return;
@@ -884,7 +942,7 @@ async function showOrders(ctx: Context): Promise<void> {
     if (!orders || orders.length === 0) {
       await editOrReply(
         ctx,
-        `\ud83d\udce6 *Meus Pedidos*\n\n_Você ainda não fez nenhum pedido._\n\nCompre um produto e ele aparecerá aqui!`,
+        `\ud83d\udce6 *Meus Pedidos*\n\n_Voc\u00ea ainda n\u00e3o fez nenhum pedido._\n\nCompre um produto e ele aparecer\u00e1 aqui!`,
         {
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('\ud83d\udecd\ufe0f Ver Produtos', 'show_products')],
@@ -910,16 +968,16 @@ async function showOrders(ctx: Context): Promise<void> {
         year: '2-digit',
         timeZone: 'America/Sao_Paulo',
       });
-      const valor = o.amount !== null ? ` · R$ ${Number(o.amount).toFixed(2)}` : '';
+      const valor = o.amount !== null ? ` \u00b7 R$ ${Number(o.amount).toFixed(2)}` : '';
       const metodo =
         o.paymentMethod === 'BALANCE'
-          ? ' · \ud83d\udcb0Saldo'
+          ? ' \u00b7 \ud83d\udcb0Saldo'
           : o.paymentMethod === 'MIXED'
-            ? ' · \ud83d\udd00Misto'
+            ? ' \u00b7 \ud83d\udd00Misto'
             : o.paymentMethod === 'PIX'
-              ? ' · \ud83d\udcf1PIX'
+              ? ' \u00b7 \ud83d\udcf1PIX'
               : '';
-      return `${emoji} *${escapeMd(o.productName)}* — ${date}${valor}${metodo}`;
+      return `${emoji} *${escapeMd(o.productName)}* \u2014 ${date}${valor}${metodo}`;
     });
 
     const total = orders.length;
@@ -928,7 +986,7 @@ async function showOrders(ctx: Context): Promise<void> {
     await editOrReply(
       ctx,
       `\ud83d\udce6 *Meus Pedidos* (${total} no total)\n\n${lines.join('\n')}${hasMore ? `\n\n_...e mais ${total - 10} pedidos anteriores._` : ''}\n\n` +
-        `_Para suporte sobre um pedido específico, entre em contato informando o nome do produto e a data._`,
+        `_Para suporte sobre um pedido espec\u00edfico, entre em contato informando o nome do produto e a data._`,
       {
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
       }
@@ -950,20 +1008,20 @@ async function showHelp(ctx: Context): Promise<void> {
   await editOrReplyHtml(
     ctx,
     `\u2753 <b>Central de Ajuda</b>\n\n` +
-      `<b>Comandos disponíveis:</b>\n` +
-      `/start — Tela inicial\n` +
-      `/produtos — Ver produtos\n` +
-      `/saldo — Ver e adicionar saldo\n` +
-      `/meus_pedidos — Histórico de pedidos\n` +
-      `/ajuda — Esta mensagem\n\n` +
+      `<b>Comandos dispon\u00edveis:</b>\n` +
+      `/start \u2014 Tela inicial\n` +
+      `/produtos \u2014 Ver produtos\n` +
+      `/saldo \u2014 Ver e adicionar saldo\n` +
+      `/meus_pedidos \u2014 Hist\u00f3rico de pedidos\n` +
+      `/ajuda \u2014 Esta mensagem\n\n` +
       `<b>Como funciona?</b>\n` +
       `1. Escolha um produto\n` +
       `2. Escolha como pagar: saldo, PIX ou os dois\n` +
       `3. Receba seu acesso automaticamente \u2705\n\n` +
-      `<b>Saldo pré-pago:</b>\n` +
-      `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
+      `<b>Saldo pr\u00e9-pago:</b>\n` +
+      `Fa\u00e7a um dep\u00f3sito uma vez e use para v\u00e1rias compras sem gerar PIX a cada vez.\n\n` +
       `<b>Modo Saldo + PIX:</b>\n` +
-      `Seu saldo cobre parte do valor e você paga o restante via PIX!\n\n` +
+      `Seu saldo cobre parte do valor e voc\u00ea paga o restante via PIX!\n\n` +
       `<b>Problemas com pagamento?</b>\n` +
       `Entre em contato informando o ID do pagamento.`,
     {
@@ -1010,7 +1068,7 @@ async function startBot(): Promise<void> {
       const updateId: number | undefined = req.body?.update_id;
       if (updateId !== undefined) {
         if (processedUpdateIds.has(updateId)) {
-          logger.warn(`[B15] update_id ${updateId} duplicado — ignorado`);
+          logger.warn(`[B15] update_id ${updateId} duplicado \u2014 ignorado`);
           return;
         }
         processedUpdateIds.add(updateId);
