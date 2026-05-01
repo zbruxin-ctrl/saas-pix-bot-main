@@ -26,6 +26,24 @@ const nextConfig = {
       },
     ];
   },
+
+  async rewrites() {
+    // API_URL é a variável server-side (sem prefixo NEXT_PUBLIC_)
+    // Fallback para NEXT_PUBLIC_API_URL em ambientes que só têm ela
+    const apiUrl =
+      process.env.API_URL ||
+      process.env.NEXT_PUBLIC_API_URL ||
+      'http://localhost:3001';
+
+    return [
+      {
+        // Redireciona /api/admin/:path* diretamente para o backend no Railway
+        // Isso evita que o Next.js sirva 404 HTML quando a página chama /api/admin/settings
+        source: '/api/admin/:path*',
+        destination: `${apiUrl}/api/admin/:path*`,
+      },
+    ];
+  },
 };
 
 module.exports = nextConfig;
