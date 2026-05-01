@@ -23,6 +23,7 @@
 // FIX #14: removidos \_ e \- do showHelp — Markdown v1 não suporta escape de caracteres
 // FIX #15: showHelp migrado para HTML — o _ em /meus_pedidos não é especial em HTML
 // CACHE: endpoint POST /internal/cache/invalidate-products — chamado pela API após mutations de produto
+// FIX B13: paymentInProgress Set em executePayment — bloqueia 2º request duplicado do Telegram
 
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
@@ -44,20 +45,16 @@ const logger = winston.createLogger({
   transports: [new winston.transports.Console()],
 });
 
-// ─── Escape Markdown v1 (evita Bad Request: can't parse entities) ──────
 function escapeMd(text: string): string {
   return String(text ?? '').replace(/[_*`[]/g, '\\$&');
 }
 
-// ─── Escape HTML (para funções que usam parse_mode HTML) ───────────────
 function escapeHtml(text: string): string {
   return String(text ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
-
-// ─── Sessão em memória ─────────────────────────────────────────────────
 
 interface UserSession {
   step: 'idle' | 'selecting_product' | 'awaiting_payment' | 'awaiting_deposit_amount';
@@ -99,22 +96,21 @@ function cleanupSessions(): void {
 
 setInterval(cleanupSessions, SESSION_CLEANUP_INTERVAL_MS);
 
-// ─── Bot ─────────────────────────────────────────────────────────────
+const paymentInProgress = new Set<number>();
 
 const bot = new Telegraf(env.TELEGRAM_BOT_TOKEN);
 
 async function registerCommands(): Promise<void> {
   await bot.telegram.setMyCommands([
-    { command: 'start',        description: '🏠 Menu inicial' },
-    { command: 'produtos',     description: '🛍️ Ver produtos disponíveis' },
-    { command: 'saldo',        description: '💰 Ver meu saldo e adicionar' },
+    { command: 'start', description: '🏠 Menu inicial' },
+    { command: 'produtos', description: '🛍️ Ver produtos disponíveis' },
+    { command: 'saldo', description: '💰 Ver meu saldo e adicionar' },
     { command: 'meus_pedidos', description: '📦 Histórico de pedidos' },
-    { command: 'ajuda',        description: '❓ Central de ajuda e suporte' },
+    { command: 'ajuda', description: '❓ Central de ajuda e suporte' },
   ]);
   logger.info('✅ Menu de comandos registrado no Telegram');
 }
 
-// ─── Helper: editar mensagem principal ou enviar nova se não existir ───
 async function editOrReply(
   ctx: Context,
   text: string,
@@ -150,7 +146,6 @@ async function editOrReply(
   session.mainMessageId = sent.message_id;
 }
 
-// ─── Helper: editar mensagem principal com HTML ─────────────────────
 async function editOrReplyHtml(
   ctx: Context,
   text: string,
@@ -186,7 +181,6 @@ async function editOrReplyHtml(
   session.mainMessageId = sent.message_id;
 }
 
-// ─── Helper: menu inicial ────────────────────────────────────────
 async function showHome(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const session = getSession(userId);
@@ -195,9 +189,9 @@ async function showHome(ctx: Context): Promise<void> {
   await editOrReply(
     ctx,
     `👋 Olá, *${firstName}*! Bem-vindo!\n\n` +
-    `🛒 Aqui você pode adquirir nossos produtos e planos de forma rápida e segura.\n\n` +
-    `💳 Aceitamos pagamento via *PIX* (confirmação instantânea) ou via *saldo* pré-carregado.\n\n` +
-    `Para ver nossos produtos, clique no botão abaixo:`,
+      `🛒 Aqui você pode adquirir nossos produtos e planos de forma rápida e segura.\n\n` +
+      `💳 Aceitamos pagamento via *PIX* (confirmação instantânea) ou via *saldo* pré-carregado.\n\n` +
+      `Para ver nossos produtos, clique no botão abaixo:`,
     {
       reply_markup: Markup.inlineKeyboard([
         [Markup.button.callback('🛍️ Ver Produtos', 'show_products')],
@@ -209,19 +203,22 @@ async function showHome(ctx: Context): Promise<void> {
   );
 }
 
-// ─── /start ──────────────────────────────────────────────────────────
-
 bot.command('start', async (ctx) => {
   const firstName = escapeMd(ctx.from?.first_name || 'visitante');
   const userId = ctx.from!.id;
 
-  sessions.set(userId, { step: 'idle', mainMessageId: undefined, firstName: ctx.from?.first_name || 'visitante', lastActivityAt: Date.now() });
+  sessions.set(userId, {
+    step: 'idle',
+    mainMessageId: undefined,
+    firstName: ctx.from?.first_name || 'visitante',
+    lastActivityAt: Date.now(),
+  });
 
   const sent = await ctx.replyWithMarkdown(
     `👋 Olá, *${firstName}*! Bem-vindo!\n\n` +
-    `🛒 Aqui você pode adquirir nossos produtos e planos de forma rápida e segura.\n\n` +
-    `💳 Aceitamos pagamento via *PIX* (confirmação instantânea) ou via *saldo* pré-carregado.\n\n` +
-    `Para ver nossos produtos, clique no botão abaixo:`,
+      `🛒 Aqui você pode adquirir nossos produtos e planos de forma rápida e segura.\n\n` +
+      `💳 Aceitamos pagamento via *PIX* (confirmação instantânea) ou via *saldo* pré-carregado.\n\n` +
+      `Para ver nossos produtos, clique no botão abaixo:`,
     Markup.inlineKeyboard([
       [Markup.button.callback('🛍️ Ver Produtos', 'show_products')],
       [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
@@ -233,14 +230,18 @@ bot.command('start', async (ctx) => {
   getSession(userId).mainMessageId = sent.message_id;
 });
 
-// ─── Comandos ───────────────────────────────────────────────────────────
-
-bot.command('produtos',     async (ctx) => { await showProducts(ctx); });
-bot.command('saldo',        async (ctx) => { await showBalance(ctx); });
-bot.command('ajuda',        async (ctx) => { await showHelp(ctx); });
-bot.command('meus_pedidos', async (ctx) => { await showOrders(ctx); });
-
-// ─── Actions de navegação ───────────────────────────────────────────────
+bot.command('produtos', async (ctx) => {
+  await showProducts(ctx);
+});
+bot.command('saldo', async (ctx) => {
+  await showBalance(ctx);
+});
+bot.command('ajuda', async (ctx) => {
+  await showHelp(ctx);
+});
+bot.command('meus_pedidos', async (ctx) => {
+  await showOrders(ctx);
+});
 
 bot.action('show_home', async (ctx) => {
   await ctx.answerCbQuery();
@@ -261,8 +262,6 @@ bot.action('show_orders', async (ctx) => {
   await ctx.answerCbQuery('📦 Carregando pedidos...');
   await showOrders(ctx);
 });
-
-// ─── Saldo ───────────────────────────────────────────────────────────
 
 async function showBalance(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
@@ -292,9 +291,7 @@ async function showBalance(ctx: Context): Promise<void> {
   } catch (err) {
     logger.error(`Erro ao buscar saldo para ${userId}:`, err);
     await editOrReply(ctx, '❌ Erro ao buscar saldo. Tente novamente.', {
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
-      ]).reply_markup,
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
     });
   }
 }
@@ -310,13 +307,11 @@ bot.action('deposit_balance', async (ctx) => {
   session.step = 'awaiting_deposit_amount';
   await ctx.replyWithMarkdown(
     `💳 *Adicionar Saldo*\n\n` +
-    `Digite o valor em reais que deseja depositar:\n` +
-    `_(mínimo R$ 1,00 | máximo R$ 10.000,00)_\n\n` +
-    `Exemplo: \`25\` ou \`50.00\``
+      `Digite o valor em reais que deseja depositar:\n` +
+      `_(mínimo R$ 1,00 | máximo R$ 10.000,00)_\n\n` +
+      `Exemplo: \`25\` ou \`50.00\``
   );
 });
-
-// ─── Selecionar produto ─────────────────────────────────────────────
 
 bot.action(/^select_product_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('⏳ Carregando produto...');
@@ -365,13 +360,7 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   await showPaymentMethodScreen(ctx, product, balanceResult);
 });
 
-// ─── Tela de método de pagamento ──────────────────────────────────────
-
-async function showPaymentMethodScreen(
-  ctx: Context,
-  product: ProductDTO,
-  preloadedBalance?: number
-): Promise<void> {
+async function showPaymentMethodScreen(ctx: Context, product: ProductDTO, preloadedBalance?: number): Promise<void> {
   const userId = ctx.from!.id;
   let balance = preloadedBalance ?? 0;
 
@@ -414,8 +403,6 @@ async function showPaymentMethodScreen(
   });
 }
 
-// ─── Executar pagamento ─────────────────────────────────────────────
-
 async function executePayment(
   ctx: Context,
   productId: string,
@@ -424,9 +411,15 @@ async function executePayment(
   const userId = ctx.from!.id;
   const session = getSession(userId);
 
-  await editOrReply(ctx, '\u23f3 Processando sua compra, aguarde...');
+  if (paymentInProgress.has(userId)) {
+    logger.warn(`[B13] Pagamento já em andamento para ${userId} (${paymentMethod}) — request duplicado ignorado`);
+    return;
+  }
+  paymentInProgress.add(userId);
 
   try {
+    await editOrReply(ctx, '\u23f3 Processando sua compra, aguarde...');
+
     const payment = await apiClient.createPayment({
       telegramId: String(userId),
       productId,
@@ -442,9 +435,9 @@ async function executePayment(
       await editOrReply(
         ctx,
         `\u2705 *Compra realizada com saldo!*\n\n` +
-        `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
-        `💰 *Valor debitado:* R$ ${Number(payment.amount).toFixed(2)}\n\n` +
-        `Seu produto será entregue em instantes! 🚀`,
+          `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
+          `💰 *Valor debitado:* R$ ${Number(payment.amount).toFixed(2)}\n\n` +
+          `Seu produto será entregue em instantes! 🚀`,
         {
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
@@ -458,7 +451,9 @@ async function executePayment(
 
     const expiresAt = new Date(payment.expiresAt);
     const expiresStr = expiresAt.toLocaleTimeString('pt-BR', {
-      hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'America/Sao_Paulo',
     });
 
     const mixedLine = payment.isMixed
@@ -494,7 +489,6 @@ async function executePayment(
 
     session.mainMessageId = qrMsg.message_id;
     logger.info(`[${paymentMethod}] PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
-
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Erro desconhecido';
     logger.error(`Erro ao processar pagamento (${paymentMethod}) para ${userId}:`, error);
@@ -507,6 +501,24 @@ async function executePayment(
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('\u2795 Adicionar Saldo', 'deposit_balance')],
             [Markup.button.callback('\u25c0\ufe0f Voltar', `select_product_${productId}`)],
+          ]).reply_markup,
+        }
+      );
+      return;
+    }
+
+    if (
+      errMsg.toLowerCase().includes('processamento') ||
+      errMsg.toLowerCase().includes('aguarde') ||
+      (error as { status?: number }).status === 429
+    ) {
+      await editOrReply(
+        ctx,
+        `\u23f3 *Seu pagamento já está sendo processado!*\n\nAguarde um instante e verifique seus pedidos. 😊`,
+        {
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
           ]).reply_markup,
         }
       );
@@ -526,10 +538,10 @@ async function executePayment(
         ]).reply_markup,
       }
     );
+  } finally {
+    paymentInProgress.delete(userId);
   }
 }
-
-// ─── Actions de pagamento ─────────────────────────────────────────────
 
 bot.action(/^pay_balance_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('💰 Processando com saldo...');
@@ -545,8 +557,6 @@ bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('🔀 Aplicando saldo + PIX...');
   await executePayment(ctx, ctx.match[1], 'MIXED');
 });
-
-// ─── Verificar pagamento ──────────────────────────────────────────────
 
 bot.action(/^check_payment_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('🔍 Verificando pagamento...');
@@ -585,8 +595,6 @@ bot.action(/^check_payment_(.+)$/, async (ctx) => {
   }
 });
 
-// ─── Cancelar pagamento ───────────────────────────────────────────────
-
 bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('❌ Cancelando...');
   const paymentId = ctx.match[1];
@@ -600,18 +608,10 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   }
 
   sessions.set(userId, { step: 'idle', lastActivityAt: Date.now() });
-  await editOrReply(
-    ctx,
-    '\u274c *Pagamento cancelado.*\n\nVolte quando quiser!',
-    {
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
-      ]).reply_markup,
-    }
-  );
+  await editOrReply(ctx, '\u274c *Pagamento cancelado.*\n\nVolte quando quiser!', {
+    reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
+  });
 });
-
-// ─── Handler de texto ──────────────────────────────────────────────────
 
 bot.on(message('text'), async (ctx) => {
   const text = ctx.message.text;
@@ -632,18 +632,15 @@ bot.on(message('text'), async (ctx) => {
     const processingMsg = await ctx.replyWithMarkdown('\u23f3 Gerando PIX de depósito, aguarde...');
 
     try {
-      const deposit = await apiClient.createDeposit(
-        String(userId),
-        valor,
-        ctx.from?.first_name,
-        ctx.from?.username
-      );
+      const deposit = await apiClient.createDeposit(String(userId), valor, ctx.from?.first_name, ctx.from?.username);
 
       await ctx.deleteMessage(processingMsg.message_id).catch(() => {});
 
       const expiresAt = new Date(deposit.expiresAt);
       const expiresStr = expiresAt.toLocaleTimeString('pt-BR', {
-        hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'America/Sao_Paulo',
       });
 
       const qrBuffer = Buffer.from(deposit.pixQrCode, 'base64');
@@ -662,7 +659,6 @@ bot.on(message('text'), async (ctx) => {
       );
 
       logger.info(`[Deposit] PIX de depósito gerado para ${userId} | valor: ${valor}`);
-
     } catch (err) {
       await ctx.deleteMessage(processingMsg.message_id).catch(() => {});
       logger.error(`Erro ao gerar depósito para ${userId}:`, err);
@@ -685,8 +681,6 @@ bot.on(message('text'), async (ctx) => {
   );
 });
 
-// ─── Funções auxiliares ───────────────────────────────────────────────
-
 async function showProducts(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const session = getSession(userId);
@@ -698,9 +692,7 @@ async function showProducts(ctx: Context): Promise<void> {
 
     if (products.length === 0) {
       await editOrReply(ctx, '😔 Nenhum produto disponível no momento. Volte em breve!', {
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
-        ]).reply_markup,
+        reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
       });
       return;
     }
@@ -713,23 +705,17 @@ async function showProducts(ctx: Context): Promise<void> {
 
     buttons.push([Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]);
 
-    await editOrReply(
-      ctx,
-      `🛍️ *Nossos Produtos*\n\nEscolha um produto abaixo:`,
-      { reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
-    );
+    await editOrReply(ctx, `🛍️ *Nossos Produtos*\n\nEscolha um produto abaixo:`, {
+      reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
+    });
   } catch (error) {
     logger.error('Erro ao buscar produtos:', error);
-    await editOrReply(
-      ctx,
-      '\u274c Erro ao buscar produtos. Tente novamente em instantes.',
-      {
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🔄 Tentar Novamente', 'show_products')],
-          [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
-        ]).reply_markup,
-      }
-    );
+    await editOrReply(ctx, '\u274c Erro ao buscar produtos. Tente novamente em instantes.', {
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Tentar Novamente', 'show_products')],
+        [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
+      ]).reply_markup,
+    });
   }
 }
 
@@ -762,17 +748,20 @@ async function showOrders(ctx: Context): Promise<void> {
     const lines = orders.slice(0, 10).map((o: OrderSummary) => {
       const emoji = statusEmoji[o.status] ?? '📦';
       const date = new Date(o.createdAt).toLocaleDateString('pt-BR', {
-        day: '2-digit', month: '2-digit', year: '2-digit',
+        day: '2-digit',
+        month: '2-digit',
+        year: '2-digit',
         timeZone: 'America/Sao_Paulo',
       });
       const valor = o.amount !== null ? ` · R$ ${Number(o.amount).toFixed(2)}` : '';
-      const metodo = o.paymentMethod === 'BALANCE'
-        ? ' · 💰Saldo'
-        : o.paymentMethod === 'MIXED'
-          ? ' · 🔀Misto'
-          : o.paymentMethod === 'PIX'
-            ? ' · 📱PIX'
-            : '';
+      const metodo =
+        o.paymentMethod === 'BALANCE'
+          ? ' · 💰Saldo'
+          : o.paymentMethod === 'MIXED'
+            ? ' · 🔀Misto'
+            : o.paymentMethod === 'PIX'
+              ? ' · 📱PIX'
+              : '';
       return `${emoji} *${escapeMd(o.productName)}* — ${date}${valor}${metodo}`;
     });
 
@@ -782,51 +771,44 @@ async function showOrders(ctx: Context): Promise<void> {
     await editOrReply(
       ctx,
       `📦 *Meus Pedidos* (${total} no total)\n\n${lines.join('\n')}${hasMore ? `\n\n_...e mais ${total - 10} pedidos anteriores._` : ''}\n\n` +
-      `_Para suporte sobre um pedido específico, entre em contato informando o nome do produto e a data._`,
+        `_Para suporte sobre um pedido específico, entre em contato informando o nome do produto e a data._`,
       {
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
-        ]).reply_markup,
+        reply_markup: Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')]]).reply_markup,
       }
     );
   } catch (err) {
     logger.error(`Erro ao buscar pedidos para ${userId}:`, err);
-    await editOrReply(
-      ctx,
-      '\u274c Erro ao buscar seus pedidos. Tente novamente.',
-      {
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🔄 Tentar Novamente', 'show_orders')],
-          [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
-        ]).reply_markup,
-      }
-    );
+    await editOrReply(ctx, '\u274c Erro ao buscar seus pedidos. Tente novamente.', {
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('🔄 Tentar Novamente', 'show_orders')],
+        [Markup.button.callback('\u25c0\ufe0f Voltar', 'show_home')],
+      ]).reply_markup,
+    });
   }
 }
 
-// FIX #15: showHelp usa HTML — o _ em /meus_pedidos nao e especial em HTML
 async function showHelp(ctx: Context): Promise<void> {
   const supportUrl = `https://wa.me/${escapeHtml(env.SUPPORT_PHONE)}`;
 
   await editOrReplyHtml(
     ctx,
     `❓ <b>Central de Ajuda</b>\n\n` +
-    `<b>Comandos disponíveis:</b>\n` +
-    `/start — Tela inicial\n` +
-    `/produtos — Ver produtos\n` +
-    `/saldo — Ver e adicionar saldo\n` +
-    `/meus_pedidos — Histórico de pedidos\n` +
-    `/ajuda — Esta mensagem\n\n` +
-    `<b>Como funciona?</b>\n` +
-    `1. Escolha um produto\n` +
-    `2. Escolha como pagar: saldo, PIX ou os dois\n` +
-    `3. Receba seu acesso automaticamente ✅\n\n` +
-    `<b>Saldo pré-pago:</b>\n` +
-    `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
-    `<b>Modo Saldo + PIX:</b>\n` +
-    `Seu saldo cobre parte do valor e você paga o restante via PIX!\n\n` +
-    `<b>Problemas com pagamento?</b>\n` +
-    `Entre em contato informando o ID do pagamento.`,
+      `<b>Comandos disponíveis:</b>\n` +
+      `/start — Tela inicial\n` +
+      `/produtos — Ver produtos\n` +
+      `/saldo — Ver e adicionar saldo\n` +
+      `/meus_pedidos — Histórico de pedidos\n` +
+      `/ajuda — Esta mensagem\n\n` +
+      `<b>Como funciona?</b>\n` +
+      `1. Escolha um produto\n` +
+      `2. Escolha como pagar: saldo, PIX ou os dois\n` +
+      `3. Receba seu acesso automaticamente ✅\n\n` +
+      `<b>Saldo pré-pago:</b>\n` +
+      `Faça um depósito uma vez e use para várias compras sem gerar PIX a cada vez.\n\n` +
+      `<b>Modo Saldo + PIX:</b>\n` +
+      `Seu saldo cobre parte do valor e você paga o restante via PIX!\n\n` +
+      `<b>Problemas com pagamento?</b>\n` +
+      `Entre em contato informando o ID do pagamento.`,
     {
       reply_markup: Markup.inlineKeyboard([
         [Markup.button.url('📞 Contatar Suporte', supportUrl)],
@@ -836,13 +818,9 @@ async function showHelp(ctx: Context): Promise<void> {
   );
 }
 
-// ─── Tratamento de erros ────────────────────────────────────────────────
-
 bot.catch((err, ctx) => {
   logger.error(`Erro no bot para update ${ctx.update.update_id}:`, err);
 });
-
-// ─── Servidor HTTP ────────────────────────────────────────────────────────
 
 async function startBot(): Promise<void> {
   if (env.NODE_ENV === 'production' && env.BOT_WEBHOOK_URL) {
@@ -879,9 +857,6 @@ async function startBot(): Promise<void> {
 
     app.get('/health', (_req, res) => res.json({ status: 'ok', bot: me.username }));
 
-    // ─── Invalidação de cache de produtos ──────────────────────────────────
-    // Chamado pela API (apps/api/src/lib/botCache.ts) após create/update/delete
-    // de produtos no painel admin. Protegido pelo mesmo TELEGRAM_BOT_SECRET.
     app.post('/internal/cache/invalidate-products', (req, res) => {
       const secret = req.headers['x-bot-secret'];
       if (secret !== env.TELEGRAM_BOT_SECRET) {
@@ -896,7 +871,6 @@ async function startBot(): Promise<void> {
     app.listen(PORT, () => {
       logger.info(`🚀 Servidor webhook do bot escutando na porta ${PORT}`);
     });
-
   } else {
     await bot.launch();
     logger.info(`📌 Bot username: @${bot.botInfo?.username}`);
