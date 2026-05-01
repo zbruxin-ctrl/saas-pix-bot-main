@@ -10,6 +10,8 @@
  *         expiração resistente a restarts (verifica status na API ao invés de
  *         depender somente do setTimeout em memória).
  *         pixExpiresAt é salvo na sessão para re-agendamento no /start.
+ * BUG FIX: answerCbQuery chamado ANTES de qualquer operação async para evitar
+ *          timeout de 30s do Telegram que silencia o bot.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -101,6 +103,11 @@ export async function executePayment(
 ): Promise<void> {
   const userId = ctx.from!.id;
   const lockKey = `pay:${userId}`;
+
+  // Responde o callback ANTES do lock para não atingir timeout do Telegram
+  if ('callbackQuery' in ctx && ctx.callbackQuery) {
+    await ctx.answerCbQuery('⏳ Processando...').catch(() => {});
+  }
 
   const acquired = await acquireLock(lockKey, 60);
   if (!acquired) {
@@ -250,14 +257,6 @@ export async function executePayment(
 /**
  * FIX #1: schedulePIXExpiry recebe delayMs como parâmetro para permitir
  * re-agendamento com tempo restante calculado a partir do Redis (pixExpiresAt).
- *
- * Fluxo resistente a restart:
- *  1. Ao gerar PIX → salva paymentId + pixExpiresAt na sessão (Redis, TTL 1h)
- *  2. schedulePIXExpiry dispara com o delay real
- *  3. Se o bot restartar → ao receber /start, index.ts lê a sessão do Redis,
- *     calcula o tempo restante e re-agenda schedulePIXExpiry se ainda pendente
- *  4. Quando o timer dispara, consulta a API (getPaymentStatus) antes de avisar,
- *     evitando falso alarme caso o pagamento já tenha sido aprovado.
  */
 export function schedulePIXExpiry(
   userId: number,
@@ -299,6 +298,12 @@ export function schedulePIXExpiry(
 
 export async function handleCheckPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
+
+  // CRÍTICO: responde o cbQuery IMEDIATAMENTE antes de qualquer operação async.
+  // Se demorar mais de 30s sem resposta, o Telegram marca o bot como "não responsivo"
+  // e para de entregar updates para aquele usuário.
+  await ctx.answerCbQuery('🔄 Verificando...').catch(() => {});
+
   try {
     // SEC FIX #6: passa telegramId para validação de ownership na API
     const { status } = await apiClient.getPaymentStatus(paymentId, String(userId));
@@ -336,8 +341,12 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
             ]).reply_markup,
           }
     );
-  } catch {
-    await ctx.answerCbQuery('Erro ao verificar pagamento\.', { show_alert: true });
+  } catch (err) {
+    console.error('[handleCheckPayment] Erro ao verificar pagamento:', err);
+    // Envia mensagem de erro em vez de silenciar
+    await ctx.reply('⚠️ Erro ao verificar pagamento\. Tente novamente\.', {
+      parse_mode: 'MarkdownV2',
+    }).catch(() => {});
   }
 }
 
@@ -346,22 +355,23 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
 export async function handleCancelPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
 
+  // CRÍTICO: responde o cbQuery IMEDIATAMENTE antes de qualquer operação async
+  await ctx.answerCbQuery('❌ Cancelando...').catch(() => {});
+
   // SEC FIX #2: Verifica ownership — só o dono do pagamento pode cancelar
   const session = await getSession(userId);
   if (session.paymentId !== paymentId) {
-    await ctx.answerCbQuery('⚠️ Ação não autorizada.', { show_alert: true }).catch(() => {});
     console.warn(`[cancelPayment] userId ${userId} tentou cancelar paymentId ${paymentId} que não é dele (sessão: ${session.paymentId})`);
+    await ctx.reply('⚠️ Ação não autorizada\.', { parse_mode: 'MarkdownV2' }).catch(() => {});
     return;
   }
 
   const lockKey = `cancel:${paymentId}`;
   const acquired = await acquireLock(lockKey, 15);
   if (!acquired) {
-    await ctx.answerCbQuery('⏳ Cancelamento já em andamento.', { show_alert: false }).catch(() => {});
+    await ctx.reply('⏳ Cancelamento já em andamento\.', { parse_mode: 'MarkdownV2' }).catch(() => {});
     return;
   }
-
-  await ctx.answerCbQuery('❌ Cancelando...').catch(() => {});
 
   try {
     // SEC FIX #6: passa telegramId para que a API valide ownership também
@@ -375,6 +385,13 @@ export async function handleCancelPayment(ctx: Context, paymentId: string): Prom
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
     });
     await clearSession(userId, session.firstName);
+  } catch (err) {
+    console.error('[handleCancelPayment] Erro ao finalizar cancelamento:', err);
+    await ctx.reply('❌ *Pagamento cancelado\.* Volte quando quiser\!', {
+      parse_mode: 'MarkdownV2',
+      reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
+    }).catch(() => {});
+    await clearSession(userId, session.firstName).catch(() => {});
   } finally {
     await releaseLock(lockKey);
   }
