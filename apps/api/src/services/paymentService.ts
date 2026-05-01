@@ -52,6 +52,9 @@
 //   Solução nível 2 (memória): Set balancePaymentLock keyed por userId:productId.
 //     Bloqueia requests simultâneos que chegam antes do DB registrar o primeiro
 //     pagamento (janela de milissegundos). Retorna 429 com mensagem amigável.
+// FIX-BLOCKED: createPayment agora verifica isBlocked do TelegramUser logo após
+//   upsert. Usuários bloqueados recebem AppError 403 antes de qualquer
+//   processamento de pagamento (BALANCE, PIX ou MIXED).
 import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
@@ -196,14 +199,22 @@ export class PaymentService {
 
     if (!product) throw new AppError('Produto não encontrado ou indisponível.', 404);
 
+    // FIX-BLOCKED: verifica se o usuário está bloqueado antes de qualquer
+    // processamento de pagamento. A leitura é sempre do DB (campo não cacheado).
+    const userStatus = await prisma.telegramUser.findUnique({
+      where: { id: telegramUser.id },
+      select: { isBlocked: true, balance: true },
+    });
+
+    if (userStatus?.isBlocked) {
+      logger.warn(`[PaymentService] Tentativa de compra bloqueada para usuário ${telegramId} (isBlocked=true)`);
+      throw new AppError('Sua conta está suspensa. Entre em contato com o suporte.', 403);
+    }
+
     // FIX BALANCE CACHE STALE: saldo SEMPRE relido do DB — cache pode estar
     // desatualizado após ajuste manual do admin (sem invalidação externa) ou
     // após cancelamento/expiração em que a invalidação não chegou a este nó.
-    const freshUser = await prisma.telegramUser.findUnique({
-      where: { id: telegramUser.id },
-      select: { balance: true },
-    });
-    const balance = freshUser ? Number(freshUser.balance) : 0;
+    const balance = userStatus ? Number(userStatus.balance) : 0;
     const price = Number(product.price);
 
     if (paymentMethod === 'BALANCE') {
