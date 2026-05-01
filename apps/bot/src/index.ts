@@ -164,7 +164,6 @@ async function editOrReplyHtml(
 }
 
 // FIX-CANCEL: deleta a mensagem de foto (QR) e envia uma mensagem de texto limpa no lugar.
-// A API do Telegram nao permite converter foto em texto via edicao, por isso deletamos e reenviamos.
 async function deletePhotoAndReply(
   ctx: Context,
   session: UserSession,
@@ -179,7 +178,6 @@ async function deletePhotoAndReply(
     return;
   }
 
-  // Tenta deletar a mensagem da foto (depositMessageId tem prioridade, senao mainMessageId)
   const photoMsgId = session.depositMessageId ?? session.mainMessageId;
   if (photoMsgId) {
     await ctx.telegram.deleteMessage(chatId, photoMsgId).catch(() => {});
@@ -187,7 +185,6 @@ async function deletePhotoAndReply(
     session.depositMessageId = undefined;
   }
 
-  // Envia mensagem de texto limpa
   const sent = await ctx.telegram.sendMessage(chatId, text, {
     parse_mode: 'Markdown',
     ...(extra as object),
@@ -746,7 +743,6 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   const paymentId = ctx.match[1];
   const userId = ctx.from!.id;
 
-  // Lock anti-duplo-clique por paymentId
   if (cancelInProgress.has(paymentId)) {
     await ctx.answerCbQuery('\u23f3 Cancelamento j\u00e1 em andamento...', { show_alert: false }).catch(() => {});
     return;
@@ -764,7 +760,6 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
 
   const session = getSession(userId);
 
-  // FIX-CANCEL: deleta a mensagem de foto e envia mensagem de texto limpa
   await deletePhotoAndReply(
     ctx,
     session,
@@ -776,7 +771,6 @@ bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
     }
   );
 
-  // Reseta a sessao preservando o firstName
   const firstName = session.firstName;
   sessions.set(userId, { step: 'idle', firstName, lastActivityAt: Date.now() });
 
@@ -794,7 +788,10 @@ bot.on(message('text'), async (ctx) => {
     const valor = parseFloat(text.replace(',', '.'));
 
     if (isNaN(valor) || valor < 1 || valor > 10000) {
-      await ctx.reply('\u274c Valor inv\u00e1lido. Digite um valor entre R$ 1,00 e R$ 10.000,00.\n\nExemplo: `25` ou `50.00`');
+      // FIX: usar replyWithMarkdown para que os backticks sejam renderizados como codigo
+      await ctx.replyWithMarkdown(
+        '\u274c Valor inv\u00e1lido\. Digite um valor entre R\$ 1,00 e R\$ 10\.000,00\.\n\nExemplo: `25` ou `50.00`'
+      );
       return;
     }
 
@@ -834,7 +831,6 @@ bot.on(message('text'), async (ctx) => {
         }
       );
 
-      // Guarda ID da mensagem de foto do deposito
       session.depositMessageId = depositMsg.message_id;
       session.mainMessageId = depositMsg.message_id;
 
