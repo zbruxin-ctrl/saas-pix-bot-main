@@ -1,38 +1,31 @@
 // Bot do Telegram - Ponto de entrada principal
-// FEATURE 1: edit-in-place (editOrReply) — evita poluição visual
-// FEATURE 2: sistema de saldo (show_balance, deposit_balance, paidWithBalance)
-// FEATURE 3: animação de loading nos botões via answerCbQuery
-// FEATURE 4: escolha de método de pagamento (BALANCE | PIX | MIXED)
-// PERF #3: Promise.all para buscar produto + saldo em paralelo (era sequencial)
-// PERF #7: limpeza de sessões idle antigas a cada 30min (evita vazamento de memória)
-// FEATURE 5: /meus_pedidos com histórico real via API + valor pago
-// FIX WEBHOOK: bot sobe servidor Express próprio na porta 8080 — webhook vai direto para o bot
-// FIX TS7016: removido node-fetch, usa fetch nativo do Node 20
-// FIX #1: suporte via env.SUPPORT_PHONE (sem hardcode)
-// FIX #2: showOrders exibe valor pago + método em cada pedido
-// FIX #3: PIX consolidado em uma única mensagem (QR Code + copia-e-cola no caption)
-// FIX #4: removido tipo inline no .map() de showOrders — usa OrderSummary diretamente
-// FIX #5: bot.telegram.getMe() após setWebhook — popula botInfo em modo webhook
-// FIX #8: bot expõe servidor HTTP próprio (Express) — Telegram bate direto no bot, sem intermediário da API
-// FIX #9: showProducts sem botões extras (Saldo/Pedidos/Ajuda removidos da lista de produtos)
-// FIX #10: showHelp usa texto simples sem markdown problemático — corrige crash do botão Ajuda
-// FIX #11: todos os botões "Voltar" agora vão para show_home (menu inicial do /start), não show_products
-// FEATURE 6: setMyCommands registra menu de comandos no Telegram (botão ☰ na caixa de texto)
-// FIX #12: showHelp usa Markdown simples (sem escapes MarkdownV2) — remove barras inversas
-// FIX #13: escapeMd() em todos os campos dinâmicos — corrige Bad Request: can't parse entities
-// FIX #14: removidos \_ e \- do showHelp — Markdown v1 não suporta escape de caracteres
-// FIX #15: showHelp migrado para HTML — o _ em /meus_pedidos não é especial em HTML
-// CACHE: endpoint POST /internal/cache/invalidate-products — chamado pela API após mutations de produto
-// FIX B13: paymentInProgress Set em executePayment — bloqueia 2º request duplicado do Telegram
-// FIX B14: res.sendStatus(200) ANTES do await bot.handleUpdate — evita retry do Telegram por timeout
-// FIX B15: dedup por update_id no webhook — descarta retries do Telegram antes de processar
-
+// FEATURE 1: edit-in-place (editOrReply)
+// FEATURE 2: sistema de saldo
+// FEATURE 3: animação de loading nos botões
+// FEATURE 4: escolha de método de pagamento
+// PERF #3: Promise.all para buscar produto + saldo em paralelo
+// PERF #7: limpeza de sessões idle a cada 30min
+// FEATURE 5: /meus_pedidos com histórico real
+// FIX WEBHOOK: bot sobe servidor Express próprio na porta 8080
+// FIX TS7016: usa fetch nativo do Node 20
+// FIX #1 a #15: vários fixes anteriores
+// FIX B13: paymentInProgress Set em executePayment
+// FIX B14: res.sendStatus(200) ANTES do await bot.handleUpdate
+// FIX B15: dedup por update_id no webhook
+// FEAT-MAINT: middleware global de manutenção — consulta /bot-config (TTL 10s)
+//   Quando maintenance_mode=true, QUALQUER interação (comando ou callback) recebe
+//   a mensagem de manutenção configurada no painel admin. O usuário não consegue
+//   navegar nem comprar. Apenas /start exibe a mensagem (sem menu).
+// FEAT-BLOCKED: quando a API retorna 403 (usuário bloqueado), o bot exibe
+//   mensagem amigável explicando que a conta está suspensa.
+// FEAT-DESC: tela de produto exibe descrição rica (igual à de boas-vindas do /start)
+//   Descrição do produto é exibida em destaque + ícone, linha separadora visual.
 import express from 'express';
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
 import type { ExtraEditMessageText } from 'telegraf/typings/telegram-types';
 import { env } from './config/env';
-import { apiClient, invalidateProductCache } from './services/apiClient';
+import { apiClient, invalidateProductCache, invalidateBotConfigCache } from './services/apiClient';
 import type { OrderSummary } from './services/apiClient';
 import type { ProductDTO, WalletTransactionDTO } from '@saas-pix/shared';
 
@@ -98,9 +91,7 @@ function cleanupSessions(): void {
 
 setInterval(cleanupSessions, SESSION_CLEANUP_INTERVAL_MS);
 
-// FIX B15: dedup de update_id — evita processar o mesmo update duas vezes
-// O Telegram reenvia o update se não receber 200 em tempo hábil.
-// Guardamos os últimos 1000 update_ids processados; limpamos a cada 5 min.
+// FIX B15: dedup de update_id
 const processedUpdateIds = new Set<number>();
 const UPDATE_DEDUP_CLEANUP_MS = 5 * 60_000;
 setInterval(() => {
@@ -194,6 +185,57 @@ async function editOrReplyHtml(
   const sent = await ctx.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', ...(extra as object) });
   session.mainMessageId = sent.message_id;
 }
+
+// ─── FEAT-MAINT: helper de verificação de manutenção ─────────────────────────
+// Retorna null se não está em manutenção, ou a mensagem configurada se estiver.
+async function getMaintenanceMessage(): Promise<string | null> {
+  try {
+    const config = await apiClient.getBotConfig();
+    if (config.maintenanceMode) {
+      return config.maintenanceMessage || 'Estamos em manutenção. Voltamos em breve! 🛠️';
+    }
+  } catch {
+    // Se não conseguir checar, não bloqueia
+  }
+  return null;
+}
+
+// ─── FEAT-MAINT: middleware global ────────────────────────────────────────────
+// Intercepta QUALQUER update (mensagem, callback, comando) e bloqueia
+// quando modo manutenção está ativo. Exibe mensagem configurada no admin.
+bot.use(async (ctx, next) => {
+  const maintMsg = await getMaintenanceMessage();
+  if (maintMsg) {
+    const userId = ctx.from?.id;
+    if (userId) {
+      const session = getSession(userId);
+      const firstName = escapeMd(session.firstName || ctx.from?.first_name || 'visitante');
+      const text =
+        `🛠️ *Manutenção em Andamento*\n\n` +
+        `Olá, *${firstName}*!\n\n` +
+        `${escapeMd(maintMsg)}\n\n` +
+        `_Pedimos desculpas pelo inconveniente. Em breve estaremos de volta!_ 😊`;
+
+      if ('callbackQuery' in ctx && ctx.callbackQuery) {
+        await ctx.answerCbQuery('🛠️ Bot em manutenção', { show_alert: true }).catch(() => {});
+      }
+
+      if (session.mainMessageId && ctx.chat?.id) {
+        await ctx.telegram.editMessageText(ctx.chat.id, session.mainMessageId, undefined, text, {
+          parse_mode: 'Markdown',
+        }).catch(async () => {
+          const sent = await ctx.replyWithMarkdown(text).catch(() => null);
+          if (sent) session.mainMessageId = sent.message_id;
+        });
+      } else {
+        const sent = await ctx.replyWithMarkdown(text).catch(() => null);
+        if (sent && userId) getSession(userId).mainMessageId = sent.message_id;
+      }
+    }
+    return; // não chama next() — bloqueia completamente
+  }
+  return next();
+});
 
 async function showHome(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
@@ -390,9 +432,15 @@ async function showPaymentMethodScreen(ctx: Context, product: ProductDTO, preloa
   const price = Number(product.price);
   const balanceStr = balance.toFixed(2);
 
+  // FEAT-DESC: descrição rica do produto com linha visual separadora
+  const descLine = product.description
+    ? `\n📝 _${escapeMd(product.description)}_\n`
+    : '';
+
   const confirmMessage =
-    `📦 *${escapeMd(product.name)}*\n\n` +
-    `📝 ${escapeMd(product.description)}\n\n` +
+    `📦 *${escapeMd(product.name)}*` +
+    descLine +
+    `\n━━━━━━━━━━━━━━━━━━━━\n` +
     `💰 *Valor:* R$ ${price.toFixed(2)}\n` +
     `🏦 *Seu saldo:* R$ ${balanceStr}\n\n` +
     `*Como deseja pagar?*`;
@@ -505,7 +553,39 @@ async function executePayment(
     logger.info(`[${paymentMethod}] PIX gerado para usuário ${userId} | Pagamento: ${payment.paymentId}`);
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Erro desconhecido';
+    const errStatus = (error as { statusCode?: number }).statusCode ?? 0;
     logger.error(`Erro ao processar pagamento (${paymentMethod}) para ${userId}:`, error);
+
+    // FEAT-BLOCKED: usuário bloqueado — 403 retornado pela API
+    if (errStatus === 403 || errMsg.toLowerCase().includes('suspensa') || errMsg.toLowerCase().includes('bloqueada') || errMsg.toLowerCase().includes('bloqueado')) {
+      await editOrReply(
+        ctx,
+        `🚫 *Conta Suspensa*\n\n` +
+          `Sua conta foi suspensa e não é possível realizar compras no momento.\n\n` +
+          `Se acredita que isso é um erro, entre em contato com o suporte.`,
+        {
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.url('📞 Falar com Suporte', `https://wa.me/${env.SUPPORT_PHONE}`)],
+            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
+          ]).reply_markup,
+        }
+      );
+      return;
+    }
+
+    // FEAT-MAINT: manutenção retornada pela API (503) mesmo sem o middleware ter interceptado
+    if (errStatus === 503 || errMsg.toLowerCase().includes('manutenção') || errMsg.toLowerCase().includes('manutencao')) {
+      await editOrReply(
+        ctx,
+        `🛠️ *Manutenção em Andamento*\n\n${escapeMd(errMsg)}\n\n_Tente novamente em alguns instantes!_ 😊`,
+        {
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
+          ]).reply_markup,
+        }
+      );
+      return;
+    }
 
     if (errMsg.toLowerCase().includes('saldo insuficiente')) {
       await editOrReply(
@@ -524,7 +604,7 @@ async function executePayment(
     if (
       errMsg.toLowerCase().includes('processamento') ||
       errMsg.toLowerCase().includes('aguarde') ||
-      (error as { status?: number }).status === 429
+      errStatus === 429
     ) {
       await editOrReply(
         ctx,
@@ -676,6 +756,17 @@ bot.on(message('text'), async (ctx) => {
     } catch (err) {
       await ctx.deleteMessage(processingMsg.message_id).catch(() => {});
       logger.error(`Erro ao gerar depósito para ${userId}:`, err);
+
+      // FEAT-MAINT: bloqueia depósito também durante manutenção
+      const depositErrMsg = err instanceof Error ? err.message : '';
+      const depositErrStatus = (err as { statusCode?: number }).statusCode ?? 0;
+      if (depositErrStatus === 503 || depositErrMsg.toLowerCase().includes('manutenção')) {
+        await ctx.replyWithMarkdown(
+          `🛠️ *Manutenção em Andamento*\n\n${escapeMd(depositErrMsg)}\n\n_Tente novamente em alguns instantes!_ 😊`
+        );
+        return;
+      }
+
       await ctx.replyWithMarkdown(
         '\u274c Erro ao gerar PIX de depósito. Tente novamente.',
         Markup.inlineKeyboard([[Markup.button.callback('\u25c0\ufe0f Voltar', 'show_balance')]])
@@ -862,10 +953,8 @@ async function startBot(): Promise<void> {
         return;
       }
 
-      // FIX B14: responde 200 IMEDIATAMENTE — evita retry do Telegram por timeout
       res.sendStatus(200);
 
-      // FIX B15: dedup por update_id — descarta o mesmo update se já foi processado
       const updateId: number | undefined = req.body?.update_id;
       if (updateId !== undefined) {
         if (processedUpdateIds.has(updateId)) {
@@ -889,7 +978,10 @@ async function startBot(): Promise<void> {
         return;
       }
       invalidateProductCache();
-      logger.info('[cache] Cache de produtos invalidado via API admin');
+      // Invalida também o config cache para que a mudança de manutenção
+      // seja refletida imediatamente sem esperar o TTL de 10s
+      invalidateBotConfigCache();
+      logger.info('[cache] Cache de produtos + bot-config invalidado via API admin');
       res.json({ ok: true });
     });
 

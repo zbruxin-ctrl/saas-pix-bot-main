@@ -1,20 +1,13 @@
 // Cliente HTTP para comunicacao do bot com a API interna
-// PERF #1: timeout reduzido para 8s (era 15s)
+// PERF #1: timeout reduzido para 8s
 // PERF #2: cache global de produtos TTL 30s
 // PERF #4: retry automatico 1x em timeout/network error
 // PERF #5: cache de saldo por usuario TTL 15s
 // PERF #6: invalidacao do cache de saldo apos deposito
-// FEATURE: getOrders(telegramId) - historico de pedidos para /meus_pedidos
-// FIX-B17: createPayment agora distingue erro real de idempotência.
-//   Problema: a API retornava 200 idempotente quando recebia 2º request BALANCE
-//   com saldo já decrementado (FIX-B16). Porém o bot ainda exibia "Saldo
-//   insuficiente" se a resposta chegasse como erro 4xx por qualquer razão.
-//   Solução: o interceptor do axios passa o statusCode junto com o erro.
-//   createPayment verifica: se status === 400 E mensagem contém "saldo
-//   insuficiente", faz 1 tentativa extra consultando /orders para verificar
-//   se existe pedido aprovado nos últimos 60s para o mesmo produto. Se sim,
-//   retorna resposta sintética paidWithBalance=true (idempotente). Garante que
-//   o bot nunca mostra "saldo insuficiente" falso para o usuário.
+// FEATURE: getOrders(telegramId)
+// FIX-B17: createPayment distingue erro real de idempotência
+// FEAT-MAINT: getBotConfig() busca maintenance_mode + maintenance_message
+//   com cache em memória TTL 10s para não bater na API a cada update
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
 import type {
@@ -48,6 +41,18 @@ export function invalidateBalanceCache(telegramId: string): void {
   balanceCache.delete(telegramId);
 }
 
+// FEAT-MAINT: cache do bot-config com TTL 10s
+interface BotConfigCache {
+  data: { maintenanceMode: boolean; maintenanceMessage: string };
+  expiresAt: number;
+}
+let botConfigCache: BotConfigCache | null = null;
+const BOT_CONFIG_CACHE_TTL = 10_000;
+
+export function invalidateBotConfigCache(): void {
+  botConfigCache = null;
+}
+
 export interface OrderSummary {
   id: string;
   status: string;
@@ -58,7 +63,6 @@ export interface OrderSummary {
   paymentMethod: PaymentMethod | null;
 }
 
-// Erro customizado que carrega o statusCode HTTP junto
 class ApiHttpError extends Error {
   constructor(message: string, public statusCode: number) {
     super(message);
@@ -79,7 +83,6 @@ class ApiClient {
       timeout: 8000,
     });
 
-    // FIX-B17: preserva statusCode no erro para permitir lógica de fallback
     this.client.interceptors.response.use(
       (r) => r,
       (error) => {
@@ -105,6 +108,24 @@ class ApiClient {
         return await fn();
       }
       throw err;
+    }
+  }
+
+  async getBotConfig(): Promise<{ maintenanceMode: boolean; maintenanceMessage: string }> {
+    const now = Date.now();
+    if (botConfigCache && botConfigCache.expiresAt > now) {
+      return botConfigCache.data;
+    }
+    try {
+      const { data } = await this.withRetry(() =>
+        this.client.get<ApiResponse<{ maintenanceMode: boolean; maintenanceMessage: string }>>('/api/payments/bot-config')
+      );
+      const result = data.data ?? { maintenanceMode: false, maintenanceMessage: '' };
+      botConfigCache = { data: result, expiresAt: now + BOT_CONFIG_CACHE_TTL };
+      return result;
+    } catch {
+      // Se falhar, assume sem manutenção para não bloquear o bot
+      return { maintenanceMode: false, maintenanceMessage: '' };
     }
   }
 
@@ -158,10 +179,7 @@ class ApiClient {
       );
       return data.data!;
     } catch (err) {
-      // FIX-B17: se recebemos 400 "saldo insuficiente" em modo BALANCE,
-      // pode ser um 2º request duplicado (saldo já decrementado pelo 1º).
-      // Antes de exibir o erro ao usuário, consultamos /orders para verificar
-      // se existe pedido APPROVED recente (últimos 60s) para o mesmo produto.
+      // FIX-B17: fallback idempotente para 400 saldo insuficiente em BALANCE
       if (
         err instanceof ApiHttpError &&
         err.statusCode === 400 &&
@@ -171,20 +189,12 @@ class ApiClient {
         try {
           const orders = await this.getOrders(params.telegramId);
           const sixtySecondsAgo = Date.now() - 60_000;
-          // Procura pedido APPROVED para o mesmo produto nos últimos 60s
-          const recentOrder = orders.find(
-            (o) =>
-              o.status === 'DELIVERED' || o.status === 'PROCESSING'
-              // createdAt pode estar como ISO string
-          );
-          // Filtra por data e produto (productId não está em OrderSummary, usa productName como fallback)
           const recentByTime = orders.find(
             (o) =>
               (o.status === 'DELIVERED' || o.status === 'PROCESSING') &&
               new Date(o.createdAt).getTime() > sixtySecondsAgo
           );
           if (recentByTime) {
-            // Retorna resposta sintética idempotente — bot exibe mensagem de sucesso
             return {
               paymentId: recentByTime.id,
               pixQrCode: '',
@@ -197,7 +207,7 @@ class ApiClient {
             };
           }
         } catch {
-          // Se a consulta de orders falhar, deixa o erro original propagar
+          // fallback falhou, deixa propagar erro original
         }
       }
       throw err;

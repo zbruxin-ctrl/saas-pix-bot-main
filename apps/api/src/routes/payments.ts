@@ -1,12 +1,14 @@
 // Rotas de pagamento (usadas pelo bot)
-// FIX BUG8: GET /products movido para ANTES de GET /:id/status (Express capturava /products como /:id)
-// FIX BUG1: adiciona POST /:id/cancel para que o bot possa gravar CANCELLED no banco
-// FIX STOCK-DISPLAY: /products agora retorna availableStock calculado corretamente
-// WALLET: adiciona POST /deposit e GET /balance
+// FIX BUG8: GET /products movido para ANTES de GET /:id/status
+// FIX BUG1: adiciona POST /:id/cancel
+// FIX STOCK-DISPLAY: /products retorna availableStock calculado corretamente
+// WALLET: POST /deposit e GET /balance
 // SORT: /products ordena por sortOrder, depois createdAt
-// OPT #5 v2: /products usa 1 groupBy para todos os COUNTs (elimina N queries separadas)
-// OPT #11: /balance resolve com include em 1 query ao invés de 2 sequenciais
-// FEATURE: GET /orders?telegramId=xxx — histórico de pedidos do usuário para o bot
+// OPT #5 v2: /products usa 1 groupBy para todos os COUNTs
+// OPT #11: /balance resolve com include em 1 query
+// FEATURE: GET /orders?telegramId=xxx
+// FEAT-MAINT: GET /bot-config expe maintenance_mode + maintenance_message para o bot
+//   POST /create e POST /deposit retornam 503 quando maintenance_mode=true
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -15,6 +17,7 @@ import { paymentRateLimit } from '../middleware/rateLimit';
 import { requireBotSecret } from '../middleware/auth';
 import { logger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
+import { getSetting } from './admin/settings';
 
 export const paymentsRouter = Router();
 
@@ -33,7 +36,37 @@ const createDepositSchema = z.object({
   username: z.string().optional(),
 });
 
-// ─── Rotas estáticas PRIMEIRO (antes de qualquer /:param) ─────────────────────
+// ─── Helper: verifica modo manutenção ────────────────────────────────────────
+async function isMaintenanceActive(): Promise<{ active: boolean; message: string }> {
+  const [mode, msg] = await Promise.all([
+    getSetting('maintenance_mode'),
+    getSetting('maintenance_message'),
+  ]);
+  return { active: mode === 'true', message: msg };
+}
+
+// ─── Rotas estáticas PRIMEIRO ─────────────────────────────────────────────────
+
+// GET /api/payments/bot-config — consumido pelo bot para checar manutenção
+paymentsRouter.get(
+  '/bot-config',
+  requireBotSecret,
+  async (_req: Request, res: Response) => {
+    try {
+      const [maintenanceMode, maintenanceMessage] = await Promise.all([
+        getSetting('maintenance_mode'),
+        getSetting('maintenance_message'),
+      ]);
+      res.json({
+        success: true,
+        data: { maintenanceMode: maintenanceMode === 'true', maintenanceMessage },
+      });
+    } catch (err) {
+      logger.error('[bot-config] Erro:', err);
+      res.json({ success: true, data: { maintenanceMode: false, maintenanceMessage: '' } });
+    }
+  }
+);
 
 // POST /api/payments/create
 paymentsRouter.post(
@@ -41,6 +74,11 @@ paymentsRouter.post(
   requireBotSecret,
   paymentRateLimit,
   async (req: Request, res: Response) => {
+    const { active, message } = await isMaintenanceActive();
+    if (active) {
+      res.status(503).json({ success: false, error: message || 'Estamos em manutenção. Voltamos em breve!' });
+      return;
+    }
     const data = createPaymentSchema.parse(req.body);
     const result = await paymentService.createPayment(data as Parameters<typeof paymentService.createPayment>[0]);
     logger.info(`Pagamento criado via API: ${result.paymentId}`);
@@ -54,6 +92,11 @@ paymentsRouter.post(
   requireBotSecret,
   paymentRateLimit,
   async (req: Request, res: Response) => {
+    const { active, message } = await isMaintenanceActive();
+    if (active) {
+      res.status(503).json({ success: false, error: message || 'Estamos em manutenção. Voltamos em breve!' });
+      return;
+    }
     const data = createDepositSchema.parse(req.body);
     const result = await paymentService.createDepositPayment(data);
     logger.info(`[Deposit] PIX de depósito criado via API: ${result.paymentId}`);
@@ -62,7 +105,6 @@ paymentsRouter.post(
 );
 
 // GET /api/payments/balance?telegramId=xxx
-// OPT #11: 1 query com include ao invés de findUnique + findMany sequenciais
 paymentsRouter.get(
   '/balance',
   requireBotSecret,
@@ -113,14 +155,10 @@ paymentsRouter.get(
 );
 
 // GET /api/payments/products
-// OPT #5 v2: 1 groupBy para buscar todos os COUNTs de stock disponível de uma vez,
-//            ao invés de N prisma.stockItem.count separados (elimina N+1 real)
-// IMPORTANTE: deve ficar ANTES de GET /:id/status
 paymentsRouter.get(
   '/products',
   requireBotSecret,
   async (_req: Request, res: Response) => {
-    // Busca produtos e contagem de stock disponível em PARALELO
     const [products, stockCounts] = await Promise.all([
       prisma.product.findMany({
         where: { isActive: true },
@@ -137,7 +175,6 @@ paymentsRouter.get(
         },
         orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
       }),
-      // 1 query de groupBy substitui N queries de count separadas
       prisma.stockItem.groupBy({
         by: ['productId'],
         where: { status: StockItemStatus.AVAILABLE },
@@ -145,7 +182,6 @@ paymentsRouter.get(
       }),
     ]);
 
-    // Monta mapa produtoId → qtd disponível para lookup O(1)
     const stockMap = new Map<string, number>();
     for (const s of stockCounts) {
       stockMap.set(s.productId, s._count.id);
@@ -153,16 +189,13 @@ paymentsRouter.get(
 
     const productsWithStock = products.map((p) => {
       let availableStock: number | null;
-
       if (p._count.stockItems > 0) {
-        // Usa o mapa: 0 se não apareceu no groupBy (nenhum AVAILABLE)
         availableStock = stockMap.get(p.id) ?? 0;
       } else if (p.stock !== null) {
         availableStock = p.stock;
       } else {
         availableStock = null;
       }
-
       return {
         id: p.id,
         name: p.name,
@@ -184,8 +217,6 @@ paymentsRouter.get(
 );
 
 // GET /api/payments/orders?telegramId=xxx
-// Retorna os últimos 20 pedidos do usuário para o comando /meus_pedidos do bot.
-// Rota estática — deve ficar ANTES de /:id/status e /:id/cancel.
 paymentsRouter.get(
   '/orders',
   requireBotSecret,
@@ -216,7 +247,7 @@ paymentsRouter.get(
         createdAt: true,
         deliveredAt: true,
         product: { select: { name: true } },
-        payment: { select: { amount: true } },
+        payment: { select: { amount: true, paymentMethod: true } },
       },
     });
 
@@ -229,6 +260,7 @@ paymentsRouter.get(
         deliveredAt: o.deliveredAt ? o.deliveredAt.toISOString() : null,
         productName: o.product?.name ?? 'Produto',
         amount: o.payment ? Number(o.payment.amount) : null,
+        paymentMethod: o.payment?.paymentMethod ?? null,
       })),
     });
   }
