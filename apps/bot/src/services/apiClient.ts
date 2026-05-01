@@ -1,5 +1,5 @@
 // Cliente HTTP para comunicacao do bot com a API interna
-// PERF #1: timeout reduzido para 8s
+// PERF #1: timeout reduzido para 8s (leituras)
 // PERF #2: cache global de produtos TTL 30s
 // PERF #4: retry automatico 1x em timeout/network error
 // PERF #5: cache de saldo por usuario TTL 15s
@@ -7,11 +7,11 @@
 // FEATURE: getOrders(telegramId)
 // FIX-B17: createPayment distingue erro real de idempotencia
 // FEAT-MAINT: getBotConfig() busca maintenance_mode + maintenance_message
-//   com cache em memoria TTL 10s
+//   com cache em memoria TTL 30s
 // FEAT-BLOCKED: getBotConfig(telegramId) tambem retorna isBlocked do usuario
-//   Cache invalidado apos cada chamada com telegramId diferente
 // SEC FIX #6: getPaymentStatus e cancelPayment agora enviam telegramId
-//   para que a API valide ownership antes de retornar/cancelar
+// PERF #7: timeout por operacao — createPayment/createDeposit usam 25s
+//   (Neon cold start + chamada Mercado Pago podem exceder 8s facilmente)
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
 import type {
@@ -22,6 +22,8 @@ import type {
   ApiResponse,
   PaymentMethod,
 } from '@saas-pix/shared';
+
+// ─── Caches ──────────────────────────────────────────────────────────────────
 
 interface ProductCache {
   products: ProductDTO[];
@@ -45,13 +47,12 @@ export function invalidateBalanceCache(telegramId: string): void {
   balanceCache.delete(telegramId);
 }
 
-// FEAT-MAINT + FEAT-BLOCKED: cache do bot-config por telegramId, TTL 30s em producao
 interface BotConfigCache {
   data: { maintenanceMode: boolean; maintenanceMessage: string; isBlocked: boolean };
   expiresAt: number;
 }
 const botConfigCache = new Map<string, BotConfigCache>();
-const BOT_CONFIG_CACHE_TTL = 30_000; // FIX #4: aumentado de 10s para 30s
+const BOT_CONFIG_CACHE_TTL = 30_000;
 
 export function invalidateBotConfigCache(telegramId?: string): void {
   if (telegramId) {
@@ -61,6 +62,8 @@ export function invalidateBotConfigCache(telegramId?: string): void {
     botConfigCache.clear();
   }
 }
+
+// ─── Tipos ───────────────────────────────────────────────────────────────────
 
 export interface OrderSummary {
   id: string;
@@ -79,40 +82,45 @@ class ApiHttpError extends Error {
   }
 }
 
+// ─── ApiClient ───────────────────────────────────────────────────────────────
+
+const BASE_HEADERS = (secret: string | undefined) => ({
+  'Content-Type': 'application/json',
+  'x-bot-secret': secret,
+});
+
 class ApiClient {
+  /** Cliente para leituras rápidas: 8s */
   private client: AxiosInstance;
+  /** Cliente para operações lentas (Neon cold start + MP): 25s */
+  private slowClient: AxiosInstance;
 
   constructor() {
-    this.client = axios.create({
+    const baseConfig = {
       baseURL: env.API_URL,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-bot-secret': env.TELEGRAM_BOT_SECRET,
-      },
-      timeout: 8000,
-    });
+      headers: BASE_HEADERS(env.TELEGRAM_BOT_SECRET),
+    };
 
-    this.client.interceptors.response.use(
-      (r) => r,
-      (error) => {
-        const msg = error.response?.data?.error || error.message;
-        const status = error.response?.status ?? 0;
-        throw new ApiHttpError(msg, status);
-      }
-    );
+    this.client = axios.create({ ...baseConfig, timeout: 8_000 });
+    this.slowClient = axios.create({ ...baseConfig, timeout: 25_000 });
+
+    const errorInterceptor = (error: unknown) => {
+      const axiosErr = error as AxiosError<{ error?: string }>;
+      const msg = axiosErr.response?.data?.error || (error instanceof Error ? error.message : 'Erro desconhecido');
+      const status = axiosErr.response?.status ?? 0;
+      throw new ApiHttpError(msg, status);
+    };
+
+    this.client.interceptors.response.use((r) => r, errorInterceptor);
+    this.slowClient.interceptors.response.use((r) => r, errorInterceptor);
   }
 
+  /** Retry para leituras rápidas (300ms delay) */
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '';
-      const isRetryable =
-        msg.toLowerCase().includes('timeout') ||
-        msg.toLowerCase().includes('econnreset') ||
-        msg.toLowerCase().includes('network error') ||
-        (err instanceof AxiosError && !err.response);
-      if (isRetryable) {
+      if (this.isRetryable(err)) {
         await new Promise((r) => setTimeout(r, 300));
         return await fn();
       }
@@ -120,15 +128,38 @@ class ApiClient {
     }
   }
 
+  /** Retry para operações lentas (800ms delay, mais tempo para recuperar) */
+  private async withRetrySlowClient<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (err) {
+      if (this.isRetryable(err)) {
+        await new Promise((r) => setTimeout(r, 800));
+        return await fn();
+      }
+      throw err;
+    }
+  }
+
+  private isRetryable(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message.toLowerCase() : '';
+    return (
+      msg.includes('timeout') ||
+      msg.includes('econnreset') ||
+      msg.includes('network error') ||
+      (err instanceof AxiosError && !err.response)
+    );
+  }
+
+  // ─── Métodos de leitura (timeout 8s) ──────────────────────────────────────
+
   async getBotConfig(
     telegramId?: string
   ): Promise<{ maintenanceMode: boolean; maintenanceMessage: string; isBlocked: boolean }> {
     const cacheKey = telegramId ?? '__global__';
     const now = Date.now();
     const cached = botConfigCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) {
-      return cached.data;
-    }
+    if (cached && cached.expiresAt > now) return cached.data;
     try {
       const qs = telegramId ? `?telegramId=${encodeURIComponent(telegramId)}` : '';
       const { data } = await this.withRetry(() =>
@@ -146,9 +177,7 @@ class ApiClient {
 
   async getProducts(): Promise<ProductDTO[]> {
     const now = Date.now();
-    if (productCache && productCache.expiresAt > now) {
-      return productCache.products;
-    }
+    if (productCache && productCache.expiresAt > now) return productCache.products;
     const { data } = await this.withRetry(() =>
       this.client.get<ApiResponse<ProductDTO[]>>('/api/payments/products')
     );
@@ -159,9 +188,7 @@ class ApiClient {
   async getBalance(telegramId: string): Promise<WalletBalanceResponse> {
     const now = Date.now();
     const cached = balanceCache.get(telegramId);
-    if (cached && cached.expiresAt > now) {
-      return cached.data;
-    }
+    if (cached && cached.expiresAt > now) return cached.data;
     const { data } = await this.withRetry(() =>
       this.client.get<ApiResponse<WalletBalanceResponse>>(
         `/api/payments/balance?telegramId=${encodeURIComponent(telegramId)}`
@@ -180,6 +207,33 @@ class ApiClient {
     return data.data ?? [];
   }
 
+  async getPaymentStatus(
+    paymentId: string,
+    telegramId: string
+  ): Promise<{ status: string; paymentId: string }> {
+    const { data } = await this.withRetry(() =>
+      this.client.get<ApiResponse<{ status: string; paymentId: string }>>(
+        `/api/payments/${paymentId}/status?telegramId=${encodeURIComponent(telegramId)}`
+      )
+    );
+    return data.data!;
+  }
+
+  async cancelPayment(
+    paymentId: string,
+    telegramId: string
+  ): Promise<{ cancelled: boolean; message: string }> {
+    const { data } = await this.withRetry(() =>
+      this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
+        `/api/payments/${paymentId}/cancel`,
+        { telegramId }
+      )
+    );
+    return data.data!;
+  }
+
+  // ─── Operações lentas (timeout 25s) ───────────────────────────────────────
+
   async createPayment(params: {
     telegramId: string;
     productId: string;
@@ -189,8 +243,8 @@ class ApiClient {
   }): Promise<CreatePaymentResponse> {
     invalidateBalanceCache(params.telegramId);
     try {
-      const { data } = await this.withRetry(() =>
-        this.client.post<ApiResponse<CreatePaymentResponse>>('/api/payments/create', params)
+      const { data } = await this.withRetrySlowClient(() =>
+        this.slowClient.post<ApiResponse<CreatePaymentResponse>>('/api/payments/create', params)
       );
       return data.data!;
     } catch (err) {
@@ -222,7 +276,7 @@ class ApiClient {
             };
           }
         } catch {
-          // fallback falhou
+          // fallback falhou — deixa o erro original subir
         }
       }
       throw err;
@@ -236,40 +290,13 @@ class ApiClient {
     username?: string
   ): Promise<CreateDepositResponse> {
     invalidateBalanceCache(telegramId);
-    const { data } = await this.withRetry(() =>
-      this.client.post<ApiResponse<CreateDepositResponse>>('/api/payments/deposit', {
+    const { data } = await this.withRetrySlowClient(() =>
+      this.slowClient.post<ApiResponse<CreateDepositResponse>>('/api/payments/deposit', {
         telegramId,
         amount,
         firstName,
         username,
       })
-    );
-    return data.data!;
-  }
-
-  // SEC FIX #6: envia telegramId na query para que a API valide ownership
-  async getPaymentStatus(
-    paymentId: string,
-    telegramId: string
-  ): Promise<{ status: string; paymentId: string }> {
-    const { data } = await this.withRetry(() =>
-      this.client.get<ApiResponse<{ status: string; paymentId: string }>>(
-        `/api/payments/${paymentId}/status?telegramId=${encodeURIComponent(telegramId)}`
-      )
-    );
-    return data.data!;
-  }
-
-  // SEC FIX #6: envia telegramId no body para que a API valide ownership
-  async cancelPayment(
-    paymentId: string,
-    telegramId: string
-  ): Promise<{ cancelled: boolean; message: string }> {
-    const { data } = await this.withRetry(() =>
-      this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
-        `/api/payments/${paymentId}/cancel`,
-        { telegramId }
-      )
     );
     return data.data!;
   }
