@@ -1,14 +1,21 @@
 /**
  * Camada de abstração para Redis via Upstash (HTTP — sem Docker).
- * Em desenvolvimento sem as vars UPSTASH_*, usa um Map em memória como fallback.
  *
- * Upstash oferece plano gratuito em: https://upstash.com
- * Após criar um banco Redis, copie UPSTASH_REDIS_REST_URL e UPSTASH_REDIS_REST_TOKEN
- * para o .env e para as variáveis de ambiente do Railway.
+ * - PRODUÇÃO: requer UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN.
+ *   Sem essas vars, o processo lança erro fatal e não sobe.
+ *   Isso garante que sessões e timers de PIX (FIX #1) nunca sejam perdidos
+ *   silenciosamente por falta de Redis em produção.
+ *
+ * - DESENVOLVIMENTO: usa Map em memória como fallback com aviso explícito.
+ *   Dados NÃO sobrevivem a restarts em dev — comportamento esperado.
+ *
+ * Upstash plano gratuito: https://console.upstash.com
+ * Após criar um banco Redis, copie UPSTASH_REDIS_REST_URL e
+ * UPSTASH_REDIS_REST_TOKEN para o .env e para as variáveis do Railway.
  */
 import { env } from '../config/env';
 
-interface RedisAdapter {
+export interface RedisAdapter {
   get(key: string): Promise<string | null>;
   set(key: string, value: string, exSeconds?: number): Promise<void>;
   /** SET NX (set if not exists). Retorna true se inseriu, false se já existia. */
@@ -101,14 +108,30 @@ class InMemoryRedis implements RedisAdapter {
   }
 }
 
-// ─── Exporta a instância correta ─────────────────────────────────────────────
+// ─── Factory: escolhe o adaptador correto ────────────────────────────────────
 
 function createRedis(): RedisAdapter {
-  if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
-    console.log('[redis] Usando Upstash Redis');
-    return new UpstashRedis(env.UPSTASH_REDIS_REST_URL, env.UPSTASH_REDIS_REST_TOKEN);
+  const { UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, NODE_ENV } = env;
+
+  if (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN) {
+    console.log('[redis] ✅ Usando Upstash Redis (HTTP)');
+    return new UpstashRedis(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN);
   }
-  console.warn('[redis] ⚠️  Upstash não configurado — usando fallback em memória (não use em produção!)');
+
+  if (NODE_ENV === 'production') {
+    // env.ts já deveria ter bloqueado, mas esta é a segunda linha de defesa
+    throw new Error(
+      '[redis] FATAL: Upstash não configurado em produção.\n' +
+      'Configure UPSTASH_REDIS_REST_URL e UPSTASH_REDIS_REST_TOKEN no Railway.\n' +
+      'Sem Redis, sessões e timers de PIX serão perdidos a cada restart.'
+    );
+  }
+
+  console.warn(
+    '[redis] ⚠️  Upstash não configurado — usando fallback em MEMÓRIA.\n' +
+    '         Sessões e timers de PIX serão perdidos em restarts.\n' +
+    '         Configure UPSTASH_REDIS_REST_URL e UPSTASH_REDIS_REST_TOKEN para usar Redis.'
+  );
   return new InMemoryRedis();
 }
 
