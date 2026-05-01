@@ -10,7 +10,7 @@ import { apiClient } from '../services/apiClient';
 import { env } from '../config/env';
 import type { OrderSummary } from '../services/apiClient';
 
-// ─── Home ────────────────────────────────────────────────────────────────────
+// ─── Home ───────────────────────────────────────────────────────────────────
 
 export async function showHome(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
@@ -86,7 +86,7 @@ export async function showProducts(ctx: Context): Promise<void> {
 export async function showOrders(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   try {
-    const orders = await apiClient.getOrders(String(userId), 10);
+    const orders = await apiClient.getOrders(String(userId));
 
     if (!orders || orders.length === 0) {
       await editOrReply(
@@ -111,7 +111,7 @@ export async function showOrders(ctx: Context): Promise<void> {
       CANCELLED: '🚫',
     };
 
-    const lines = orders.map((o: OrderSummary) => {
+    const lines = orders.slice(0, 10).map((o: OrderSummary) => {
       const emoji = statusEmoji[o.status] ?? '📦';
       const date = new Date(o.createdAt).toLocaleDateString('pt-BR', {
         day: '2-digit',
@@ -154,7 +154,9 @@ export async function showHelp(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   const chatId = ctx.chat?.id;
   const session = await getSession(userId);
-  const supportUrl = `https://wa.me/${encodeURIComponent(env.SUPPORT_PHONE)}`;
+  const supportUrl = env.SUPPORT_PHONE
+    ? `https://wa.me/${encodeURIComponent(env.SUPPORT_PHONE)}`
+    : '#';
 
   const text =
     `❓ <b>Central de Ajuda</b>\n\n` +
@@ -173,10 +175,14 @@ export async function showHelp(ctx: Context): Promise<void> {
     `<b>Problemas com pagamento?</b>\n` +
     `Entre em contato informando o ID do pagamento.`;
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.url('📞 Contatar Suporte', supportUrl)],
-    [Markup.button.callback('◀️ Voltar', 'show_home')],
-  ]);
+  const buttons = env.SUPPORT_PHONE
+    ? [
+        [Markup.button.url('📞 Contatar Suporte', supportUrl)],
+        [Markup.button.callback('◀️ Voltar', 'show_home')],
+      ]
+    : [[Markup.button.callback('◀️ Voltar', 'show_home')]];
+
+  const keyboard = Markup.inlineKeyboard(buttons);
 
   if (session.mainMessageId && chatId) {
     try {
@@ -201,7 +207,22 @@ export async function showHelp(ctx: Context): Promise<void> {
 // ─── Conta bloqueada ─────────────────────────────────────────────────────────
 
 export async function showBlockedMessage(ctx: Context): Promise<void> {
-  const supportUrl = `https://wa.me/${encodeURIComponent(env.SUPPORT_PHONE)}`;
+  const supportUrl = env.SUPPORT_PHONE
+    ? `https://wa.me/${encodeURIComponent(env.SUPPORT_PHONE)}`
+    : '#';
+
+  const buttons = env.SUPPORT_PHONE
+    ? [
+        [Markup.button.url('📞 Falar com Suporte', supportUrl)],
+        [Markup.button.callback('💰 Ver Saldo', 'show_balance')],
+        [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+        [Markup.button.callback('❓ Ajuda', 'show_help')],
+      ]
+    : [
+        [Markup.button.callback('💰 Ver Saldo', 'show_balance')],
+        [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+        [Markup.button.callback('❓ Ajuda', 'show_help')],
+      ];
 
   await editOrReply(
     ctx,
@@ -214,12 +235,7 @@ export async function showBlockedMessage(ctx: Context): Promise<void> {
       `Se acredita que isso é um erro, entre em contato com o suporte.`,
     {
       parse_mode: 'HTML',
-      reply_markup: Markup.inlineKeyboard([
-        [Markup.button.url('📞 Falar com Suporte', supportUrl)],
-        [Markup.button.callback('💰 Ver Saldo', 'show_balance')],
-        [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
-        [Markup.button.callback('❓ Ajuda', 'show_help')],
-      ]).reply_markup,
+      reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
     }
   );
 }

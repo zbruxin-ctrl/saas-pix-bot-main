@@ -27,6 +27,9 @@ const EnvSchema = z
     API_BASE_URL: z.string().url().optional(),
     API_SECRET: z.string().optional(),
 
+    // Suporte: número do WhatsApp para contato (ex: 5511999999999)
+    SUPPORT_PHONE: z.string().default(''),
+
     // Redis (Upstash) — OBRIGATÓRIO em produção
     UPSTASH_REDIS_REST_URL: requiredInProd(z.string().url()),
     UPSTASH_REDIS_REST_TOKEN: requiredInProd(z.string()),
