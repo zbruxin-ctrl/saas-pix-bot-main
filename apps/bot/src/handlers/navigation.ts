@@ -17,18 +17,8 @@ export async function showHome(ctx: Context): Promise<void> {
   const session = await getSession(userId);
   const firstName = escapeMd(ctx.from?.first_name || session.firstName || 'visitante');
 
-  let configLine = '';
-  try {
-    const config = await apiClient.getBotConfig();
-    if (config?.welcomeMessage) {
-      configLine = `\n${escapeMd(config.welcomeMessage)}\n`;
-    }
-  } catch {
-    // sem config customizada — usa padrão
-  }
-
   const text =
-    `👋 *Olá, ${firstName}\!*${configLine}\n` +
+    `👋 *Olá, ${firstName}\!*\n\n` +
     `Escolha uma opção abaixo para continuar:`;
 
   await editOrReply(ctx, text, {
@@ -48,7 +38,7 @@ export async function showProducts(ctx: Context): Promise<void> {
     const products = await apiClient.getProducts();
 
     if (!products || products.length === 0) {
-      await editOrReply(ctx, '📭 *Nenhum produto disponível no momento\.*\n\nVolte em breve\!', {
+      await editOrReply(ctx, '🔭 *Nenhum produto disponível no momento\.*\n\nVolte em breve\!', {
         reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
       });
       return;
@@ -80,7 +70,7 @@ export async function showOrders(ctx: Context): Promise<void> {
     const orders = await apiClient.getOrders(String(userId));
 
     if (!orders || orders.length === 0) {
-      await editOrReply(ctx, '📭 *Você ainda não tem pedidos\.*\n\nFaça sua primeira compra\!', {
+      await editOrReply(ctx, '🔭 *Você ainda não tem pedidos\.*\n\nFaça sua primeira compra\!', {
         reply_markup: Markup.inlineKeyboard([
           [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
           [Markup.button.callback('◀️ Voltar', 'show_home')],
@@ -121,16 +111,6 @@ export async function showOrders(ctx: Context): Promise<void> {
 // ─── Ajuda ───────────────────────────────────────────────────────────────────
 
 export async function showHelp(ctx: Context): Promise<void> {
-  let supportLine = '';
-  try {
-    const config = await apiClient.getBotConfig();
-    if (config?.supportContact) {
-      supportLine = `\n\n📞 *Suporte:* ${escapeMd(config.supportContact)}`;
-    }
-  } catch {
-    // sem config
-  }
-
   await editOrReply(
     ctx,
     `*❓ Central de Ajuda*\n\n` +
@@ -140,8 +120,7 @@ export async function showHelp(ctx: Context): Promise<void> {
       `3\. Pague e receba seu produto automaticamente\n\n` +
       `*Problemas?*\n` +
       `• PIX não aprovado? Aguarde até 2 minutos e verifique novamente\.\n` +
-      `• Produto não entregue? Entre em contato com o suporte\.` +
-      `${supportLine}`,
+      `• Produto não entregue? Entre em contato com o suporte\.`,
     {
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback('◀️ Voltar', 'show_home')]]).reply_markup,
     }
