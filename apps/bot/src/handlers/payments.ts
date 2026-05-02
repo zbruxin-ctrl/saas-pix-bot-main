@@ -17,6 +17,8 @@
  *          timeout de 30s do Telegram que silencia o bot.
  * FEAT-PRICING: tela de cupom/referral antes de gerar PIX; exibe desconto no resumo.
  * FIX-TS2352: double cast via unknown para acessar campos opcionais de CreatePaymentResponse
+ * FIX-COUPON-DISCOUNT: aplica pendingCouponDiscount ao preço exibido na tela de método;
+ *                      oculta botão de cupom quando já existe cupom aplicado.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -57,16 +59,27 @@ export async function showPaymentMethodScreen(
     }
   }
 
-  const price = Number(product.price);
+  // FIX-COUPON-DISCOUNT: aplica desconto do cupom ao preço exibido
+  const session = await getSession(userId);
+  const rawPrice = Number(product.price);
+  const couponDiscount = session.pendingCouponDiscount ?? 0;
+  const price = Math.max(0, rawPrice - couponDiscount);
+
   const balanceStr = balance.toFixed(2);
   const descLine = product.description
     ? `\n📝 <i>${escapeHtml(product.description)}</i>\n`
     : '';
 
+  const couponLine = session.pendingCoupon
+    ? `🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${escapeHtml(couponDiscount.toFixed(2))})</b>\n` +
+      `💵 <b>Total com desconto:</b> R$ ${escapeHtml(price.toFixed(2))}\n`
+    : '';
+
   const confirmMessage =
     `📦 <b>${escapeHtml(product.name)}</b>${descLine}\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
-    `💰 <b>Valor:</b> R$ ${escapeHtml(price.toFixed(2))}\n` +
+    `💰 <b>Valor:</b> R$ ${escapeHtml(rawPrice.toFixed(2))}\n` +
+    couponLine +
     `🏦 <b>Seu saldo:</b> R$ ${escapeHtml(balanceStr)}\n\n` +
     `<b>Como deseja pagar?</b>`;
 
@@ -92,7 +105,11 @@ export async function showPaymentMethodScreen(
     ]);
   }
 
-  buttons.push([Markup.button.callback('🏷️ Tenho um cupom', `coupon_input_${product.id}`)]);
+  // Oculta botão de cupom se já existe um cupom aplicado na sessão
+  if (!session.pendingCoupon) {
+    buttons.push([Markup.button.callback('🏷️ Tenho um cupom', `coupon_input_${product.id}`)]);
+  }
+
   buttons.push([Markup.button.callback('◀️ Voltar', 'show_products')]);
 
   await editOrReply(ctx, confirmMessage, {
@@ -153,13 +170,17 @@ export async function executePayment(
   try {
     await editOrReply(ctx, '⏳ Processando sua compra, aguarde...', { parse_mode: 'HTML' });
 
+    // Usa cupom da sessão se não foi passado explicitamente
+    const sessionForCoupon = await getSession(userId);
+    const effectiveCoupon = couponCode ?? sessionForCoupon.pendingCoupon ?? undefined;
+
     const payment = await apiClient.createPayment({
       telegramId: String(userId),
       productId,
       firstName: ctx.from?.first_name,
       username: ctx.from?.username,
       paymentMethod,
-      ...(couponCode ? { couponCode } : {}),
+      ...(effectiveCoupon ? { couponCode: effectiveCoupon } : {}),
       ...(referralCode ? { referralCode } : {}),
     } as Parameters<typeof apiClient.createPayment>[0]);
 
@@ -169,6 +190,7 @@ export async function executePayment(
     session.pixExpiresAt = payment.expiresAt;
     delete session.pendingProductId;
     delete session.pendingCoupon;
+    delete session.pendingCouponDiscount;
     await saveSession(userId, session);
 
     const paymentAny = payment as unknown as Record<string, unknown>;

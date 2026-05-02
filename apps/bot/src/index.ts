@@ -9,6 +9,7 @@
  * FIX-COUPON: remove .catch() silencioso na validação de cupom; corrige ordem
  *             do guard result.data (deve vir ANTES do saveSession); corrige
  *             typos "cupão" → "cupom".
+ * FIX-COUPON-DISCOUNT: salva discountAmount na sessão para uso na tela de pagamento.
  */
 
 import { initSentry, captureError } from './config/sentry';
@@ -179,6 +180,7 @@ bot.action(/^skip_coupon_(.+)$/, async (ctx) => {
     const productId = ctx.match[1];
     const session = await getSession(ctx.from!.id);
     delete session.pendingCoupon;
+    delete session.pendingCouponDiscount;
     session.step = 'selecting_product';
     await saveSession(ctx.from!.id, session);
     // Volta para tela de método de pagamento sem cupom
@@ -321,8 +323,9 @@ bot.on(message('text'), async (ctx) => {
 
       // Salva na sessão somente após validar tudo
       session.pendingCoupon = couponCode;
+      session.pendingCouponDiscount = d.discountAmount; // FIX-COUPON-DISCOUNT
+      session.mainMessageId = undefined;
       session.step = 'selecting_product';
-      session.mainMessageId = undefined; // 👈 ADICIONAR ISSO
       await saveSession(userId, session);
 
       await ctx.reply(

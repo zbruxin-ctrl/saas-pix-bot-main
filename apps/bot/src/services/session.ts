@@ -7,6 +7,7 @@
  * FIX #1: campo pixExpiresAt adicionado — permite re-agendar o timer de
  *         expiração do PIX ao receber /start após um restart do bot.
  * FIX-BUILD: adiciona 'awaiting_coupon' ao step + pendingProductId/pendingCoupon à interface
+ * FIX-COUPON-DISCOUNT: adiciona pendingCouponDiscount para persistir valor de desconto entre telas
  */
 import { redis } from './redis';
 
@@ -25,6 +26,8 @@ export interface UserSession {
   pendingProductId?: string;
   /** Cupom digitado pelo usuário, antes de confirmar pagamento */
   pendingCoupon?: string | null;
+  /** Valor do desconto do cupom (em reais) para exibir na tela de pagamento */
+  pendingCouponDiscount?: number;
   /** Armazena produtos em cache local na sessão para evitar re-fetch */
   products?: never;
 }
