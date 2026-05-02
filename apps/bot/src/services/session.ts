@@ -10,6 +10,9 @@
  * FEAT-COPYPASTE-CHECK: adiciona pixQrCodeText para reenviar copia e cola ao verificar pagamento
  * FIX-SESSION-TTL: TTL dinâmico por estado — sessões com PIX pendente expiram
  *   em 35min (margem sobre os 30min do PIX) em vez de ficar 1h no Redis.
+ * AUDIT #14: getSession renova TTL do Redis (via saveSession) ao carregar sessão
+ *   existente — sem isso, sessões de usuários ativos podiam expirar no Redis se
+ *   o caller não chamasse saveSession ao final da operação.
  */
 import { redis } from './redis';
 
@@ -61,6 +64,10 @@ export async function getSession(userId: number): Promise<UserSession> {
   if (raw) {
     const session: UserSession = JSON.parse(raw);
     session.lastActivityAt = Date.now();
+    // AUDIT #14: renova TTL no Redis a cada leitura de sessão existente.
+    // Sem isso, sessões de usuários ativos podiam expirar se o caller
+    // não fizesse saveSession ao final da operação (ex: leituras somente).
+    await redis.set(sessionKey(userId), JSON.stringify(session), getTTL(session.step));
     return session;
   }
   return { step: 'idle', lastActivityAt: Date.now() };
