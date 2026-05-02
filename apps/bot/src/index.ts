@@ -10,6 +10,8 @@
  *
  * FIX #6: referralCode capturado do startPayload e salvo na sessão — propagado ao createPayment.
  * FIX #7: clearSession sem 3º parâmetro — session.ts lê usedCoupons da sessão atual automaticamente.
+ * FIX ITEM-8: schedulePIXExpiry agendado após geração de PIX de depósito.
+ * FIX ITEM-11: saveSession desnecessário removido de select_product.
  */
 import { Telegraf, Markup } from 'telegraf';
 import type { Context } from 'telegraf';
@@ -173,8 +175,8 @@ bot.action('show_products', async (ctx) => {
 
 async function showBalance(ctx: Context): Promise<void> {
   try {
-    const userId = ctx.from!.id;
-    const data   = await apiClient.getBalance(String(userId));
+    const userId   = ctx.from!.id;
+    const data     = await apiClient.getBalance(String(userId));
 
     const txs: WalletTransactionDTO[] = data.transactions ?? [];
 
@@ -436,13 +438,13 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   try {
     const productId = ctx.match[1];
     const userId    = ctx.from.id;
-    const session   = await getSession(userId);
+    // FIX ITEM-11: sessão lida mas NÃO salva aqui — nenhuma alteração foi feita nela
+    await getSession(userId);
 
     let product: ProductDTO | undefined;
     try {
       const products = await apiClient.getProducts();
       product = products.find((p) => p.id === productId);
-      await saveSession(userId, session);
     } catch (err) {
       console.error('[select_product] erro:', err);
       await ctx.reply('❌ Erro ao buscar produto. Tente novamente.', { parse_mode: 'HTML' });
@@ -666,14 +668,15 @@ bot.on('text', async (ctx) => {
           ctx.from.username
         );
 
-        const qrText  = deposit.pixQrCodeText ?? deposit.pixCopyPaste ?? '';
+        // FIX ITEM-1: pixCopyPaste não existe em CreateDepositResponse — usa apenas pixQrCodeText
+        const qrText  = deposit.pixQrCodeText ?? '';
         const qrImage = deposit.pixQrCode ?? '';
 
         if (qrImage) {
           await ctx.replyWithPhoto(
             { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
             {
-              caption: `💳 *PIX gerado\!*\n\n*Valor:* R\\$ ${String(value.toFixed(2)).replace('.', '\\.')}\n\nEscaneie o QR ou copie o código abaixo:`,
+              caption: `💳 *PIX gerado\\!*\n\n*Valor:* R\\$ ${String(value.toFixed(2)).replace('.', '\\.')}\n\nEscaneie o QR ou copie o código abaixo:`,
               parse_mode: 'MarkdownV2',
               reply_markup: Markup.inlineKeyboard([
                 [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
@@ -694,6 +697,11 @@ bot.on('text', async (ctx) => {
           );
         }
         await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
+
+        // FIX ITEM-8: agenda timer de expiração para o PIX de depósito
+        if (deposit.expiresAt) {
+          await schedulePIXExpiry(ctx, deposit.paymentId, userId, deposit.expiresAt);
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Erro ao gerar depósito';
         await ctx.reply(`❌ ${msg}`, { parse_mode: 'HTML' });
