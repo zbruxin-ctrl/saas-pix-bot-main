@@ -24,6 +24,9 @@
  * FEAT-COPYPASTE-CHECK: salva pixQrCodeText na sessão e reenvia copia e cola
  *                       quando usuário clica em Verificar Pagamento e status é PENDING.
  * FIX-502: mensagem amigável quando API retorna 502 (servidor inicializando).
+ * FIX-SESSION-ORDER: sessão só é persistida com step=awaiting_payment APÓS
+ *                    replyWithPhoto ter sucesso, evitando sessão suja em caso de
+ *                    falha no envio da foto (ex: erro 400 MarkdownV2).
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -189,16 +192,7 @@ export async function executePayment(
       ...(referralCode ? { referralCode } : {}),
     } as Parameters<typeof apiClient.createPayment>[0]);
 
-    const session = await getSession(userId);
-    session.paymentId = payment.paymentId;
-    session.step = 'awaiting_payment';
-    session.pixExpiresAt = payment.expiresAt;
-    session.pixQrCodeText = payment.pixQrCodeText; // FEAT-COPYPASTE-CHECK
-    delete session.pendingProductId;
-    delete session.pendingCoupon;
-    delete session.pendingCouponDiscount;
-    await saveSession(userId, session);
-
+    // ── Pagamento por saldo puro: salva sessão e finaliza ──────────────────
     const paymentAny = payment as unknown as Record<string, unknown>;
 
     if (payment.paidWithBalance) {
@@ -220,10 +214,11 @@ export async function executePayment(
           ]).reply_markup,
         }
       );
-      await clearSession(userId, session.firstName);
+      await clearSession(userId, sessionForCoupon.firstName);
       return;
     }
 
+    // ── Pagamento PIX / Misto: envia QR code primeiro, só então persiste sessão ──
     const expiresAt = new Date(payment.expiresAt);
     const expiresStr = expiresAt.toLocaleTimeString('pt-BR', {
       hour: '2-digit',
@@ -252,12 +247,13 @@ export async function executePayment(
       `📋 *Copia e Cola:*\n\`${escapeMd(payment.pixQrCodeText)}\``;
 
     const chatId = ctx.chat?.id;
-    const updatedSession = await getSession(userId);
-    if (chatId && updatedSession.mainMessageId) {
-      await ctx.telegram.deleteMessage(chatId, updatedSession.mainMessageId).catch(() => {});
-      updatedSession.mainMessageId = undefined;
+    const sessionBeforeSend = await getSession(userId);
+    if (chatId && sessionBeforeSend.mainMessageId) {
+      await ctx.telegram.deleteMessage(chatId, sessionBeforeSend.mainMessageId).catch(() => {});
     }
 
+    // FIX-SESSION-ORDER: envia a foto PRIMEIRO. Se falhar, a sessão NÃO é marcada
+    // como awaiting_payment e o pagamento não fica pendente fantasma no Redis.
     const qrMsg = await ctx.replyWithPhoto(
       { source: qrBuffer },
       {
@@ -270,8 +266,17 @@ export async function executePayment(
       }
     );
 
-    updatedSession.mainMessageId = qrMsg.message_id;
-    await saveSession(userId, updatedSession);
+    // Foto enviada com sucesso — agora é seguro persistir o estado de pagamento
+    const sessionAfterSend = await getSession(userId);
+    sessionAfterSend.paymentId = payment.paymentId;
+    sessionAfterSend.step = 'awaiting_payment';
+    sessionAfterSend.pixExpiresAt = payment.expiresAt;
+    sessionAfterSend.pixQrCodeText = payment.pixQrCodeText;
+    sessionAfterSend.mainMessageId = qrMsg.message_id;
+    delete sessionAfterSend.pendingProductId;
+    delete sessionAfterSend.pendingCoupon;
+    delete sessionAfterSend.pendingCouponDiscount;
+    await saveSession(userId, sessionAfterSend);
 
     const effectiveChatId = chatId ?? userId;
     schedulePIXExpiry(userId, payment.paymentId, effectiveChatId, PIX_TIMEOUT_MS);

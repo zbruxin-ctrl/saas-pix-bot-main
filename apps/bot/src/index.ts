@@ -14,6 +14,9 @@
  *                     tela de método de pagamento sem desconto.
  * FIX-START-BUTTONS: /start com PIX pendente agora envia botões de Verificar/Cancelar.
  * FEAT-COPYPASTE-START: exibe pix copia e cola na mensagem de PIX em andamento.
+ * FIX-START-STALE: /start verifica status do PIX pendente na API antes de bloquear
+ *                  o usuário — sessões fantasmas (geradas por falha no envio da foto)
+ *                  são limpas automaticamente e o menu é exibido normalmente.
  */
 
 import { initSentry, captureError } from './config/sentry';
@@ -24,7 +27,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { env } from './config/env';
 import { apiClient, invalidateProductCache, invalidateBotConfigCache } from './services/apiClient';
-import { getSession, saveSession } from './services/session';
+import { getSession, saveSession, clearSession } from './services/session';
 import type { UserSession } from './services/session';
 import { escapeHtml } from './utils/escape';
 import { markUpdateProcessed } from './services/locks';
@@ -69,7 +72,31 @@ bot.command('start', async (ctx) => {
     }
 
     if (existing.step === 'awaiting_payment' && existing.paymentId) {
-      // FIX #1: re-agenda o timer de expiração usando o tempo restante do Redis
+      // FIX-START-STALE: verifica se o pagamento ainda existe e está realmente
+      // pendente na API. Sessões corrompidas (foto falhou ao ser enviada) ou
+      // expiradas/canceladas são limpas aqui, permitindo uso normal do bot.
+      try {
+        const { status } = await apiClient.getPaymentStatus(
+          existing.paymentId,
+          String(userId)
+        );
+        if (status !== 'PENDING') {
+          // Pagamento já resolvido (APPROVED, CANCELLED, EXPIRED) — limpa sessão
+          await clearSession(userId, existing.firstName);
+          await showHome(ctx);
+          return;
+        }
+      } catch {
+        // Pagamento não encontrado na API ou erro de rede — limpa sessão fantasma
+        console.warn(
+          `[/start] paymentId ${existing.paymentId} não encontrado na API para userId ${userId} — limpando sessão`
+        );
+        await clearSession(userId, existing.firstName);
+        await showHome(ctx);
+        return;
+      }
+
+      // Pagamento realmente PENDING — re-agenda timer e exibe aviso
       if (existing.pixExpiresAt) {
         const remaining = new Date(existing.pixExpiresAt).getTime() - Date.now();
         if (remaining > 0) {
