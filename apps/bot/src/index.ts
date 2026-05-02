@@ -30,6 +30,7 @@ import {
   handleCheckPayment,
   handleCancelPayment,
   showPaymentMethodScreen,
+  showCouponInputScreen,
   schedulePIXExpiry,
 } from './handlers/payments';
 import { handleReferral, showReferralMenu, processReferralStart } from './handlers/referral';
@@ -159,6 +160,37 @@ bot.action('deposit_balance', async (ctx) => {
   }
 });
 
+// ─── Cupom ───────────────────────────────────────────────────────────────────
+bot.action(/^coupon_input_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('🏷️ Cupom...').catch(() => {});
+  try {
+    await showCouponInputScreen(ctx, ctx.match[1]);
+  } catch (err) {
+    captureError(err, { handler: 'coupon_input' });
+  }
+});
+
+bot.action(/^skip_coupon_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('⏭️ Pulando cupom...').catch(() => {});
+  try {
+    const productId = ctx.match[1];
+    const session = await getSession(ctx.from!.id);
+    delete session.pendingCoupon;
+    session.step = 'selecting_product';
+    await saveSession(ctx.from!.id, session);
+    // Volta para tela de método de pagamento sem cupom
+    const products = await apiClient.getProducts();
+    const product = products.find((p) => p.id === productId);
+    if (!product) {
+      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+      return;
+    }
+    await showPaymentMethodScreen(ctx, product);
+  } catch (err) {
+    captureError(err, { handler: 'skip_coupon' });
+  }
+});
+
 // ─── Seleção de produto ───────────────────────────────────────────────────────
 bot.action(/^select_product_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('⏳ Carregando produto...').catch(() => {});
@@ -236,6 +268,54 @@ bot.on(message('text'), async (ctx) => {
 
     if (session.step === 'awaiting_deposit_amount') {
       await handleDepositAmount(ctx, text);
+      return;
+    }
+
+    // Usuário digitou o código do cupão
+    if (session.step === 'awaiting_coupon' && session.pendingProductId) {
+      const productId = session.pendingProductId;
+      const couponCode = text.toUpperCase().trim();
+
+      // Valida o cupão na API antes de prosseguir
+      const { validateCoupon } = await import('./services/couponClient');
+      const products = await apiClient.getProducts();
+      const product = products.find((p) => p.id === productId);
+      const price = product ? Number(product.price) : 0;
+
+      const result = await validateCoupon(couponCode, String(userId), price, productId).catch(() => ({ valid: false, error: 'Erro ao validar cupão.' }));
+
+      if (!result.valid) {
+        await ctx.reply(
+          `❌ <b>${result.error ?? 'Cupão inválido.'}</b>\n\nDigite outro código ou clique em Pular.`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '⏭️ Pular', callback_data: `skip_coupon_${productId}` }],
+                [{ text: '◀️ Voltar', callback_data: `select_product_${productId}` }],
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      // Cupão válido — salva na sessão e vai para tela de método
+      session.pendingCoupon = couponCode;
+      session.step = 'selecting_product';
+      await saveSession(userId, session);
+
+      const d = result.data!;
+      await ctx.reply(
+        `✅ <b>Cupão aplicado!</b>\n\n` +
+        `🏷️ Código: <code>${couponCode}</code>\n` +
+        `💰 Desconto: <b>R$ ${d.discountAmount.toFixed(2)}</b>\n` +
+        `✅ Total com desconto: <b>R$ ${d.finalAmount.toFixed(2)}</b>\n\n` +
+        `Agora escolha como pagar ⬇️`,
+        { parse_mode: 'HTML' }
+      );
+
+      if (product) await showPaymentMethodScreen(ctx, product);
       return;
     }
 
