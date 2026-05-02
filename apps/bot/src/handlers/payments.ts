@@ -21,7 +21,8 @@
  *                      oculta botão de cupom quando já existe cupom aplicado.
  * FIX-MDV2: escapa '!' e demais caracteres reservados do MarkdownV2 na caption do PIX.
  * FEAT-REMOVE-COUPON: botão 🗑️ Remover cupom na tela de método de pagamento.
- * CACHE-BUST: 2026-05-02 — força recompilação deste arquivo pelo tsc.
+ * FEAT-COPYPASTE-CHECK: salva pixQrCodeText na sessão e reenvia copia e cola
+ *                       quando usuário clica em Verificar Pagamento e status é PENDING.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -191,6 +192,7 @@ export async function executePayment(
     session.paymentId = payment.paymentId;
     session.step = 'awaiting_payment';
     session.pixExpiresAt = payment.expiresAt;
+    session.pixQrCodeText = payment.pixQrCodeText; // FEAT-COPYPASTE-CHECK
     delete session.pendingProductId;
     delete session.pendingCoupon;
     delete session.pendingCouponDiscount;
@@ -394,9 +396,30 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
       await clearSession(userId);
     }
 
+    if (status === 'PENDING') {
+      // FEAT-COPYPASTE-CHECK: reenvia copia e cola junto com o status pendente
+      const session = await getSession(userId);
+      const pixText = session.pixQrCodeText;
+
+      const copyPasteBlock = pixText
+        ? `\n\n📋 <b>Copia e Cola:</b>\n<code>${escapeHtml(pixText)}</code>`
+        : '';
+
+      await editOrReply(
+        ctx,
+        `⏳ <b>Pagamento pendente</b>\n\nAinda não identificamos seu pagamento. Se já pagou, aguarde alguns segundos e verifique novamente.${copyPasteBlock}`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Verificar Novamente', `check_payment_${paymentId}`)],
+            [Markup.button.callback('❌ Cancelar', `cancel_payment_${paymentId}`)],
+          ]).reply_markup,
+        }
+      );
+      return;
+    }
+
     const statusMessages: Record<string, string> = {
-      PENDING:
-        '⏳ <b>Pagamento pendente</b>\n\nAinda não identificamos seu pagamento. Se já pagou, aguarde alguns segundos e verifique novamente.',
       APPROVED:
         '✅ <b>Pagamento aprovado!</b>\n\nSeu acesso está sendo liberado. Você receberá uma mensagem em instantes.',
       REJECTED:
@@ -409,21 +432,13 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
     await editOrReply(
       ctx,
       msg,
-      status === 'PENDING'
-        ? {
-            parse_mode: 'HTML',
-            reply_markup: Markup.inlineKeyboard([
-              [Markup.button.callback('🔄 Verificar Novamente', `check_payment_${paymentId}`)],
-              [Markup.button.callback('❌ Cancelar', `cancel_payment_${paymentId}`)],
-            ]).reply_markup,
-          }
-        : {
-            parse_mode: 'HTML',
-            reply_markup: Markup.inlineKeyboard([
-              [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
-              [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
-            ]).reply_markup,
-          }
+      {
+        parse_mode: 'HTML',
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
+          [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+        ]).reply_markup,
+      }
     );
   } catch (err) {
     console.error('[handleCheckPayment] Erro ao verificar pagamento:', err);
