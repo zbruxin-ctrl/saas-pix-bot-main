@@ -27,6 +27,10 @@
  * FIX-SESSION-ORDER: sessão só é persistida com step=awaiting_payment APÓS
  *                    replyWithPhoto ter sucesso, evitando sessão suja em caso de
  *                    falha no envio da foto (ex: erro 400 MarkdownV2).
+ * FIX-CHECK-SESSION-ORDER: handleCheckPayment carrega sessão uma vez no início;
+ *                          clearSession sempre recebe firstName; clearSession
+ *                          movida para após editOrReply nos status terminais.
+ * FIX-ESCAPEHTML-NUMERIC: escapeHtml() removido de valores numéricos puros.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -48,7 +52,7 @@ export function initPaymentHandlers(bot: Telegraf): void {
   _bot = bot;
 }
 
-// ─── Tela de seleção de método de pagamento ──────────────────────────────────
+// ─── Tela de seleção de método de pagamento ────────────────────────────────────────
 
 export async function showPaymentMethodScreen(
   ctx: Context,
@@ -73,22 +77,23 @@ export async function showPaymentMethodScreen(
   const couponDiscount = session.pendingCouponDiscount ?? 0;
   const price = Math.max(0, rawPrice - couponDiscount);
 
+  // FIX-ESCAPEHTML-NUMERIC: valores numéricos não precisam de escapeHtml
   const balanceStr = balance.toFixed(2);
   const descLine = product.description
     ? `\n📝 <i>${escapeHtml(product.description)}</i>\n`
     : '';
 
   const couponLine = session.pendingCoupon
-    ? `🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${escapeHtml(couponDiscount.toFixed(2))})</b>\n` +
-      `💵 <b>Total com desconto:</b> R$ ${escapeHtml(price.toFixed(2))}\n`
+    ? `🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${couponDiscount.toFixed(2)})</b>\n` +
+      `💵 <b>Total com desconto:</b> R$ ${price.toFixed(2)}\n`
     : '';
 
   const confirmMessage =
     `📦 <b>${escapeHtml(product.name)}</b>${descLine}\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `💰 <b>Valor:</b> R$ ${escapeHtml(rawPrice.toFixed(2))}\n` +
+    `────────────────────\n` +
+    `💰 <b>Valor:</b> R$ ${rawPrice.toFixed(2)}\n` +
     couponLine +
-    `🏦 <b>Seu saldo:</b> R$ ${escapeHtml(balanceStr)}\n\n` +
+    `🏦 <b>Seu saldo:</b> R$ ${balanceStr}\n\n` +
     `<b>Como deseja pagar?</b>`;
 
   const buttons = [];
@@ -127,7 +132,7 @@ export async function showPaymentMethodScreen(
   });
 }
 
-// ─── Tela de input de cupom ──────────────────────────────────────────────────
+// ─── Tela de input de cupom ─────────────────────────────────────────────────────────
 
 export async function showCouponInputScreen(
   ctx: Context,
@@ -153,7 +158,7 @@ export async function showCouponInputScreen(
   );
 }
 
-// ─── Execução de pagamento ───────────────────────────────────────────────────
+// ─── Execução de pagamento ─────────────────────────────────────────────────────────────────
 
 export async function executePayment(
   ctx: Context,
@@ -192,7 +197,7 @@ export async function executePayment(
       ...(referralCode ? { referralCode } : {}),
     } as Parameters<typeof apiClient.createPayment>[0]);
 
-    // ── Pagamento por saldo puro: salva sessão e finaliza ──────────────────
+    // ── Pagamento por saldo puro: salva sessão e finaliza ──────────────────────
     const paymentAny = payment as unknown as Record<string, unknown>;
 
     if (payment.paidWithBalance) {
@@ -204,7 +209,7 @@ export async function executePayment(
         ctx,
         `✅ <b>Compra realizada com saldo!</b>\n\n` +
           `📦 <b>Produto:</b> ${escapeHtml(payment.productName)}\n` +
-          `💰 <b>Valor debitado:</b> R$ ${escapeHtml(Number(payment.amount).toFixed(2))}${discountLine}\n` +
+          `💰 <b>Valor debitado:</b> R$ ${Number(payment.amount).toFixed(2)}${discountLine}\n` +
           `Seu produto será entregue em instantes! 🚀`,
         {
           parse_mode: 'HTML',
@@ -243,7 +248,7 @@ export async function executePayment(
       `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
       `💰 *Valor total:* R$ ${escapeMd(Number(payment.amount).toFixed(2))}${mixedLine}${discountMdLine}\n` +
       `⏰ *Válido até:* ${escapeMd(expiresStr)}\n` +
-      `🪪 *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
+      `🪺 *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
       `📋 *Copia e Cola:*\n\`${escapeMd(payment.pixQrCodeText)}\``;
 
     const chatId = ctx.chat?.id;
@@ -370,7 +375,7 @@ export async function executePayment(
   }
 }
 
-// ─── Timeout de PIX ──────────────────────────────────────────────────────────
+// ─── Timeout de PIX ─────────────────────────────────────────────────────────────────────────────────────
 
 export function schedulePIXExpiry(
   userId: number,
@@ -403,23 +408,21 @@ export function schedulePIXExpiry(
   }, delayMs);
 }
 
-// ─── Verificar pagamento ─────────────────────────────────────────────────────
+// ─── Verificar pagamento ───────────────────────────────────────────────────────────────────────────────
 
 export async function handleCheckPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
 
   await ctx.answerCbQuery('🔄 Verificando...').catch(() => {});
 
+  // FIX-CHECK-SESSION-ORDER: carrega sessão uma vez para todos os branches
+  const session = await getSession(userId);
+
   try {
     const { status } = await apiClient.getPaymentStatus(paymentId, String(userId));
 
-    if (status === 'EXPIRED' || status === 'CANCELLED' || status === 'APPROVED') {
-      await clearSession(userId);
-    }
-
     if (status === 'PENDING') {
       // FEAT-COPYPASTE-CHECK: reenvia copia e cola junto com o status pendente
-      const session = await getSession(userId);
       const pixText = session.pixQrCodeText;
 
       const copyPasteBlock = pixText
@@ -450,6 +453,8 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
     };
 
     const msg = statusMessages[status] || '❓ Status desconhecido';
+
+    // FIX-CHECK-RACE: envia a mensagem ANTES de limpar a sessão
     await editOrReply(
       ctx,
       msg,
@@ -461,6 +466,9 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
         ]).reply_markup,
       }
     );
+
+    // Limpa sessão após confirmar que a mensagem foi entregue
+    await clearSession(userId, session.firstName);
   } catch (err) {
     console.error('[handleCheckPayment] Erro ao verificar pagamento:', err);
     await ctx.reply('⚠️ Erro ao verificar pagamento. Tente novamente.', {
@@ -469,7 +477,7 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
   }
 }
 
-// ─── Cancelar pagamento ──────────────────────────────────────────────────────
+// ─── Cancelar pagamento ───────────────────────────────────────────────────────────────────────────────
 
 export async function handleCancelPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
