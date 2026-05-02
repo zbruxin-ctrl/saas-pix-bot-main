@@ -7,23 +7,23 @@ import { formatDate } from '@/lib/utils';
 interface CouponRow {
   id: string;
   code: string;
-  type: 'PERCENT' | 'FIXED';
-  value: number;
+  discountType: 'PERCENT' | 'FIXED';
+  discountValue: number;
   minOrderValue: number | null;
   maxUses: number | null;
   usedCount: number;
-  expiresAt: string | null;
+  validUntil: string | null;
   isActive: boolean;
   createdAt: string;
 }
 
-const EMPTY_FORM: Omit<CouponRow, 'id' | 'usedCount' | 'createdAt'> = {
+const EMPTY_FORM = {
   code: '',
-  type: 'PERCENT',
-  value: 10,
-  minOrderValue: null,
-  maxUses: null,
-  expiresAt: null,
+  discountType: 'PERCENT' as 'PERCENT' | 'FIXED',
+  discountValue: 10,
+  minOrderValue: null as number | null,
+  maxUses: null as number | null,
+  validUntil: null as string | null,
   isActive: true,
 };
 
@@ -65,11 +65,11 @@ export default function CouponsPage() {
     setEditingId(row.id);
     setForm({
       code: row.code,
-      type: row.type,
-      value: row.value,
+      discountType: row.discountType,
+      discountValue: row.discountValue,
       minOrderValue: row.minOrderValue,
       maxUses: row.maxUses,
-      expiresAt: row.expiresAt ? row.expiresAt.slice(0, 10) : null,
+      validUntil: row.validUntil ? row.validUntil.slice(0, 10) : null,
       isActive: row.isActive,
     });
     setFormError('');
@@ -77,20 +77,29 @@ export default function CouponsPage() {
   }
 
   async function handleSave() {
-    if (!form.code.trim()) { setFormError('Código do cupão é obrigatório.'); return; }
-    if (form.value <= 0) { setFormError('Valor deve ser maior que zero.'); return; }
+    if (!form.code.trim()) { setFormError('Código do cupom é obrigatório.'); return; }
+    if (!form.discountValue || form.discountValue <= 0) { setFormError('Valor de desconto deve ser maior que zero.'); return; }
     setSaving(true);
     setFormError('');
     try {
+      const payload = {
+        code: form.code,
+        discountType: form.discountType,
+        discountValue: form.discountValue,
+        minOrderValue: form.minOrderValue,
+        maxUses: form.maxUses,
+        validUntil: form.validUntil || null,
+        isActive: form.isActive,
+      };
       if (editingId) {
-        await updateCoupon(editingId, form);
+        await updateCoupon(editingId, payload);
       } else {
-        await createCoupon(form);
+        await createCoupon(payload);
       }
       setShowForm(false);
       fetchCoupons();
     } catch (err: any) {
-      setFormError(err?.response?.data?.error || 'Erro ao salvar cupão.');
+      setFormError(err?.response?.data?.error || 'Erro ao salvar cupom.');
     } finally {
       setSaving(false);
     }
@@ -114,10 +123,10 @@ export default function CouponsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">🏷️ Cupons</h1>
-          <p className="text-gray-500 text-sm mt-1">{filtered.length} cupão{filtered.length !== 1 ? 'ões' : ''}</p>
+          <p className="text-gray-500 text-sm mt-1">{filtered.length} cupom{filtered.length !== 1 ? 's' : ''}</p>
         </div>
         <button onClick={openCreate} className="btn-primary text-sm">
-          + Novo Cupão
+          + Novo Cupom
         </button>
       </div>
 
@@ -157,13 +166,13 @@ export default function CouponsPage() {
                 <tr>
                   <td colSpan={7} className="text-center py-12 text-gray-400">
                     <div className="text-3xl mb-2">🏷️</div>
-                    <p className="font-medium text-gray-500">Nenhum cupão encontrado</p>
-                    <button onClick={openCreate} className="mt-3 text-blue-600 text-sm underline">Criar o primeiro cupão</button>
+                    <p className="font-medium text-gray-500">Nenhum cupom encontrado</p>
+                    <button onClick={openCreate} className="mt-3 text-blue-600 text-sm underline">Criar o primeiro cupom</button>
                   </td>
                 </tr>
               ) : (
                 filtered.map((r) => {
-                  const expired = r.expiresAt ? new Date(r.expiresAt) < new Date() : false;
+                  const expired = r.validUntil ? new Date(r.validUntil) < new Date() : false;
                   const esgotado = r.maxUses != null && r.usedCount >= r.maxUses;
                   const statusLabel = !r.isActive ? 'Inativo' : expired ? 'Expirado' : esgotado ? 'Esgotado' : 'Ativo';
                   const statusClass = !r.isActive || expired || esgotado
@@ -178,9 +187,9 @@ export default function CouponsPage() {
                         </span>
                       </td>
                       <td className="px-4 py-3 font-semibold text-gray-900">
-                        {r.type === 'PERCENT'
-                          ? `${r.value}% off`
-                          : `R$ ${r.value.toFixed(2)} off`}
+                        {r.discountType === 'PERCENT'
+                          ? `${r.discountValue}% off`
+                          : `R$ ${r.discountValue.toFixed(2)} off`}
                       </td>
                       <td className="px-4 py-3 text-gray-600">
                         {r.usedCount}{r.maxUses != null ? ` / ${r.maxUses}` : ''}
@@ -189,7 +198,7 @@ export default function CouponsPage() {
                         {r.minOrderValue != null ? `R$ ${r.minOrderValue.toFixed(2)}` : <span className="text-gray-400">—</span>}
                       </td>
                       <td className="px-4 py-3 text-gray-500 text-xs">
-                        {r.expiresAt ? formatDate(r.expiresAt) : <span className="text-gray-400">—</span>}
+                        {r.validUntil ? formatDate(r.validUntil) : <span className="text-gray-400">—</span>}
                       </td>
                       <td className="px-4 py-3">
                         <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${statusClass}`}>
@@ -227,7 +236,7 @@ export default function CouponsPage() {
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-bold text-gray-900">
-                {editingId ? 'Editar Cupão' : 'Novo Cupão'}
+                {editingId ? 'Editar Cupom' : 'Novo Cupom'}
               </h2>
               <button onClick={() => setShowForm(false)} className="text-gray-400 hover:text-gray-600 text-2xl leading-none">×</button>
             </div>
@@ -248,8 +257,8 @@ export default function CouponsPage() {
                   <label className="block text-sm font-medium text-gray-700 mb-1">Tipo</label>
                   <select
                     className="input w-full"
-                    value={form.type}
-                    onChange={(e) => setForm((f) => ({ ...f, type: e.target.value as 'PERCENT' | 'FIXED' }))}
+                    value={form.discountType}
+                    onChange={(e) => setForm((f) => ({ ...f, discountType: e.target.value as 'PERCENT' | 'FIXED' }))}
                   >
                     <option value="PERCENT">Porcentagem (%)</option>
                     <option value="FIXED">Valor fixo (R$)</option>
@@ -257,15 +266,15 @@ export default function CouponsPage() {
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    {form.type === 'PERCENT' ? 'Desconto (%)' : 'Desconto (R$)'}
+                    Desconto ({form.discountType === 'PERCENT' ? '%' : 'R$'}) *
                   </label>
                   <input
                     type="number"
-                    min="0"
-                    step={form.type === 'PERCENT' ? '1' : '0.01'}
+                    min="0.01"
+                    step="0.01"
                     className="input w-full"
-                    value={form.value}
-                    onChange={(e) => setForm((f) => ({ ...f, value: Number(e.target.value) }))}
+                    value={form.discountValue}
+                    onChange={(e) => setForm((f) => ({ ...f, discountValue: parseFloat(e.target.value) || 0 }))}
                   />
                 </div>
               </div>
@@ -276,10 +285,10 @@ export default function CouponsPage() {
                   <input
                     type="number"
                     min="1"
-                    placeholder="Ilimitado"
                     className="input w-full"
+                    placeholder="Ilimitado"
                     value={form.maxUses ?? ''}
-                    onChange={(e) => setForm((f) => ({ ...f, maxUses: e.target.value ? Number(e.target.value) : null }))}
+                    onChange={(e) => setForm((f) => ({ ...f, maxUses: e.target.value ? parseInt(e.target.value) : null }))}
                   />
                 </div>
                 <div>
@@ -288,10 +297,10 @@ export default function CouponsPage() {
                     type="number"
                     min="0"
                     step="0.01"
-                    placeholder="Sem mínimo"
                     className="input w-full"
+                    placeholder="Sem mínimo"
                     value={form.minOrderValue ?? ''}
-                    onChange={(e) => setForm((f) => ({ ...f, minOrderValue: e.target.value ? Number(e.target.value) : null }))}
+                    onChange={(e) => setForm((f) => ({ ...f, minOrderValue: e.target.value ? parseFloat(e.target.value) : null }))}
                   />
                 </div>
               </div>
@@ -301,8 +310,8 @@ export default function CouponsPage() {
                 <input
                   type="date"
                   className="input w-full"
-                  value={form.expiresAt ?? ''}
-                  onChange={(e) => setForm((f) => ({ ...f, expiresAt: e.target.value || null }))}
+                  value={form.validUntil ?? ''}
+                  onChange={(e) => setForm((f) => ({ ...f, validUntil: e.target.value || null }))}
                 />
               </div>
 
@@ -312,32 +321,32 @@ export default function CouponsPage() {
                   id="isActive"
                   checked={form.isActive}
                   onChange={(e) => setForm((f) => ({ ...f, isActive: e.target.checked }))}
-                  className="w-4 h-4 rounded border-gray-300 text-blue-600"
+                  className="w-4 h-4 rounded border-gray-300"
                 />
-                <label htmlFor="isActive" className="text-sm text-gray-700">Cupão ativo</label>
+                <label htmlFor="isActive" className="text-sm font-medium text-gray-700">Cupom ativo</label>
               </div>
             </div>
 
             {formError && (
-              <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-2 text-sm text-red-700">
                 {formError}
-              </p>
+              </div>
             )}
 
             <div className="flex gap-3 pt-2">
               <button
                 onClick={() => setShowForm(false)}
-                className="btn-secondary flex-1"
+                className="flex-1 btn-secondary"
                 disabled={saving}
               >
                 Cancelar
               </button>
               <button
                 onClick={handleSave}
-                className="btn-primary flex-1"
                 disabled={saving}
+                className="flex-1 btn-primary"
               >
-                {saving ? 'Salvando...' : editingId ? 'Salvar alterações' : 'Criar cupão'}
+                {saving ? 'Salvando...' : editingId ? 'Salvar alterações' : 'Criar cupom'}
               </button>
             </div>
           </div>
