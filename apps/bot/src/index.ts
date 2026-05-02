@@ -8,7 +8,7 @@
  * BUG FIX: todos os handlers têm try/catch global para nunca silenciar o bot.
  * FIX-COUPON: remove .catch() silencioso na validação de cupom; corrige ordem
  *             do guard result.data (deve vir ANTES do saveSession); corrige
- *             typos "cupão" → "cupom".
+ *             typos cupão → cupom.
  * FIX-COUPON-DISCOUNT: salva discountAmount na sessão para uso na tela de pagamento.
  * FEAT-REMOVE-COUPON: action remove_coupon_ limpa cupom da sessão e volta para
  *                     tela de método de pagamento sem desconto.
@@ -19,6 +19,7 @@
  *                  são limpas automaticamente e o menu é exibido normalmente.
  * FIX-COUPON-ACTION-DEDUP: skip_coupon_ e remove_coupon_ compartilham handleClearCouponAndShowPayment.
  *                          Dead code pay_mixed_coupon_ removido.
+ * FIX-CUPOM: cupão→cupom em todos os literais de UI.
  */
 
 import { initSentry, captureError } from './config/sentry';
@@ -227,7 +228,7 @@ bot.action('deposit_balance', async (ctx) => {
   }
 });
 
-// ─── Cupom ───────────────────────────────────────────────────────────────────────────────────
+// ─── Cupom ───────────────────────────────────────────────────────────────────────────────────────
 bot.action(/^coupon_input_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('🏷️ Cupom...').catch(() => {});
   try {
@@ -303,7 +304,7 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   }
 });
 
-// ─── Ações de pagamento ──────────────────────────────────────────────────────────────────────────────────────
+// ─── Ações de pagamento ──────────────────────────────────────────────────────────────────────────────────────────
 bot.action(/^pay_pix_(.+)$/, async (ctx) => {
   await executePayment(ctx, ctx.match[1], 'PIX');
 });

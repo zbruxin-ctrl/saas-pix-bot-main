@@ -41,6 +41,8 @@
  *           foi reservado mesmo se replyWithPhoto falhar.
  * AUDIT #19: caption MarkdownV2 limitada a 900 chars; copia-e-cola enviado em mensagem
  *            separada se a caption exceder o limite — elimina erro 400 por caption longa.
+ * FIX-CUPOM: cupão→cupom em todos os literais; guard de erro de cupom aceita
+ *            'Cupom'/'cupom' além de 'Cupão'/'cupão' e 'COUPON'.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -96,7 +98,7 @@ export async function showPaymentMethodScreen(
     : '';
 
   const couponLine = session.pendingCoupon
-    ? `🏷️ <b>Cupão:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${couponDiscount.toFixed(2)})</b>\n` +
+    ? `🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${couponDiscount.toFixed(2)})</b>\n` +
       `💵 <b>Total com desconto:</b> R$ ${price.toFixed(2)}\n`
     : '';
 
@@ -131,9 +133,9 @@ export async function showPaymentMethodScreen(
   }
 
   if (session.pendingCoupon) {
-    buttons.push([Markup.button.callback('🗑️ Remover cupão', `remove_coupon_${product.id}`)]);
+    buttons.push([Markup.button.callback('🗑️ Remover cupom', `remove_coupon_${product.id}`)]);
   } else {
-    buttons.push([Markup.button.callback('🏷️ Tenho um cupão', `coupon_input_${product.id}`)]);
+    buttons.push([Markup.button.callback('🏷️ Tenho um cupom', `coupon_input_${product.id}`)]);
   }
 
   buttons.push([Markup.button.callback('◀️ Voltar', 'show_products')]);
@@ -144,7 +146,7 @@ export async function showPaymentMethodScreen(
   });
 }
 
-// ─── Tela de input de cupão ────────────────────────────────────────────────────────────────────────────────────
+// ─── Tela de input de cupom ────────────────────────────────────────────────────────────────────────────────────
 
 export async function showCouponInputScreen(
   ctx: Context,
@@ -158,8 +160,8 @@ export async function showCouponInputScreen(
 
   await editOrReply(
     ctx,
-    `🏷️ <b>Digite seu cupão de desconto:</b>\n\n` +
-    `<i>Envie o código do cupão ou clique em Pular para continuar sem desconto.</i>`,
+    `🏷️ <b>Digite seu cupom de desconto:</b>\n\n` +
+    `<i>Envie o código do cupom ou clique em Pular para continuar sem desconto.</i>`,
     {
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([
@@ -197,7 +199,7 @@ export async function executePayment(
     await editOrReply(ctx, '⏳ Processando sua compra, aguarde...', { parse_mode: 'HTML' });
 
     // FIX-DOUBLE-GETSESSION: sessão carregada uma única vez e reutilizada
-    // em todo o fluxo (cupão, pagamento por saldo e PIX).
+    // em todo o fluxo (cupom, pagamento por saldo e PIX).
     const session = await getSession(userId);
     const effectiveCoupon = couponCode ?? session.pendingCoupon ?? undefined;
 
@@ -216,7 +218,7 @@ export async function executePayment(
     if (payment.paidWithBalance) {
       const discountLine = payment.discountAmount
         ? `\n🏷️ <b>Desconto aplicado:</b> R$ ${Number(payment.discountAmount).toFixed(2)}` +
-          (payment.couponApplied ? ` (cupão ${escapeHtml(payment.couponApplied)})` : '') + `\n`
+          (payment.couponApplied ? ` (cupom ${escapeHtml(payment.couponApplied)})` : '') + `\n`
         : '';
 
       await editOrReply(
@@ -321,11 +323,12 @@ export async function executePayment(
     console.info(`[${paymentMethod}] PIX gerado para ${userId} | id: ${payment.paymentId} | expira: ${payment.expiresAt}`);
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : 'Erro desconhecido';
+    const errMsgLower = errMsg.toLowerCase();
     const errStatus = (error as { statusCode?: number }).statusCode ?? 0;
     console.error(`[executePayment] Erro (${paymentMethod}) para ${userId}:`, error);
     captureError(error, { handler: 'executePayment', paymentMethod, userId, productId });
 
-    if (errStatus === 403 || errMsg.toLowerCase().includes('suspensa')) {
+    if (errStatus === 403 || errMsgLower.includes('suspensa')) {
       await showBlockedMessage(ctx);
       return;
     }
@@ -345,7 +348,7 @@ export async function executePayment(
       return;
     }
 
-    if (errStatus === 503 || errMsg.toLowerCase().includes('manutencao') || errMsg.toLowerCase().includes('manutenção')) {
+    if (errStatus === 503 || errMsgLower.includes('manutencao') || errMsgLower.includes('manutenção')) {
       await editOrReply(
         ctx,
         `🛠️ <b>Manutenção em Andamento</b>\n\n${escapeHtml(errMsg)}\n\n<i>Tente novamente em alguns instantes! 😊</i>`,
@@ -354,18 +357,20 @@ export async function executePayment(
       return;
     }
 
+    // FIX-CUPOM: detecta erros de cupom com ou sem acento (cupão/cupom/COUPON)
     if (errStatus === 400 && (
-      errMsg.includes('Cupão') || errMsg.includes('cupão') ||
-      errMsg.includes('COUPON')
+      errMsgLower.includes('cupom') ||
+      errMsgLower.includes('cupão') ||
+      errMsgLower.includes('coupon')
     )) {
       await editOrReply(
         ctx,
-        `❌ <b>${escapeHtml(errMsg)}</b>\n\nTente outro cupão ou pague sem desconto.`,
+        `❌ <b>${escapeHtml(errMsg)}</b>\n\nTente outro cupom ou pague sem desconto.`,
         {
           parse_mode: 'HTML',
           reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🏷️ Tentar outro cupão', `coupon_input_${productId}`)],
-            [Markup.button.callback('📱 Pagar sem cupão', `pay_pix_${productId}`)],
+            [Markup.button.callback('🏷️ Tentar outro cupom', `coupon_input_${productId}`)],
+            [Markup.button.callback('📱 Pagar sem cupom', `pay_pix_${productId}`)],
             [Markup.button.callback('◀️ Voltar', `select_product_${productId}`)],
           ]).reply_markup,
         }
@@ -373,7 +378,7 @@ export async function executePayment(
       return;
     }
 
-    if (errMsg.toLowerCase().includes('saldo insuficiente')) {
+    if (errMsgLower.includes('saldo insuficiente')) {
       await editOrReply(
         ctx,
         `❌ <b>${escapeHtml(errMsg)}</b>\n\nEscolha outra forma de pagamento ou adicione saldo.`,
@@ -388,7 +393,7 @@ export async function executePayment(
       return;
     }
 
-    const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econnreset');
+    const isTimeout = errMsgLower.includes('timeout') || errMsgLower.includes('econnreset');
 
     // AUDIT #7: mensagem diferenciada para MIXED — saldo pode ter sido reservado
     // antes do replyWithPhoto falhar; avisa o usuário para usar /start e verificar.

@@ -9,6 +9,7 @@
  * FIX-ESCAPEHTML-NUMERIC: escapeHtml() removido de Number(balance).toFixed(2).
  * FIX-DEPOSIT-STEP-ORDER: session.step='idle' e saveSession movidos para após
  *   createDeposit ter sucesso, consistente com FIX-SESSION-ORDER do projeto.
+ * FIX-MDV2-BANG: '!' no literal 'automaticamente! ✅' escapado para MarkdownV2.
  */
 import { Context, Markup } from 'telegraf';
 import { escapeHtml, escapeMd } from '../utils/escape';
@@ -94,6 +95,7 @@ export async function handleDepositAmount(ctx: Context, text: string): Promise<v
 
     // FIX-DEPOSIT-SESSION-ORDER: envia a foto PRIMEIRO.
     // Se replyWithPhoto falhar, a sessão NÃO fica com depositPaymentId orphan.
+    // FIX-MDV2-BANG: '!' escapado como '\\!' no literal MarkdownV2.
     const depositMsg = await ctx.replyWithPhoto(
       { source: qrBuffer },
       {
