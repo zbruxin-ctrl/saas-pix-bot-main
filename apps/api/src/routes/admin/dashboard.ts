@@ -1,7 +1,4 @@
 // routes/admin/dashboard.ts
-// FIX PROD: todas as queries isoladas com .catch() para evitar HTTP 500
-// NOVO: GET /chart — receita dos últimos 30 dias agrupada por dia
-// NOVO: GET /low-stock — produtos com ≤ 3 itens disponíveis
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma';
 import { AuthenticatedRequest } from '../../middleware/auth';
@@ -72,14 +69,11 @@ adminDashboardRouter.get('/', async (_req: AuthenticatedRequest, res: Response) 
       },
     }).catch(() => []);
 
-    // Produtos com estoque baixo (≤ 3 itens disponíveis FIFO ou stock numérico)
+    // FIX: stock é Int? (nullable) — filtra apenas produtos com stock NOT NULL e <= 3
     const lowStockProducts = await prisma.product.findMany({
       where: {
         isActive: true,
-        OR: [
-          { stock: { lte: 3, gt: 0 } },
-          { stock: 0 },
-        ],
+        stock: { not: null, lte: 3 },
       },
       select: { id: true, name: true, stock: true },
     }).catch(() => []);
@@ -127,7 +121,6 @@ adminDashboardRouter.get('/', async (_req: AuthenticatedRequest, res: Response) 
 });
 
 // GET /api/admin/dashboard/chart?days=30
-// Retorna receita agrupada por dia nos últimos N dias
 adminDashboardRouter.get('/chart', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const days = Math.min(Number(req.query.days ?? 30), 90);
@@ -139,7 +132,6 @@ adminDashboardRouter.get('/chart', async (req: AuthenticatedRequest, res: Respon
       orderBy: { approvedAt: 'asc' },
     });
 
-    // Agrupa por data (YYYY-MM-DD) em memória — compatível com Neon/Postgres
     const byDay: Record<string, number> = {};
     for (const p of payments) {
       if (!p.approvedAt) continue;
@@ -147,7 +139,6 @@ adminDashboardRouter.get('/chart', async (req: AuthenticatedRequest, res: Respon
       byDay[key] = (byDay[key] ?? 0) + Number(p.amount);
     }
 
-    // Preenche dias sem vendas com 0
     const result: { date: string; revenue: number }[] = [];
     for (let i = days - 1; i >= 0; i--) {
       const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);

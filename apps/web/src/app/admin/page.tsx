@@ -13,6 +13,23 @@ interface DashboardData {
   lowStockProducts: LowStockProduct[];
 }
 
+const EMPTY_STATS: DashboardStats = {
+  totalRevenue: 0,
+  revenueToday: 0,
+  revenueThisMonth: 0,
+  totalApproved: 0,
+  totalPending: 0,
+  totalRejected: 0,
+  totalExpired: 0,
+  totalCancelled: 0,
+  totalRefunded: 0,
+  paymentsToday: 0,
+  paymentsThisMonth: 0,
+  deliveriesFailedToday: 0,
+  webhooksFailedToday: 0,
+  ordersWithFailure: 0,
+};
+
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [chartData, setChartData] = useState<{ date: string; revenue: number }[]>([]);
@@ -20,16 +37,26 @@ export default function DashboardPage() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    Promise.all([
+    Promise.allSettled([
       getDashboard(),
       getDashboardChart(30),
-    ])
-      .then(([dash, chart]) => {
-        setData(dash);
-        setChartData(chart);
-      })
-      .catch(() => setError('Erro ao carregar dashboard'))
-      .finally(() => setLoading(false));
+    ]).then(([dashResult, chartResult]) => {
+      if (dashResult.status === 'fulfilled') {
+        const dash = dashResult.value;
+        setData({
+          stats: { ...EMPTY_STATS, ...(dash?.stats ?? {}) },
+          recentPayments: dash?.recentPayments ?? [],
+          lowStockProducts: dash?.lowStockProducts ?? [],
+        });
+      } else {
+        console.error('[dashboard] erro ao carregar stats:', dashResult.reason);
+        setError('Erro ao carregar dashboard. Tente novamente.');
+      }
+
+      if (chartResult.status === 'fulfilled') {
+        setChartData(Array.isArray(chartResult.value) ? chartResult.value : []);
+      }
+    }).finally(() => setLoading(false));
   }, []);
 
   if (loading) {
@@ -40,15 +67,21 @@ export default function DashboardPage() {
     );
   }
 
-  if (error) {
+  if (error || !data) {
     return (
       <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-6 text-center">
-        {error}
+        {error || 'Erro ao carregar dashboard.'}
+        <button
+          onClick={() => window.location.reload()}
+          className="block mx-auto mt-3 text-sm underline hover:no-underline"
+        >
+          Tentar novamente
+        </button>
       </div>
     );
   }
 
-  const { stats, recentPayments, lowStockProducts } = data!;
+  const { stats, recentPayments, lowStockProducts } = data;
 
   return (
     <div className="space-y-6">
@@ -57,7 +90,6 @@ export default function DashboardPage() {
         <p className="text-gray-500 text-sm mt-1">Visão geral do sistema</p>
       </div>
 
-      {/* Alerta de estoque baixo */}
       {lowStockProducts.length > 0 && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4">
           <div className="flex items-center gap-2 mb-2">
@@ -79,7 +111,6 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Cards de estatísticas */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatsCard
           title="Receita Total"
@@ -139,10 +170,8 @@ export default function DashboardPage() {
         />
       </div>
 
-      {/* Gráfico de receita dos últimos 30 dias */}
       <RevenueChart data={chartData} />
 
-      {/* Tabela de pagamentos recentes */}
       <div className="card">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-gray-900">Pagamentos Recentes</h2>
