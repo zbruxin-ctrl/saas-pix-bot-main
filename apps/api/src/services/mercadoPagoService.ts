@@ -180,6 +180,17 @@ class MercadoPagoService {
     return { isApproved, paymentDetail };
   }
 
+  async cancelPayment(mercadoPagoId: string): Promise<void> {
+    try {
+      await this.client.put(`/v1/payments/${mercadoPagoId}`, { status: 'cancelled' });
+      logger.info(`Pagamento cancelado no MP: ${mercadoPagoId}`);
+    } catch (error) {
+      const mpError = extractMpError(error);
+      logger.warn(`Falha ao cancelar pagamento ${mercadoPagoId} no MP: ${mpError}`);
+      throw new Error(`Não foi possível cancelar o pagamento no Mercado Pago: ${mpError}`);
+    }
+  }
+
   async refundPayment(mercadoPagoId: string): Promise<void> {
     try {
       await this.client.post(`/v1/payments/${mercadoPagoId}/refunds`);
