@@ -29,6 +29,14 @@
 // FIX-BUILD2: troca env.WEBHOOK_URL → env.BOT_WEBHOOK_URL (variável correta do schema)
 // FEAT-PRICING: integra applyPricing, commitCouponUse, commitReferral e payReferralReward
 // FIX-TS2352: double cast via unknown para extrair couponCode/referralCode de CreatePaymentRequest
+// VARREDURA-FIX #1: _payWithPix/_payMixed: reserveStock com try/catch + cancelamento + refund MP
+// VARREDURA-FIX #2: processApprovedPayment: confirmReservation falhou → não avança para deliver
+// VARREDURA-FIX #3: _payWithBalance: payReferralReward executado para BALANCE
+// VARREDURA-FIX #4: REFERRAL_REWARD como constante única
+// VARREDURA-FIX #8: getPaymentStatus: releaseReservation ao expirar
+// VARREDURA-FIX #9: cancelExpiredPayment: releaseReservation ao cancelar
+// VARREDURA-FIX #11: comentário sobre limitação dos locks in-memory (multi-instância)
+// VARREDURA-FIX #12: statusCache.delete após _payWithBalance aprovar
 import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
@@ -53,6 +61,9 @@ import type {
   CreateDepositRequest,
   CreateDepositResponse,
 } from '@saas-pix/shared';
+
+// ─── VARREDURA-FIX #4: constante única para recompensa de referral ────────────
+const REFERRAL_REWARD_AMOUNT = 5.00; // R$ 5,00 por indicação
 
 // ─── OPT #8: interfaces internas extraídas ────────────────────────────────────
 interface TelegramUserSnap {
@@ -119,6 +130,8 @@ export function invalidateStockItemCache(productId: string): void {
 }
 
 // ─── OPT #5: cache de usuário conhecido (TTL 5min) ───────────────────────────
+// NOTA: o campo `balance` no cache é apenas para referência do id do usuário.
+// O saldo REAL é sempre relido do banco via userStatus em createPayment.
 const userCacheTTL = 5 * 60_000;
 interface UserCacheEntry {
   id: string;
@@ -172,6 +185,9 @@ const statusCacheTTL = 5_000;
 const statusCache = new Map<string, { status: PaymentStatus; expiresAt: number }>();
 
 // ─── lock in-memory para _payMixed simultâneos ────────────────────────────────
+// NOTA (VARREDURA #11): estes locks funcionam apenas em single-instance.
+// Em ambiente multi-pod, a deduplicação real é garantida pelas queries
+// existingPending/existingApproved no banco de dados.
 const mixedPaymentLock = new Set<string>();
 
 // ─── lock in-memory para _payWithBalance simultâneos ─────────────────────────
@@ -191,6 +207,7 @@ export class PaymentService {
 
     if (!product) throw new AppError('Produto não encontrado ou indisponível.', 404);
 
+    // Saldo SEMPRE relido do DB (não usa o valor do cache de usuário)
     const userStatus = await prisma.telegramUser.findUnique({
       where: { id: telegramUser.id },
       select: { isBlocked: true, balance: true },
@@ -382,16 +399,29 @@ export class PaymentService {
           await commitCouponUse(tx, pricingResult.couponId, telegramUser.id, newPayment.id);
         }
 
-        // Commit referral (sem recompensa ainda)
+        // Commit referral
         if (pricingResult?.referrerId) {
-          const REFERRAL_REWARD = 5.00; // R$ 5,00 por indicação
-          await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD);
+          await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD_AMOUNT);
         }
+
+        // VARREDURA-FIX #3: paga recompensa de referral para BALANCE (mesmo fluxo de PIX/MIXED)
+        await payReferralReward(tx, newPayment.id, async (userId, amount, description, txClient) => {
+          await txClient.telegramUser.update({
+            where: { id: userId },
+            data: { balance: { increment: amount } },
+          });
+          await txClient.walletTransaction.create({
+            data: { telegramUserId: userId, type: 'REFERRAL_REWARD', amount, description },
+          });
+        });
 
         return { payment: newPayment, order: newOrder };
       });
 
       invalidateUserCache(telegramId);
+
+      // VARREDURA-FIX #12: limpa statusCache após aprovar pagamento BALANCE
+      statusCache.delete(payment.id);
 
       if (product.stock !== null || hasStockItems) {
         try {
@@ -536,16 +566,34 @@ export class PaymentService {
           await commitCouponUse(tx, pricingResult.couponId, telegramUser.id, newPayment.id);
         }
         if (pricingResult?.referrerId) {
-          const REFERRAL_REWARD = 5.00;
-          await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD);
+          await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD_AMOUNT);
         }
 
         return newPayment;
       });
 
+      // VARREDURA-FIX #1: reserveStock com try/catch + cancelamento + refund MP para _payMixed
       if (product.stock !== null || hasStockItems) {
-        await stockService.reserveStock(product.id, telegramUser.id, payment.id);
-        invalidateStockItemCache(product.id);
+        try {
+          await stockService.reserveStock(product.id, telegramUser.id, payment.id);
+          invalidateStockItemCache(product.id);
+        } catch (err) {
+          logger.error(`[Mixed] Erro ao reservar estoque para payment ${payment.id}:`, err);
+          // Cancela o payment no banco
+          await prisma.payment.update({
+            where: { id: payment.id },
+            data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() },
+          });
+          // Tenta estornar no Mercado Pago
+          if (mpPayment.id) {
+            try {
+              await mercadoPagoService.refundPayment(mpPayment.id.toString());
+            } catch (refundErr) {
+              logger.error(`[Mixed] CRÍTICO: falha ao estornar no MP para payment ${payment.id}`, refundErr);
+            }
+          }
+          throw new AppError('Produto sem estoque disponível.', 409);
+        }
       }
 
       return {
@@ -648,17 +696,35 @@ export class PaymentService {
         await commitCouponUse(tx, pricingResult.couponId, telegramUser.id, newPayment.id);
       }
       if (pricingResult?.referrerId) {
-        const REFERRAL_REWARD = 5.00;
-        await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD);
+        await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD_AMOUNT);
       }
 
       return newPayment;
     });
 
+    // VARREDURA-FIX #1: reserveStock com try/catch + cancelamento + refund MP para _payWithPix
     const hasStockItems = await this.productHasStockItems(product.id);
     if (product.stock !== null || hasStockItems) {
-      await stockService.reserveStock(product.id, telegramUser.id, payment.id);
-      invalidateStockItemCache(product.id);
+      try {
+        await stockService.reserveStock(product.id, telegramUser.id, payment.id);
+        invalidateStockItemCache(product.id);
+      } catch (err) {
+        logger.error(`[PIX] Erro ao reservar estoque para payment ${payment.id}:`, err);
+        // Cancela o payment no banco
+        await prisma.payment.update({
+          where: { id: payment.id },
+          data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() },
+        });
+        // Tenta estornar no Mercado Pago
+        if (mpPayment.id) {
+          try {
+            await mercadoPagoService.refundPayment(mpPayment.id.toString());
+          } catch (refundErr) {
+            logger.error(`[PIX] CRÍTICO: falha ao estornar no MP para payment ${payment.id}`, refundErr);
+          }
+        }
+        throw new AppError('Produto sem estoque disponível.', 409);
+      }
     }
 
     return {
@@ -725,6 +791,7 @@ export class PaymentService {
 
     const pixExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
+    // productId é nullable no schema — explicitamente null para depósitos
     const payment = await prisma.payment.create({
       data: {
         telegramUserId: telegramUser.id,
@@ -835,7 +902,6 @@ export class PaymentService {
             },
           });
 
-          // Paga recompensa de referral se houver
           await payReferralReward(tx, paymentId, async (userId, amount, description, txClient) => {
             await txClient.telegramUser.update({
               where: { id: userId },
@@ -889,10 +955,12 @@ export class PaymentService {
       return;
     }
 
+    // VARREDURA-FIX #2: se confirmReservation falhar, não avança para deliver
     try {
       await stockService.confirmReservation(paymentId);
     } catch (err) {
-      logger.warn(`[processApproved] confirmReservation falhou para ${paymentId}:`, err);
+      logger.error(`[processApproved] confirmReservation falhou para ${paymentId} — entrega abortada:`, err);
+      return;
     }
 
     const orderId = payment.order?.id ?? paymentId;
@@ -931,6 +999,14 @@ export class PaymentService {
       data: { status: PaymentStatus.EXPIRED, expiredAt: new Date() },
     });
     statusCache.delete(paymentId);
+
+    // VARREDURA-FIX #9: libera reserva de estoque ao expirar via ExpireJob
+    try {
+      await stockService.releaseReservation(paymentId);
+    } catch (err) {
+      logger.warn(`[ExpireJob] releaseReservation falhou para ${paymentId}:`, err);
+    }
+
     logger.info(`[ExpireJob] Payment ${paymentId} expirado`);
   }
 
@@ -960,6 +1036,13 @@ export class PaymentService {
         where: { id: paymentId },
         data: { status: PaymentStatus.EXPIRED, expiredAt: new Date() },
       });
+
+      // VARREDURA-FIX #8: libera reserva de estoque ao detectar expiração via polling
+      try {
+        await stockService.releaseReservation(paymentId);
+      } catch (err) {
+        logger.warn(`[getPaymentStatus] releaseReservation falhou para ${paymentId}:`, err);
+      }
     }
 
     statusCache.set(paymentId, { status, expiresAt: now + statusCacheTTL });
@@ -990,7 +1073,7 @@ export class PaymentService {
       try {
         await mercadoPagoService.refundPayment(payment.mercadoPagoId);
       } catch (err) {
-        logger.warn(`[cancelPayment] Falha ao estornar no MP (${payment.mercadoPagoId}): erro ignorado`);
+        logger.warn(`[cancelPayment] Falha ao estornar no MP (${payment.mercadoPagoId}): erro ignorado`, err);
       }
     }
 

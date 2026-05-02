@@ -10,6 +10,9 @@
  *          de ação é feito pelo Telegraf automaticamente ao registrar bot.action.
  *          Aqui aceitamos Context genérico pois as funções são chamadas tanto
  *          de bot.action quanto de bot.command.
+ *
+ * VARREDURA-FIX #10: showQuantityScreen usa availableStock (já descontado de reservas)
+ *                    em vez de product.stock bruto.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -120,7 +123,10 @@ export async function showQuantityScreen(
   session.pendingQty = undefined;
   await saveSession(userId, session);
 
-  const maxStock = product.stock != null ? product.stock : Infinity;
+  // VARREDURA-FIX #10: usa availableStock (já descontado de reservas pendentes)
+  // em vez de product.stock bruto que não reflete reservas em aberto.
+  const effectiveStock = product.availableStock ?? product.stock;
+  const maxStock = effectiveStock != null ? effectiveStock : Infinity;
   const maxQty = Math.min(maxStock, 10);
 
   if (maxQty <= 0) {
@@ -139,8 +145,8 @@ export async function showQuantityScreen(
 
   const descLine = product.description
     ? `\n📝 <i>${escapeHtml(product.description)}</i>` : '';
-  const stockLine = product.stock != null && product.stock <= 5
-    ? `\n⚠️ <b>Apenas ${product.stock} em estoque!</b>` : '';
+  const stockLine = effectiveStock != null && effectiveStock <= 5
+    ? `\n⚠️ <b>Apenas ${effectiveStock} em estoque!</b>` : '';
 
   const qtyRows: ReturnType<typeof Markup.button.callback>[][] = [];
   let row: ReturnType<typeof Markup.button.callback>[] = [];
@@ -184,61 +190,76 @@ export async function showPaymentMethodScreen(
   const descLine = product.description
     ? `\n📝 <i>${escapeHtml(product.description)}</i>\n` : '';
 
+  const effectiveStock = product.availableStock ?? product.stock;
   const stockLine = (() => {
-    if (product.stock == null) return '';
-    if (product.stock <= 0)   return `\n⛔ <b>ESGOTADO</b>\n`;
-    if (product.stock <= 5)   return `\n⚠️ <b>Apenas ${product.stock} em estoque!</b>\n`;
-    return `\n📦 <b>Estoque:</b> ${product.stock} disponíveis\n`;
+    if (effectiveStock == null) return '';
+    if (effectiveStock <= 0) return `\n⚠️ <b>Esgotado!</b>`;
+    if (effectiveStock <= 5) return `\n⚠️ <b>Apenas ${effectiveStock} em estoque!</b>`;
+    return '';
   })();
 
   const couponLine = session.pendingCoupon
-    ? `🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${couponDiscount.toFixed(2)})</b>\n` +
-      `💵 <b>Total com desconto:</b> R$ ${unitPrice.toFixed(2)}/un\n`
-    : '';
+    ? `\n🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> (-R$ ${couponDiscount.toFixed(2)})` : '';
 
   const qtyLine = qty > 1
-    ? `🔢 <b>Quantidade:</b> ${qty}x\n` +
-      `💵 <b>Total:</b> R$ ${price.toFixed(2)}\n`
-    : '';
+    ? `\n🔢 <b>Quantidade:</b> ${qty}x` : '';
 
-  const confirmMessage =
-    `📦 <b>${escapeHtml(product.name)}</b>${descLine}` +
-    stockLine +
-    `\n────────────────────\n` +
-    `💰 <b>Valor unitário:</b> R$ ${rawPrice.toFixed(2)}\n` +
-    couponLine +
-    qtyLine +
-    `👛 <b>Seu saldo:</b> R$ ${balance.toFixed(2)}\n\n` +
-    `<b>Como deseja pagar?</b>`;
+  const canPayBalance = balance >= price;
+  const canPayMixed   = balance > 0 && balance < price;
 
-  const canPayWithBalance = balance >= price;
-  const canPayMixed = balance > 0 && balance < price;
-  const hasCoupon = !!session.pendingCoupon;
+  const buttons: ReturnType<typeof Markup.button.callback>[][] = [];
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback(`💳 PIX (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)],
-    ...(canPayWithBalance
-      ? [[Markup.button.callback(`👛 Saldo (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]]
-      : []),
-    ...(canPayMixed
-      ? [[Markup.button.callback('🔀 Misto (Saldo + PIX)', `pay_mixed_${product.id}`)]]
-      : []),
-    ...(!hasCoupon
-      ? [[Markup.button.callback('🏷️ Aplicar cupom', `coupon_input_${product.id}`)]]
-      : []),
-    ...(hasCoupon
-      ? [[Markup.button.callback('🗑️ Remover cupom', `remove_coupon_${product.id}`)]]
-      : []),
-    [Markup.button.callback('❌ Cancelar', 'cancel_payment')],
+  buttons.push([
+    Markup.button.callback(
+      `💳 PIX — R$ ${price.toFixed(2)}`,
+      `pay_pix_${product.id}`
+    ),
   ]);
 
-  await editOrReply(ctx, confirmMessage, {
-    parse_mode: 'HTML',
-    reply_markup: keyboard.reply_markup,
-  });
+  if (canPayBalance) {
+    buttons.push([
+      Markup.button.callback(
+        `💰 Saldo (R$ ${balance.toFixed(2)}) — Pagar R$ ${price.toFixed(2)}`,
+        `pay_balance_${product.id}`
+      ),
+    ]);
+  }
+
+  if (canPayMixed) {
+    const pixPart = (price - balance).toFixed(2);
+    buttons.push([
+      Markup.button.callback(
+        `🔀 Misto — Saldo R$ ${balance.toFixed(2)} + PIX R$ ${pixPart}`,
+        `pay_mixed_${product.id}`
+      ),
+    ]);
+  }
+
+  if (!session.pendingCoupon) {
+    buttons.push([
+      Markup.button.callback('🏷️ Usar Cupom', `coupon_input_${product.id}`),
+    ]);
+  } else {
+    buttons.push([
+      Markup.button.callback('❌ Remover Cupom', `remove_coupon_${product.id}`),
+    ]);
+  }
+
+  buttons.push([Markup.button.callback('◀️ Voltar', `select_product_${product.id}`)]);
+
+  await editOrReply(
+    ctx,
+    `📦 <b>${escapeHtml(product.name)}</b>${descLine}${stockLine}${qtyLine}\n\n` +
+    `💰 <b>Total a pagar:</b> R$ ${price.toFixed(2)}${couponLine}\n\n` +
+    `<b>Como deseja pagar?</b>`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
+    }
+  );
 }
 
-// ─── Tela de input de cupom ──────────────────────────────────────────────────
+// ─── Tela de input de cupom ───────────────────────────────────────────────────
 
 export async function showCouponInputScreen(
   ctx: Context,
@@ -252,269 +273,224 @@ export async function showCouponInputScreen(
 
   await editOrReply(
     ctx,
-    `🏷️ <b>Aplicar cupom</b>\n\nDigite o código do cupom abaixo:`,
+    `🏷️ <b>Inserir Cupom</b>\n\nDigite o código do cupom:\n\n<i>Para cancelar, clique no botão abaixo.</i>`,
     {
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Cancelar', `back_to_payment_${productId}`)],
+        [Markup.button.callback('◀️ Voltar', `back_to_payment_${productId}`)],
       ]).reply_markup,
     }
   );
 }
 
-// ─── Executar pagamento ───────────────────────────────────────────────────────
+// ─── executePayment ───────────────────────────────────────────────────────────
 
 export async function executePayment(
   ctx: Context,
   productId: string,
-  paymentMethod: 'PIX' | 'BALANCE' | 'MIXED'
+  method: 'PIX' | 'BALANCE' | 'MIXED'
 ): Promise<void> {
   const userId = ctx.from!.id;
-  const lockKey = `payment_lock:${userId}`;
-  const lockToken = await acquireLock(lockKey, 30);
-  if (!lockToken) {
-    await ctx.reply('⏳ Aguarde, seu pagamento anterior ainda está sendo processado.', { parse_mode: 'HTML' });
+  const acquired = await acquireLock(String(userId));
+  if (!acquired) {
+    await ctx.reply('⏳ Aguarde, processando pagamento anterior...', { parse_mode: 'HTML' });
     return;
   }
 
-  const session = await getSession(userId);
-
   try {
-    const qty = session.pendingQty ?? 1;
-    const effectiveCoupon = session.pendingCoupon ?? undefined;
+    const session = await getSession(userId);
+    const firstName = ctx.from!.first_name;
+    const username  = ctx.from!.username;
+
+    await editOrReply(ctx, '⏳ <b>Processando pagamento...</b>', { parse_mode: 'HTML' });
 
     const payment = await apiClient.createPayment({
       telegramId: String(userId),
       productId,
-      quantity: qty,
-      firstName: ctx.from?.first_name,
-      username: ctx.from?.username,
-      paymentMethod,
-      ...(effectiveCoupon ? { couponCode: effectiveCoupon } : {}),
-    } as Parameters<typeof apiClient.createPayment>[0]);
+      firstName,
+      username,
+      paymentMethod: method,
+      couponCode: session.pendingCoupon ?? undefined,
+      referralCode: session.referralCode ?? undefined,
+    });
 
-    if (effectiveCoupon) {
-      await markCouponUsed(userId, effectiveCoupon);
-    }
-
-    if (paymentMethod === 'PIX' || paymentMethod === 'MIXED') {
-      const qrText   = payment.pixQrCodeText ?? payment.pixQrCode ?? '';
-      const amount   = payment.amount ?? 0;
-      const expiresAt = payment.expiresAt
-        ? new Date(payment.expiresAt).toISOString()
-        : new Date(Date.now() + 30 * 60 * 1000).toISOString();
-
-      let productName = payment.productName ?? '';
-      if (!productName) {
-        try {
-          const products = await apiClient.getProducts();
-          productName = products.find((p) => p.id === productId)?.name ?? '';
-        } catch { /**/ }
-      }
-
-      const captionLines = [
-        `💳 *PIX gerado com sucesso\!*`,
-        ``,
-        `📦 *Produto:* ${escapeMarkdownV2(productName)}`,
-        `💰 *Valor:* R\$ ${escapeMarkdownV2(Number(amount).toFixed(2))}`,
-        `⏰ *Expira em:* 30 minutos`,
-        ``,
-        `Copie o código abaixo ou escaneie o QR Code:`,
-      ].join('\n').slice(0, 900);
-
-      const pixMsg = await ctx.replyWithPhoto(
-        {
-          url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}`,
-        },
-        {
-          caption: captionLines,
-          parse_mode: 'MarkdownV2',
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
-            [Markup.button.callback('❌ Cancelar PIX', `cancel_payment_${payment.paymentId}`)],
-          ]).reply_markup,
-        }
-      );
-
-      await ctx.reply(`<code>${escapeHtml(qrText)}</code>`, { parse_mode: 'HTML' });
-
-      session.step              = 'awaiting_payment';
-      session.paymentId         = payment.paymentId;
-      session.pixExpiresAt      = expiresAt;
-      session.pixQrCodeText     = qrText;
-      session.mainMessageId     = pixMsg.message_id;
-      session.selectedProductId = productId;
-      session.pendingProductName = productName;
-      await saveSession(userId, session);
-
-      await schedulePIXExpiry(ctx, payment.paymentId, userId, expiresAt);
-    } else {
-      // BALANCE — entrega imediata
-      // CreatePaymentResponse não declara deliveryContent — acessamos via cast seguro
-      const deliveryContent = (payment as unknown as { deliveryContent?: string | null }).deliveryContent ?? null;
-      const productName     = payment.productName ?? productId;
-      const usedCoupons     = session.usedCoupons ?? [];
-      await clearSession(userId, session.firstName, usedCoupons);
-
+    if (payment.paidWithBalance) {
+      if (session.pendingCoupon) markCouponUsed(session);
+      await clearSession(userId, firstName);
       await ctx.reply(
-        buildDeliveryMessage(productName, deliveryContent),
+        buildDeliveryMessage(payment.productName ?? productId),
         {
           parse_mode: 'HTML',
           reply_markup: afterPurchaseKeyboard(productId).reply_markup,
         }
       );
+      return;
     }
-  } catch (err: unknown) {
-    console.error('[executePayment] erro:', err);
-    const msg    = err instanceof Error ? err.message : '';
-    const is502  = msg.includes('502') || msg.includes('Bad Gateway');
-    if (is502) {
-      await ctx.reply('⚠️ O servidor está inicializando. Tente novamente em alguns segundos.', { parse_mode: 'HTML' });
+
+    // PIX ou MIXED — aguarda confirmação
+    const expiresAt = payment.expiresAt ?? new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    const qrText    = payment.pixQrCodeText ?? '';
+    const qrImage   = payment.pixQrCode ?? '';
+
+    session.step         = 'awaiting_payment';
+    session.paymentId    = payment.paymentId;
+    session.pixExpiresAt = expiresAt;
+    session.pixQrCodeText = qrText;
+    if (session.pendingCoupon) markCouponUsed(session);
+    await saveSession(userId, session);
+
+    const amountStr = String((payment.amount ?? 0).toFixed(2)).replace('.', '\\.');
+    const balanceStr = payment.balanceUsed && payment.balanceUsed > 0
+      ? `\nSaldo usado: R\\$ ${String(payment.balanceUsed.toFixed(2)).replace('.', '\\.')}\n*PIX:* R\\$ ${String((payment.pixAmount ?? payment.amount ?? 0).toFixed(2)).replace('.', '\\.')}`
+      : '';
+
+    if (qrImage) {
+      await ctx.replyWithPhoto(
+        { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
+        {
+          caption:
+            `💳 *PIX gerado\!*\n\n` +
+            `*Total:* R\\$ ${amountStr}${balanceStr}\n\n` +
+            `Escaneie o QR ou copie o código abaixo:`,
+          parse_mode: 'MarkdownV2',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
+            [Markup.button.callback('❌ Cancelar PIX',        `cancel_payment_${payment.paymentId}`)],
+          ]).reply_markup,
+        }
+      );
     } else {
       await ctx.reply(
-        `❌ Erro ao processar pagamento: ${escapeHtml(msg || 'Erro desconhecido')}`,
-        { parse_mode: 'HTML' }
+        `💳 <b>PIX gerado!</b>\n\nTotal: R$ ${(payment.amount ?? 0).toFixed(2)}\n\nCopie o código abaixo:`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
+            [Markup.button.callback('❌ Cancelar PIX',        `cancel_payment_${payment.paymentId}`)],
+          ]).reply_markup,
+        }
       );
     }
+    await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
+    await schedulePIXExpiry(ctx, payment.paymentId, userId, expiresAt);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Erro desconhecido';
+    console.error('[executePayment] erro:', err);
+    await ctx.reply(`❌ ${escapeHtml(msg)}`, { parse_mode: 'HTML' });
   } finally {
-    await releaseLock(lockKey, lockToken);
+    await releaseLock(String(userId));
   }
 }
 
-// ─── Verificar pagamento ──────────────────────────────────────────────────────
+// ─── handleCheckPayment ───────────────────────────────────────────────────────
 
 export async function handleCheckPayment(
   ctx: Context,
   paymentId: string
 ): Promise<void> {
-  const userId  = ctx.from!.id;
-  const session = await getSession(userId);
-
   try {
-    const status = await apiClient.getPaymentStatus(paymentId, String(userId));
+    const status = await apiClient.getPaymentStatus(paymentId);
 
-    if (status.status === 'PAID' || status.status === 'APPROVED') {
-      const productId       = session.selectedProductId;
-      const productName     = status.productName ?? session.pendingProductName ?? '';
-      const deliveryContent = status.deliveryContent ?? null;
-
-      const usedCoupons = session.usedCoupons ?? [];
-      await clearSession(userId, session.firstName, usedCoupons);
-
+    if (status.status === 'APPROVED') {
+      const userId    = ctx.from!.id;
+      const firstName = ctx.from!.first_name;
+      cancelPIXTimer(userId);
+      await clearSession(userId, firstName);
       await ctx.reply(
-        buildDeliveryMessage(productName, deliveryContent),
+        buildDeliveryMessage('seu produto'),
         {
           parse_mode: 'HTML',
-          reply_markup: afterPurchaseKeyboard(productId).reply_markup,
+          reply_markup: afterPurchaseKeyboard().reply_markup,
         }
       );
-    } else if (status.status === 'EXPIRED' || status.status === 'CANCELLED') {
-      await editOrReply(
-        ctx,
-        `❌ <b>Pagamento ${status.status === 'EXPIRED' ? 'expirado' : 'cancelado'}</b>\n\nGere um novo pedido quando quiser.`,
-        {
-          parse_mode: 'HTML',
-          reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
-            [Markup.button.callback('🏠 Menu', 'show_home')],
-          ]).reply_markup,
-        }
-      );
-      const usedCoupons = session.usedCoupons ?? [];
-      await clearSession(userId, session.firstName, usedCoupons);
-    } else {
-      if (session.pixQrCodeText) {
-        await ctx.reply(
-          `⏳ Pagamento ainda não confirmado. Copie o código PIX abaixo:\n\n<code>${escapeHtml(session.pixQrCodeText)}</code>`,
-          { parse_mode: 'HTML' }
-        );
-      } else {
-        await ctx.answerCbQuery('⏳ Pagamento ainda não confirmado. Aguarde.').catch(() => {});
-      }
+      return;
     }
-  } catch (err: unknown) {
+
+    if (status.status === 'EXPIRED' || status.status === 'CANCELLED') {
+      await ctx.reply(
+        `⏰ Este PIX expirou ou foi cancelado. Use /produtos para fazer um novo pedido.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    await ctx.reply(
+      `⏳ Pagamento ainda pendente. Aguarde a confirmação do PIX.`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.callback('🔄 Verificar novamente', `check_payment_${paymentId}`)],
+          [Markup.button.callback('❌ Cancelar PIX',        `cancel_payment_${paymentId}`)],
+        ]).reply_markup,
+      }
+    );
+  } catch (err) {
     console.error('[handleCheckPayment] erro:', err);
-    await ctx.reply('❌ Erro ao verificar pagamento. Tente novamente.', { parse_mode: 'HTML' });
+    await ctx.reply('❌ Erro ao verificar pagamento.', { parse_mode: 'HTML' });
   }
 }
 
-// ─── Cancelar pagamento ───────────────────────────────────────────────────────
+// ─── handleCancelPayment ──────────────────────────────────────────────────────
 
 export async function handleCancelPayment(
   ctx: Context,
   paymentId: string
 ): Promise<void> {
-  const userId    = ctx.from!.id;
-  const lockKey   = `cancel_lock:${userId}`;
-  const lockToken = await acquireLock(lockKey, 15);
-  if (!lockToken) return;
-
-  const session = await getSession(userId);
-
   try {
-    await apiClient.cancelPayment(paymentId, String(userId));
-    await editOrReply(
-      ctx,
-      `❌ <b>PIX cancelado.</b>\n\nUse /produtos para fazer um novo pedido.`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
-          [Markup.button.callback('🏠 Menu', 'show_home')],
-        ]).reply_markup,
-      }
-    );
+    const result = await apiClient.cancelPayment(paymentId);
+    const userId    = ctx.from!.id;
+    const firstName = ctx.from!.first_name;
     cancelPIXTimer(userId);
-    const usedCoupons = session.usedCoupons ?? [];
-    await clearSession(userId, session.firstName, usedCoupons).catch(() => {});
-  } finally {
-    await releaseLock(lockKey, lockToken);
+    await clearSession(userId, firstName);
+
+    if (result.cancelled) {
+      await ctx.reply(
+        `✅ PIX cancelado com sucesso. Use /produtos para fazer um novo pedido.`,
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      await ctx.reply(
+        `⚠️ ${escapeHtml(result.reason ?? 'Não foi possível cancelar o pagamento.')}`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  } catch (err) {
+    console.error('[handleCancelPayment] erro:', err);
+    await ctx.reply('❌ Erro ao cancelar pagamento.', { parse_mode: 'HTML' });
   }
 }
 
-// ─── Agendar expiração do PIX ─────────────────────────────────────────────────
+// ─── schedulePIXExpiry ────────────────────────────────────────────────────────
 
 export async function schedulePIXExpiry(
   ctx: Context,
   paymentId: string,
   userId: number,
-  expiresAtISO: string
+  expiresAt: string
 ): Promise<void> {
-  const expiresAt     = new Date(expiresAtISO).getTime();
-  const now           = Date.now();
-  const msUntilExpiry = expiresAt - now;
+  const ms = new Date(expiresAt).getTime() - Date.now();
+  if (ms <= 0) return;
 
-  const expiredKeyboard = Markup.inlineKeyboard([
-    [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
-    [Markup.button.callback('🏠 Menu', 'show_home')],
-  ]);
-
-  async function handleExpiry(): Promise<void> {
+  const timer = setTimeout(async () => {
     try {
-      const status = await apiClient.getPaymentStatus(paymentId, String(userId));
-      if (status.status !== 'PAID' && status.status !== 'APPROVED') {
-        await ctx.reply(
-          '⏰ <b>Seu PIX expirou.</b>\n\nGere um novo pedido quando quiser.',
-          { parse_mode: 'HTML', reply_markup: expiredKeyboard.reply_markup }
-        );
-        const session = await getSession(userId);
-        await clearSession(userId, session.firstName, session.usedCoupons ?? []);
-      }
-    } catch { /**/ }
-  }
-
-  if (msUntilExpiry <= 0) {
-    await handleExpiry();
-    return;
-  }
-
-  const t = setTimeout(async () => {
-    try {
-      await handleExpiry();
-    } finally {
+      const session = await getSession(userId);
+      if (session.paymentId !== paymentId) return;
+      const firstName = session.firstName ?? '';
       cancelPIXTimer(userId);
+      await clearSession(userId, firstName);
+      await ctx.reply(
+        `⏰ <b>PIX expirado!</b>\n\nSeu PIX expirou. Use /produtos para gerar um novo pedido.`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
+          ]).reply_markup,
+        }
+      );
+    } catch (err) {
+      console.error('[PIXExpiry] erro:', err);
     }
-  }, msUntilExpiry);
+  }, ms);
 
-  registerPIXTimer(userId, t);
+  registerPIXTimer(userId, timer);
 }
