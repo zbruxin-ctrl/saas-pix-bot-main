@@ -15,6 +15,7 @@
  * FEAT-SUPPORT: showHelp busca supportPhone via apiClient.getBotConfig() (painel admin).
  * FIX-WELCOME: showHome busca welcomeMessage via apiClient.getBotConfig() (painel admin).
  * FIX-MD2HTML: welcomeMessage convertida de Markdown para HTML antes de exibir.
+ * FIX-NODUP: cabeçalho hardcoded removido — welcomeMessage já contém o cabeçalho completo.
  */
 import { Telegraf, Markup } from 'telegraf';
 import type { Context } from 'telegraf';
@@ -55,42 +56,34 @@ async function getBotUsername(): Promise<string> {
 }
 
 // ─── Markdown → HTML helper ───────────────────────────────────────────────────
-// Converte subset básico de Markdown (negrito, itálico, código, links) para HTML.
-// Necessário pois o painel admin salva a mensagem com Markdown mas o bot usa parse_mode HTML.
+// Converte subset básico de Markdown para HTML (parse_mode: HTML).
 function mdToHtml(text: string): string {
   return text
-    // Escapa caracteres HTML antes de inserir tags (evita double-encode)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    // **negrito** → <b>negrito</b>
     .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
-    // *itálico* ou _itálico_ → <i>itálico</i>
     .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<i>$1</i>')
     .replace(/_(.*?)_/g, '<i>$1</i>')
-    // `código` → <code>código</code>
     .replace(/`([^`]+)`/g, '<code>$1</code>')
-    // [texto](url) → <a href="url">texto</a>
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
 }
 
 // ─── showHome ─────────────────────────────────────────────────────────────────
 
 const DEFAULT_WELCOME =
+  '👋 Olá! Bem-vindo!\n\n' +
   '🛒 Aqui você pode adquirir nossos produtos de forma rápida e segura.\n\n' +
   '💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo pré-carregado</b>.';
 
 async function showHome(ctx: Context): Promise<void> {
   const config = await apiClient.getBotConfig().catch(() => ({ welcomeMessage: '' }));
-  // Converte Markdown → HTML caso o admin tenha digitado com formatação Markdown
+  // welcomeMessage do banco é a mensagem completa (já inclui saudação, corpo, etc.)
+  // Não adicionamos nenhum cabeçalho fixo aqui para evitar duplicação.
   const rawMsg = config.welcomeMessage?.trim();
   const welcomeMsg = rawMsg ? mdToHtml(rawMsg) : DEFAULT_WELCOME;
 
-  const firstName = ctx.from?.first_name ?? 'visitante';
-  const text =
-    `👋 Olá, <b>${firstName}</b>! Bem-vindo!\n\n` +
-    `${welcomeMsg}\n\n` +
-    `Escolha uma opção no <b>menu</b> para começar:\n\nPara ver nossos produtos, clique no botão abaixo:`;
+  const text = `${welcomeMsg}\n\nPara ver nossos produtos, clique no botão abaixo:`;
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
@@ -119,7 +112,6 @@ bot.start(async (ctx) => {
 
     if (referralCode && referralCode !== String(userId)) {
       try { await registerReferral(referralCode, String(userId)); } catch { /**/ }
-      // FIX #6: salva referralCode na sessão para ser propagado ao createPayment
       if (!session.referralCode) {
         session.referralCode = referralCode;
       }
@@ -393,7 +385,6 @@ bot.action('show_referral', async (ctx) => {
 // ─── Ajuda ────────────────────────────────────────────────────────────────────
 
 async function showHelp(ctx: Context): Promise<void> {
-  // Busca o telefone de suporte dinamicamente do painel admin
   const config = await apiClient.getBotConfig().catch(() => ({ supportPhone: '' }));
   const phone = config.supportPhone || '';
 
@@ -471,7 +462,6 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
   try {
     const productId = ctx.match[1];
     const userId    = ctx.from.id;
-    // FIX ITEM-11: sessão lida mas NÃO salva aqui — nenhuma alteração foi feita nela
     await getSession(userId);
 
     let product: ProductDTO | undefined;
@@ -529,7 +519,7 @@ bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx) => {
   }
 });
 
-// ─── Métodos de pagamento ────────────────────────────────────────────────────────────
+// ─── Métodos de pagamento ─────────────────────────────────────────────────────
 
 bot.action(/^pay_pix_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -629,7 +619,6 @@ bot.on('text', async (ctx) => {
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
       const productId = session.pendingProductId;
 
-      // Busca produto para calcular o valor a ser enviado ao endpoint de validação
       let orderAmount = 0;
       try {
         const products = await apiClient.getProducts();
@@ -701,7 +690,6 @@ bot.on('text', async (ctx) => {
           ctx.from.username
         );
 
-        // FIX ITEM-1: pixCopyPaste não existe em CreateDepositResponse — usa apenas pixQrCodeText
         const qrText  = deposit.pixQrCodeText ?? '';
         const qrImage = deposit.pixQrCode ?? '';
 
@@ -731,7 +719,6 @@ bot.on('text', async (ctx) => {
         }
         await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
 
-        // FIX ITEM-8: agenda timer de expiração para o PIX de depósito
         if (deposit.expiresAt) {
           await schedulePIXExpiry(ctx, deposit.paymentId, userId, deposit.expiresAt);
         }
