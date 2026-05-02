@@ -1,14 +1,9 @@
 /**
  * Bot Telegram principal — registro de handlers e inicialização.
- *
- * FEAT: botão Indicações no menu; histórico de transações em Meu Saldo;
- *       botão Cancelar no depósito; ajuda com WhatsApp + lista de comandos;
- *       estoque ao lado dos produtos; cupom único por usuário (check local);
- *       emoji 👛 carteira no botão de saldo; WhatsApp fixo na ajuda.
  */
 import { Telegraf, Markup, Context } from 'telegraf';
 import { apiClient } from './services/apiClient';
-import { getSession, saveSession, clearSession, markCouponUsed, hasCouponBeenUsed } from './services/session';
+import { getSession, saveSession, clearSession } from './services/session';
 import { validateCoupon } from './services/couponClient';
 import { registerReferral } from './services/referralClient';
 import {
@@ -44,9 +39,9 @@ async function showHome(ctx: any) {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
-    [Markup.button.callback('👛 Meu Saldo', 'show_balance')],
+    [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
     [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
-    [Markup.button.callback('👥 Indicações', 'show_referrals')],
+    [Markup.button.callback('👥 Indicações', 'show_referral')],
     [Markup.button.callback('❓ Ajuda', 'show_help')],
   ]);
 
@@ -68,9 +63,7 @@ bot.start(async (ctx) => {
     const referralCode = ctx.startPayload || undefined;
 
     if (referralCode && referralCode !== String(userId)) {
-      try {
-        await registerReferral(referralCode, String(userId));
-      } catch { /**/ }
+      try { await registerReferral(referralCode, String(userId)); } catch { /**/ }
     }
 
     if (session.step === 'awaiting_payment' && session.paymentId && session.pixExpiresAt) {
@@ -112,10 +105,14 @@ async function showProducts(ctx: any) {
     }
 
     const buttons = products.map((p: ProductDTO) => {
-      const stockTag = p.stock != null ? ` [${p.stock} un.]` : '';
+      // monta label com estoque
+      let stockLabel = '';
+      if (p.stock != null) {
+        stockLabel = p.stock <= 0 ? ' ❌ Esgotado' : ` (${p.stock} restantes)`;
+      }
       return [
         Markup.button.callback(
-          `${p.name} — R$ ${Number(p.price).toFixed(2)}${stockTag}`,
+          `${p.name} — R$ ${Number(p.price).toFixed(2)}${stockLabel}`,
           `select_product_${p.id}`
         ),
       ];
@@ -152,19 +149,22 @@ async function showBalance(ctx: any) {
     const userId = ctx.from!.id;
     const data = await apiClient.getBalance(String(userId));
 
-    const txList: any[] = data.transactions ?? [];
+    // Histórico de transações
     let historyText = '';
-    if (txList.length > 0) {
-      const lines = txList.slice(0, 8).map((tx: any) => {
-        const sign = tx.type === 'CREDIT' || tx.amount > 0 ? '➕' : '➖';
-        const val = Math.abs(Number(tx.amount)).toFixed(2);
-        const desc = tx.description ? ` — ${tx.description}` : '';
-        return `${sign} R$ ${val}${desc}`;
+    const txs: any[] = data.transactions ?? [];
+    if (txs.length > 0) {
+      const lines = txs.slice(0, 5).map((t: any) => {
+        const sign = t.type === 'CREDIT' ? '+' : '-';
+        const emoji = t.type === 'CREDIT' ? '🟢' : '🔴';
+        const date = t.createdAt ? new Date(t.createdAt).toLocaleDateString('pt-BR') : '';
+        return `${emoji} ${sign}R$ ${Number(t.amount).toFixed(2)} — ${t.description ?? t.type}${date ? ` <i>(${date})</i>` : ''}`;
       });
-      historyText = `\n\n📋 <b>Últimas transações:</b>\n${lines.join('\n')}`;
+      historyText = `\n\n📃 <b>Últimas transações:</b>\n${lines.join('\n')}`;
+    } else {
+      historyText = '\n\n<i>Nenhuma transação encontrada.</i>';
     }
 
-    const text = `👛 <b>Seu saldo:</b> R$ ${Number(data.balance).toFixed(2)}${historyText}`;
+    const text = `💰 <b>Seu saldo:</b> R$ ${Number(data.balance).toFixed(2)}${historyText}`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('💳 Depositar', 'deposit_balance')],
       [Markup.button.callback('◀️ Voltar', 'show_home')],
@@ -196,15 +196,17 @@ bot.action('deposit_balance', async (ctx) => {
     const session = await getSession(userId);
     session.step = 'awaiting_deposit_amount';
     await saveSession(userId, session);
-    await ctx.reply(
-      `💳 <b>Depositar saldo</b>\n\nDigite o valor que deseja depositar (mínimo R$ 1,00):`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('❌ Cancelar', 'cancel_deposit')],
-        ]).reply_markup,
-      }
-    );
+    const text = `💳 <b>Depositar saldo</b>\n\nDigite o valor que deseja depositar (mínimo R$ 1,00):\n\n<i>Para cancelar, clique no botão abaixo.</i>`;
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('❌ Cancelar', 'cancel_deposit')],
+    ]);
+    if (ctx.callbackQuery) {
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
+        return;
+      } catch { /* ignora */ }
+    }
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
   } catch (err) {
     console.error('[deposit_balance] erro:', err);
   }
@@ -214,64 +216,9 @@ bot.action('cancel_deposit', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const userId = ctx.from!.id;
   const session = await getSession(userId);
-  if (session.step === 'awaiting_deposit_amount') {
-    session.step = 'idle';
-    await saveSession(userId, session);
-  }
-  await showHome(ctx);
-});
-
-// ─── Indicações ───────────────────────────────────────────────────────────────
-
-async function showReferrals(ctx: any) {
-  try {
-    const userId = ctx.from!.id;
-    let referralData: any;
-    try {
-      referralData = await apiClient.getReferrals(String(userId));
-    } catch {
-      referralData = null;
-    }
-
-    const botUsername = (await bot.telegram.getMe()).username;
-    const referralLink = `https://t.me/${botUsername}?start=${userId}`;
-
-    let statsText = '';
-    if (referralData) {
-      const total = referralData.totalReferrals ?? 0;
-      const earned = referralData.totalEarned ?? 0;
-      statsText =
-        `\n\n📊 <b>Suas estatísticas:</b>\n` +
-        `👤 Indicados: <b>${total}</b>\n` +
-        `💵 Total ganho: <b>R$ ${Number(earned).toFixed(2)}</b>`;
-    }
-
-    const text =
-      `👥 <b>Programa de Indicações</b>\n\n` +
-      `Indique amigos e ganhe bônus para cada compra feita pela sua indicação!\n\n` +
-      `🔗 <b>Seu link de indicação:</b>\n` +
-      `<code>${referralLink}</code>${statsText}`;
-
-    const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('◀️ Voltar', 'show_home')],
-    ]);
-
-    if (ctx.callbackQuery) {
-      try {
-        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
-        return;
-      } catch { /* ignora */ }
-    }
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
-  } catch (err) {
-    console.error('[showReferrals] erro:', err);
-    await ctx.reply('❌ Erro ao carregar indicações.', { parse_mode: 'HTML' });
-  }
-}
-
-bot.action('show_referrals', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  await showReferrals(ctx);
+  session.step = 'idle';
+  await saveSession(userId, session);
+  await showBalance(ctx);
 });
 
 // ─── /pedidos ─────────────────────────────────────────────────────────────────
@@ -320,37 +267,88 @@ bot.action('show_orders', async (ctx) => {
   await showOrders(ctx);
 });
 
+// ─── Indicações ────────────────────────────────────────────────────────────────
+
+async function showReferral(ctx: any) {
+  try {
+    const userId = ctx.from!.id;
+    let referralInfo: any = null;
+    try {
+      referralInfo = await apiClient.getReferralInfo(String(userId));
+    } catch { /* ignora se endpoint não existir */ }
+
+    const botUsername = (await bot.telegram.getMe()).username;
+    const link = `https://t.me/${botUsername}?start=${userId}`;
+
+    let statsText = '';
+    if (referralInfo) {
+      statsText =
+        `\n\n📊 <b>Suas estatísticas:</b>\n` +
+        `• Indicados: <b>${referralInfo.referralCount ?? 0}</b>\n` +
+        `• Bônus acumulado: <b>R$ ${Number(referralInfo.bonusEarned ?? 0).toFixed(2)}</b>`;
+    }
+
+    const text =
+      `👥 <b>Programa de Indicações</b>\n\n` +
+      `Indique amigos e ganhe bônus quando eles realizarem a primeira compra!\n\n` +
+      `🔗 <b>Seu link de indicação:</b>\n<code>${link}</code>` +
+      statsText;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('◀️ Voltar', 'show_home')],
+    ]);
+
+    if (ctx.callbackQuery) {
+      try {
+        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
+        return;
+      } catch { /* ignora */ }
+    }
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
+  } catch (err) {
+    console.error('[showReferral] erro:', err);
+    await ctx.reply('❌ Erro ao carregar indicações.', { parse_mode: 'HTML' });
+  }
+}
+
+bot.command('indicacoes', showReferral);
+
+bot.action('show_referral', async (ctx) => {
+  await ctx.answerCbQuery('👥 Carregando indicações...').catch(() => {});
+  await showReferral(ctx);
+});
+
 // ─── Ajuda ────────────────────────────────────────────────────────────────────
 
 async function showHelp(ctx: any) {
   const phone = process.env.SUPPORT_PHONE_NUMBER ?? '';
+  const whatsappLine = phone
+    ? `\n📞 <a href="https://wa.me/${phone}">Falar com suporte no WhatsApp</a>`
+    : '';
 
   const text =
     `<b>❓ Central de Ajuda</b>\n\n` +
     `<b>Como funciona?</b>\n` +
     `1. Escolha um produto em 🛒 <b>Ver Produtos</b>\n` +
-    `2. Selecione a quantidade desejada\n` +
-    `3. Escolha a forma de pagamento (PIX ou Saldo)\n` +
-    `4. Pague e receba seu produto automaticamente\n\n` +
-    `<b>📋 Comandos disponíveis:</b>\n` +
+    `2. Selecione a forma de pagamento (PIX ou Saldo)\n` +
+    `3. Pague e receba seu produto automaticamente\n\n` +
+    `<b>💬 Comandos disponíveis:</b>\n` +
     `/start — Mostra o menu inicial\n` +
-    `/produtos — Lista os produtos disponíveis\n` +
-    `/saldo — Exibe seu saldo e histórico de transações\n` +
-    `/meus_pedidos — Histórico dos seus pedidos\n` +
-    `/ajuda — Esta central de ajuda\n` +
-    `/suporte — Contato direto com o suporte\n\n` +
-    `<b>❗ Dúvidas frequentes:</b>\n` +
-    `• PIX não aprovado? Aguarde até 2 min e clique em Verificar.\n` +
-    `• Produto não entregue? Fale com o suporte abaixo.`;
+    `/produtos — Lista de produtos disponíveis\n` +
+    `/saldo — Consultar saldo e histórico\n` +
+    `/meus_pedidos — Ver seus pedidos\n` +
+    `/indicacoes — Seu link de indicação\n` +
+    `/ajuda — Exibe esta mensagem de ajuda\n` +
+    `/suporte — Contato com o suporte\n\n` +
+    `<b>Problemas?</b>\n` +
+    `• PIX não aprovado? Aguarde até 2 minutos e verifique novamente.\n` +
+    `• Produto não entregue? Entre em contato com o suporte.` +
+    whatsappLine;
 
-  // Monta os botões — WhatsApp sempre aparece se o número estiver configurado
-  const buttons: ReturnType<typeof Markup.button.callback>[][] = [];
-  if (phone) {
-    buttons.push([Markup.button.url('💬 Falar no WhatsApp', `https://wa.me/${phone}`)]);
-  }
-  buttons.push([Markup.button.callback('◀️ Voltar', 'show_home')]);
-
-  const keyboard = Markup.inlineKeyboard(buttons);
+  const keyboard = Markup.inlineKeyboard([
+    ...(phone ? [[Markup.button.url('📞 Suporte WhatsApp', `https://wa.me/${phone}`)]] : []),
+    [Markup.button.callback('◀️ Voltar', 'show_home')],
+  ]);
 
   if (ctx.callbackQuery) {
     try {
@@ -406,21 +404,16 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
       session.products = products as never;
       await saveSession(userId, session);
     } catch (err) {
-      console.error('[select_product] erro ao buscar produtos:', err);
+      console.error('[select_product] erro:', err);
       await ctx.reply('❌ Erro ao buscar produto. Tente novamente.', { parse_mode: 'HTML' });
       return;
     }
 
-    if (!product) {
-      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
-      return;
-    }
-
+    if (!product) { await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' }); return; }
     if (product.stock != null && product.stock <= 0) {
       await ctx.reply('⚠️ Este produto está esgotado no momento.', { parse_mode: 'HTML' });
       return;
     }
-
     await showQuantityScreen(ctx as unknown as Context, product);
   } catch (err) {
     console.error('[select_product_action] erro:', err);
@@ -447,10 +440,7 @@ bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx) => {
       apiClient.getBalance(String(userId)).catch(() => ({ balance: 0, transactions: [] })),
     ]);
     const product = products.find((p) => p.id === productId);
-    if (!product) {
-      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
-      return;
-    }
+    if (!product) { await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' }); return; }
 
     await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
   } catch (err) {
@@ -458,7 +448,9 @@ bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx) => {
   }
 });
 
-// ─── Métodos de pagamento ─────────────────────────────────────────────────────
+// ─── Métodos de pagamento (com botão cancelar) ───────────────────────────────
+// Nota: showPaymentMethodScreen já deve incluir o botão cancelar no handler/payments.ts
+// Aqui garantimos que as actions de pix/balance/mixed passam o cancel action
 
 bot.action(/^pay_pix_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -492,7 +484,7 @@ bot.action('cancel_payment', async (ctx) => {
   const userId = ctx.from!.id;
   const session = await getSession(userId);
   cancelPIXTimer(userId);
-  await clearSession(userId, session.firstName, session.usedCoupons ?? []);
+  await clearSession(userId, session.firstName);
   await ctx.reply('❌ Pedido cancelado. Use /produtos para começar novamente.', { parse_mode: 'HTML' });
 });
 
@@ -549,31 +541,9 @@ bot.on('text', async (ctx) => {
     const session = await getSession(userId);
     const text = ctx.message.text.trim();
 
-    // ── Cupom ──────────────────────────────────────────────────────────────
+    // ── Cupom
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
       const couponCode = text.toUpperCase();
-
-      // Verifica se o usuário já usou este cupom antes (controle local por sessão/Redis)
-      const alreadyUsed = await hasCouponBeenUsed(userId, couponCode);
-      if (alreadyUsed) {
-        await ctx.reply(
-          `❌ Você já utilizou o cupom <code>${couponCode}</code> anteriormente.\nCada cupom pode ser usado apenas <b>uma vez</b> por conta.`,
-          { parse_mode: 'HTML' }
-        );
-        // Volta para a tela de pagamento
-        try {
-          const products = await apiClient.getProducts();
-          const product = products.find((p) => p.id === session.pendingProductId);
-          const walletData = await apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 }));
-          if (product) {
-            session.step = 'selecting_product';
-            await saveSession(userId, session);
-            await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
-          }
-        } catch { /* ignora */ }
-        return;
-      }
-
       try {
         const products = await apiClient.getProducts();
         const product = products.find((p) => p.id === session.pendingProductId);
@@ -588,7 +558,10 @@ bot.on('text', async (ctx) => {
           session.step = 'selecting_product';
           await saveSession(userId, session);
 
-          const walletData = await apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 }));
+          const [, walletData] = await Promise.all([
+            Promise.resolve(),
+            apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 })),
+          ]);
 
           if (product) {
             await ctx.reply(
@@ -598,17 +571,7 @@ bot.on('text', async (ctx) => {
             await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
           }
         } else {
-          // Exibe erro e volta à tela de pagamento automaticamente
-          await ctx.reply(`❌ ${result.error ?? 'Cupom inválido ou expirado.'}`, { parse_mode: 'HTML' });
-          try {
-            const walletData = await apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 }));
-            const product2 = products.find((p) => p.id === session.pendingProductId);
-            if (product2) {
-              session.step = 'selecting_product';
-              await saveSession(userId, session);
-              await showPaymentMethodScreen(ctx as unknown as Context, product2, Number(walletData.balance));
-            }
-          } catch { /* ignora */ }
+          await ctx.reply(`❌ ${result.error ?? 'Cupom inválido.'}`, { parse_mode: 'HTML' });
         }
       } catch (err) {
         console.error('[coupon_validate] erro:', err);
@@ -617,7 +580,7 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    // ── Depósito ───────────────────────────────────────────────────────────
+    // ── Depósito
     if (session.step === 'awaiting_deposit_amount') {
       const amount = parseFloat(text.replace(',', '.'));
       if (isNaN(amount) || amount < 1) {
@@ -645,7 +608,7 @@ bot.on('text', async (ctx) => {
         await ctx.replyWithPhoto(
           { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
           {
-            caption: `💳 *Depósito de R\$ ${String(amount.toFixed(2)).replace('.', '\\.')}*\n\nEscaneie o QR ou copie o código abaixo:`,
+            caption: `💳 *Depósito de R\\$ ${String(amount.toFixed(2)).replace('.', '\\.')}*\n\nEscaneie o QR ou copie o código abaixo:`,
             parse_mode: 'MarkdownV2',
             reply_markup: Markup.inlineKeyboard([
               [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
