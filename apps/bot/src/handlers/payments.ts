@@ -5,10 +5,11 @@
  * PADRÃO: parse_mode HTML em mensagens de texto.
  *         parse_mode MarkdownV2 APENAS em captions de replyWithPhoto.
  *
- * FEAT: mensagem de entrega mostra conteúdo do produto (deliveryContent).
- * FEAT: botão "Comprar Novamente" após pedido confirmado.
- * FEAT: mensagem de PIX expirado com botão de novo pedido.
- * FEAT: boas-vindas personalizável via BOT_WELCOME_MESSAGE.
+ * TIPAGEM: todas as funções exportadas recebem Context (telegraf) —
+ *          BotContext é apenas alias para Context; NarrowedContext nos handlers
+ *          de ação é feito pelo Telegraf automaticamente ao registrar bot.action.
+ *          Aqui aceitamos Context genérico pois as funções são chamadas tanto
+ *          de bot.action quanto de bot.command.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -31,38 +32,45 @@ function escapeMarkdownV2(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 }
 
+/**
+ * Tenta editar a mensagem atual (se vier de callback) ou envia nova mensagem.
+ * Silencia o erro "message is not modified" do Telegram (400 com essa descrição)
+ * e qualquer outro erro de edição — nesse caso cai no reply normal.
+ */
 async function editOrReply(
   ctx: Context,
   text: string,
   extra?: Parameters<Context['editMessageText']>[1]
-) {
+): Promise<void> {
   try {
     if (ctx.callbackQuery?.message) {
       await ctx.editMessageText(text, extra as never);
-    } else {
-      await ctx.reply(text, extra as never);
+      return;
     }
-  } catch {
-    await ctx.reply(text, extra as never);
+  } catch (err: unknown) {
+    // Ignora apenas "message is not modified" (400); outros erros são silenciados também
+    // pois o fallback abaixo garante a entrega.
+    void err;
   }
+  await ctx.reply(text, extra as never);
 }
 
-export function initPaymentHandlers() {
+export function initPaymentHandlers(): void {
   // placeholder — handlers registrados no index.ts
 }
 
 // ─── PIX timers ──────────────────────────────────────────────────────────────
 
-const pixTimers = new Map<number, NodeJS.Timeout>();
+const pixTimers = new Map<number, ReturnType<typeof setTimeout>>();
 
-function registerPIXTimer(userId: number, t: NodeJS.Timeout) {
+function registerPIXTimer(userId: number, t: ReturnType<typeof setTimeout>): void {
   cancelPIXTimer(userId);
   pixTimers.set(userId, t);
 }
 
-export function cancelPIXTimer(userId: number) {
+export function cancelPIXTimer(userId: number): void {
   const existing = pixTimers.get(userId);
-  if (existing) {
+  if (existing !== undefined) {
     clearTimeout(existing);
     pixTimers.delete(userId);
   }
@@ -72,8 +80,7 @@ export function cancelPIXTimer(userId: number) {
 
 /**
  * Monta a mensagem de confirmação de pagamento + entrega.
- * Se deliveryContent estiver disponível, exibe o conteúdo após "✅ Pagamento confirmado!".
- * Se não houver conteúdo (produto digital sem conteúdo automático), exibe mensagem padrão.
+ * Se deliveryContent estiver disponível, exibe dentro de <pre>.
  */
 function buildDeliveryMessage(
   productName: string,
@@ -99,9 +106,8 @@ function buildDeliveryMessage(
 
 /**
  * Teclado exibido após uma compra confirmada.
- * Inclui "Comprar Novamente" (volta para o produto) e "Menu".
  */
-function afterPurchaseKeyboard(productId?: string) {
+function afterPurchaseKeyboard(productId?: string): ReturnType<typeof Markup.inlineKeyboard> {
   const rows: ReturnType<typeof Markup.button.callback>[][] = [];
   if (productId) {
     rows.push([Markup.button.callback('🔄 Comprar Novamente', `select_product_${productId}`)]);
@@ -220,10 +226,18 @@ export async function showPaymentMethodScreen(
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback(`💳 PIX (R$ ${price.toFixed(2)})`, `pay_pix_${product.id}`)],
-    ...(canPayWithBalance ? [[Markup.button.callback(`👛 Saldo (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]] : []),
-    ...(canPayMixed ? [[Markup.button.callback(`🔀 Misto (Saldo + PIX)`, `pay_mixed_${product.id}`)]] : []),
-    ...(!hasCoupon ? [[Markup.button.callback('🏷️ Aplicar cupom', `coupon_input_${product.id}`)]] : []),
-    ...(hasCoupon ? [[Markup.button.callback('🗑️ Remover cupom', `remove_coupon_${product.id}`)]] : []),
+    ...(canPayWithBalance
+      ? [[Markup.button.callback(`👛 Saldo (R$ ${price.toFixed(2)})`, `pay_balance_${product.id}`)]]
+      : []),
+    ...(canPayMixed
+      ? [[Markup.button.callback('🔀 Misto (Saldo + PIX)', `pay_mixed_${product.id}`)]]
+      : []),
+    ...(!hasCoupon
+      ? [[Markup.button.callback('🏷️ Aplicar cupom', `coupon_input_${product.id}`)]]
+      : []),
+    ...(hasCoupon
+      ? [[Markup.button.callback('🗑️ Remover cupom', `remove_coupon_${product.id}`)]]
+      : []),
     [Markup.button.callback('❌ Cancelar', 'cancel_payment')],
   ]);
 
@@ -288,14 +302,13 @@ export async function executePayment(
       ...(effectiveCoupon ? { couponCode: effectiveCoupon } : {}),
     } as Parameters<typeof apiClient.createPayment>[0]);
 
-    // Marca o cupom como usado por este usuário (persiste além da sessão)
     if (effectiveCoupon) {
       await markCouponUsed(userId, effectiveCoupon);
     }
 
     if (paymentMethod === 'PIX' || paymentMethod === 'MIXED') {
-      const qrText = payment.pixQrCodeText ?? payment.pixQrCode ?? '';
-      const amount = payment.amount ?? 0;
+      const qrText   = payment.pixQrCodeText ?? payment.pixQrCode ?? '';
+      const amount   = payment.amount ?? 0;
       const expiresAt = payment.expiresAt
         ? new Date(payment.expiresAt).toISOString()
         : new Date(Date.now() + 30 * 60 * 1000).toISOString();
@@ -319,7 +332,9 @@ export async function executePayment(
       ].join('\n').slice(0, 900);
 
       const pixMsg = await ctx.replyWithPhoto(
-        { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
+        {
+          url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}`,
+        },
         {
           caption: captionLines,
           parse_mode: 'MarkdownV2',
@@ -332,20 +347,21 @@ export async function executePayment(
 
       await ctx.reply(`<code>${escapeHtml(qrText)}</code>`, { parse_mode: 'HTML' });
 
-      session.step = 'awaiting_payment';
-      session.paymentId = payment.paymentId;
-      session.pixExpiresAt = expiresAt;
-      session.pixQrCodeText = qrText;
-      session.mainMessageId = pixMsg.message_id;
+      session.step             = 'awaiting_payment';
+      session.paymentId        = payment.paymentId;
+      session.pixExpiresAt     = expiresAt;
+      session.pixQrCodeText    = qrText;
+      session.mainMessageId    = pixMsg.message_id;
       session.selectedProductId = productId;
+      session.pendingProductName = productName;
       await saveSession(userId, session);
 
       await schedulePIXExpiry(ctx, payment.paymentId, userId, expiresAt);
     } else {
       // BALANCE — entrega imediata
-      const deliveryContent = (payment as any).deliveryContent ?? null;
-      const productName = payment.productName ?? productId;
-      const usedCoupons = session.usedCoupons ?? [];
+      const deliveryContent = (payment as Record<string, unknown>).deliveryContent as string | null ?? null;
+      const productName     = payment.productName ?? productId;
+      const usedCoupons     = session.usedCoupons ?? [];
       await clearSession(userId, session.firstName, usedCoupons);
 
       await ctx.reply(
@@ -358,12 +374,15 @@ export async function executePayment(
     }
   } catch (err: unknown) {
     console.error('[executePayment] erro:', err);
-    const msg = err instanceof Error ? err.message : '';
-    const is502 = msg.includes('502') || msg.includes('Bad Gateway');
+    const msg    = err instanceof Error ? err.message : '';
+    const is502  = msg.includes('502') || msg.includes('Bad Gateway');
     if (is502) {
       await ctx.reply('⚠️ O servidor está inicializando. Tente novamente em alguns segundos.', { parse_mode: 'HTML' });
     } else {
-      await ctx.reply(`❌ Erro ao processar pagamento: ${escapeHtml(msg || 'Erro desconhecido')}`, { parse_mode: 'HTML' });
+      await ctx.reply(
+        `❌ Erro ao processar pagamento: ${escapeHtml(msg || 'Erro desconhecido')}`,
+        { parse_mode: 'HTML' }
+      );
     }
   } finally {
     await releaseLock(lockKey, lockToken);
@@ -376,15 +395,15 @@ export async function handleCheckPayment(
   ctx: Context,
   paymentId: string
 ): Promise<void> {
-  const userId = ctx.from!.id;
+  const userId  = ctx.from!.id;
   const session = await getSession(userId);
 
   try {
     const status = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'PAID' || status.status === 'APPROVED') {
-      const productId = session.selectedProductId;
-      const productName = status.productName ?? session.pendingProductName ?? '';
+      const productId      = session.selectedProductId;
+      const productName    = status.productName ?? session.pendingProductName ?? '';
       const deliveryContent = status.deliveryContent ?? null;
 
       const usedCoupons = session.usedCoupons ?? [];
@@ -398,7 +417,8 @@ export async function handleCheckPayment(
         }
       );
     } else if (status.status === 'EXPIRED' || status.status === 'CANCELLED') {
-      await editOrReply(ctx,
+      await editOrReply(
+        ctx,
         `❌ <b>Pagamento ${status.status === 'EXPIRED' ? 'expirado' : 'cancelado'}</b>\n\nGere um novo pedido quando quiser.`,
         {
           parse_mode: 'HTML',
@@ -420,7 +440,7 @@ export async function handleCheckPayment(
         await ctx.answerCbQuery('⏳ Pagamento ainda não confirmado. Aguarde.').catch(() => {});
       }
     }
-  } catch (err) {
+  } catch (err: unknown) {
     console.error('[handleCheckPayment] erro:', err);
     await ctx.reply('❌ Erro ao verificar pagamento. Tente novamente.', { parse_mode: 'HTML' });
   }
@@ -432,8 +452,8 @@ export async function handleCancelPayment(
   ctx: Context,
   paymentId: string
 ): Promise<void> {
-  const userId = ctx.from!.id;
-  const lockKey = `cancel_lock:${userId}`;
+  const userId   = ctx.from!.id;
+  const lockKey  = `cancel_lock:${userId}`;
   const lockToken = await acquireLock(lockKey, 15);
   if (!lockToken) return;
 
@@ -441,7 +461,8 @@ export async function handleCancelPayment(
 
   try {
     await apiClient.cancelPayment(paymentId, String(userId));
-    await editOrReply(ctx,
+    await editOrReply(
+      ctx,
       `❌ <b>PIX cancelado.</b>\n\nUse /produtos para fazer um novo pedido.`,
       {
         parse_mode: 'HTML',
@@ -467,16 +488,16 @@ export async function schedulePIXExpiry(
   userId: number,
   expiresAtISO: string
 ): Promise<void> {
-  const expiresAt = new Date(expiresAtISO).getTime();
-  const now = Date.now();
-  const msUntilExpiry = expiresAt - now;
+  const expiresAt      = new Date(expiresAtISO).getTime();
+  const now            = Date.now();
+  const msUntilExpiry  = expiresAt - now;
 
   const expiredKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
     [Markup.button.callback('🏠 Menu', 'show_home')],
   ]);
 
-  if (msUntilExpiry <= 0) {
+  async function handleExpiry(): Promise<void> {
     try {
       const status = await apiClient.getPaymentStatus(paymentId, String(userId));
       if (status.status !== 'PAID' && status.status !== 'APPROVED') {
@@ -488,21 +509,17 @@ export async function schedulePIXExpiry(
         await clearSession(userId, session.firstName, session.usedCoupons ?? []);
       }
     } catch { /**/ }
+  }
+
+  if (msUntilExpiry <= 0) {
+    await handleExpiry();
     return;
   }
 
   const t = setTimeout(async () => {
     try {
-      const status = await apiClient.getPaymentStatus(paymentId, String(userId));
-      if (status.status !== 'PAID' && status.status !== 'APPROVED') {
-        await ctx.reply(
-          '⏰ <b>Seu PIX expirou.</b>\n\nGere um novo pedido quando quiser.',
-          { parse_mode: 'HTML', reply_markup: expiredKeyboard.reply_markup }
-        );
-        const session = await getSession(userId);
-        await clearSession(userId, session.firstName, session.usedCoupons ?? []);
-      }
-    } catch { /**/ } finally {
+      await handleExpiry();
+    } finally {
       cancelPIXTimer(userId);
     }
   }, msUntilExpiry);

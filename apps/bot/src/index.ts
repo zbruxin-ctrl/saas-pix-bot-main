@@ -1,7 +1,15 @@
 /**
  * Bot Telegram principal — registro de handlers e inicialização.
+ *
+ * TIPAGEM: usa BotContext (= Context do Telegraf) nas funções genéricas.
+ *          bot.action / bot.command / bot.on recebem callback narrowado
+ *          automaticamente pelo Telegraf — basta usar ctx.from, ctx.message,
+ *          ctx.callbackQuery diretamente, sem cast para Middleware<...>.
  */
-import { Telegraf, Markup, Context } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
+import type { Context } from 'telegraf';
+import type { CallbackQuery, Update } from 'telegraf/types';
+import type { NarrowedContext } from 'telegraf';
 import { apiClient } from './services/apiClient';
 import { getSession, saveSession, clearSession } from './services/session';
 import { validateCoupon } from './services/couponClient';
@@ -18,6 +26,11 @@ import {
   cancelPIXTimer,
 } from './handlers/payments';
 
+// Tipos de conveniência para os handlers
+type BotCtx = Context;
+type CbCtx  = NarrowedContext<Context, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>;
+type TxtCtx = NarrowedContext<Context, Update.MessageUpdate>;
+
 type ProductDTO = Awaited<ReturnType<typeof apiClient.getProducts>>[number];
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
@@ -29,12 +42,14 @@ initPaymentHandlers();
 
 // ─── showHome ─────────────────────────────────────────────────────────────────
 
-async function showHome(ctx: any) {
-  const firstName = ctx.from?.first_name || 'visitante';
+async function showHome(ctx: BotCtx): Promise<void> {
+  const welcomeMsg = process.env.BOT_WELCOME_MESSAGE
+    ?? `🛒 Aqui você pode adquirir nossos produtos de forma rápida e segura.\n\n💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo pré-carregado</b>.`;
+
+  const firstName = ctx.from?.first_name ?? 'visitante';
   const text =
     `👋 Olá, <b>${firstName}</b>! Bem-vindo!\n\n` +
-    `🛒 Aqui você pode adquirir nossos produtos de forma rápida e segura.\n\n` +
-    `💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo pré-carregado</b>.\n\n` +
+    `${welcomeMsg}\n\n` +
     `Para ver nossos produtos, clique no botão abaixo:`;
 
   const keyboard = Markup.inlineKeyboard([
@@ -77,26 +92,26 @@ bot.start(async (ctx) => {
           ]).reply_markup,
         }
       );
-      await schedulePIXExpiry(ctx as unknown as Context, session.paymentId, userId, session.pixExpiresAt);
+      await schedulePIXExpiry(ctx as Context, session.paymentId, userId, session.pixExpiresAt);
       return;
     }
 
     session.firstName = ctx.from.first_name;
     await saveSession(userId, session);
-    await showHome(ctx);
+    await showHome(ctx as Context);
   } catch (err) {
     console.error('[/start] Erro:', err);
   }
 });
 
-bot.action('show_home', async (ctx) => {
+bot.action('show_home', async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
   await showHome(ctx);
 });
 
 // ─── /produtos ────────────────────────────────────────────────────────────────
 
-async function showProducts(ctx: any) {
+async function showProducts(ctx: BotCtx): Promise<void> {
   try {
     const products = await apiClient.getProducts();
     if (!products.length) {
@@ -105,7 +120,6 @@ async function showProducts(ctx: any) {
     }
 
     const buttons = products.map((p: ProductDTO) => {
-      // monta label com estoque
       let stockLabel = '';
       if (p.stock != null) {
         stockLabel = p.stock <= 0 ? ' ❌ Esgotado' : ` (${p.stock} restantes)`;
@@ -135,40 +149,52 @@ async function showProducts(ctx: any) {
   }
 }
 
-bot.command('produtos', showProducts);
+bot.command('produtos', (ctx) => showProducts(ctx));
 
-bot.action('show_products', async (ctx) => {
+bot.action('show_products', async (ctx: CbCtx) => {
   await ctx.answerCbQuery('⏳ Carregando produtos...').catch(() => {});
   await showProducts(ctx);
 });
 
 // ─── /saldo ───────────────────────────────────────────────────────────────────
 
-async function showBalance(ctx: any) {
+async function showBalance(ctx: BotCtx): Promise<void> {
   try {
     const userId = ctx.from!.id;
-    const data = await apiClient.getBalance(String(userId));
+    const data   = await apiClient.getBalance(String(userId));
 
-    // Histórico de transações
+    const txs: Array<{
+      type: string;
+      amount: number;
+      description?: string;
+      createdAt?: string;
+    }> = (data as unknown as { transactions?: unknown[] }).transactions ?? [];
+
     let historyText = '';
-    const txs: any[] = data.transactions ?? [];
     if (txs.length > 0) {
-      const lines = txs.slice(0, 5).map((t: any) => {
-        const sign = t.type === 'CREDIT' ? '+' : '-';
+      const lines = txs.slice(0, 5).map((t) => {
+        const sign  = t.type === 'CREDIT' ? '+' : '-';
         const emoji = t.type === 'CREDIT' ? '🟢' : '🔴';
-        const date = t.createdAt ? new Date(t.createdAt).toLocaleDateString('pt-BR') : '';
-        return `${emoji} ${sign}R$ ${Number(t.amount).toFixed(2)} — ${t.description ?? t.type}${date ? ` <i>(${date})</i>` : ''}`;
+        const date  = t.createdAt
+          ? new Date(t.createdAt).toLocaleDateString('pt-BR')
+          : '';
+        return (
+          `${emoji} ${sign}R$ ${Number(t.amount).toFixed(2)} — ` +
+          `${t.description ?? t.type}` +
+          `${date ? ` <i>(${date})</i>` : ''}`
+        );
       });
       historyText = `\n\n📃 <b>Últimas transações:</b>\n${lines.join('\n')}`;
     } else {
       historyText = '\n\n<i>Nenhuma transação encontrada.</i>';
     }
 
-    const text = `💰 <b>Seu saldo:</b> R$ ${Number(data.balance).toFixed(2)}${historyText}`;
+    const text     = `💰 <b>Seu saldo:</b> R$ ${Number(data.balance).toFixed(2)}${historyText}`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('💳 Depositar', 'deposit_balance')],
       [Markup.button.callback('◀️ Voltar', 'show_home')],
     ]);
+
     if (ctx.callbackQuery) {
       try {
         await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
@@ -182,54 +208,54 @@ async function showBalance(ctx: any) {
   }
 }
 
-bot.command('saldo', showBalance);
+bot.command('saldo', (ctx) => showBalance(ctx));
 
-bot.action('show_balance', async (ctx) => {
+bot.action('show_balance', async (ctx: CbCtx) => {
   await ctx.answerCbQuery('⏳ Buscando saldo...').catch(() => {});
   await showBalance(ctx);
 });
 
-bot.action('deposit_balance', async (ctx) => {
+bot.action('deposit_balance', async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
-    const userId = ctx.from!.id;
+    const userId  = ctx.from.id;
     const session = await getSession(userId);
-    session.step = 'awaiting_deposit_amount';
+    session.step  = 'awaiting_deposit_amount';
     await saveSession(userId, session);
-    const text = `💳 <b>Depositar saldo</b>\n\nDigite o valor que deseja depositar (mínimo R$ 1,00):\n\n<i>Para cancelar, clique no botão abaixo.</i>`;
+
+    const text     = `💳 <b>Depositar saldo</b>\n\nDigite o valor que deseja depositar (mínimo R$ 1,00):\n\n<i>Para cancelar, clique no botão abaixo.</i>`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('❌ Cancelar', 'cancel_deposit')],
     ]);
-    if (ctx.callbackQuery) {
-      try {
-        await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
-        return;
-      } catch { /* ignora */ }
+
+    try {
+      await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
+    } catch {
+      await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
     }
-    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup });
   } catch (err) {
     console.error('[deposit_balance] erro:', err);
   }
 });
 
-bot.action('cancel_deposit', async (ctx) => {
+bot.action('cancel_deposit', async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from!.id;
+  const userId  = ctx.from.id;
   const session = await getSession(userId);
-  session.step = 'idle';
+  session.step  = 'idle';
   await saveSession(userId, session);
   await showBalance(ctx);
 });
 
 // ─── /pedidos ─────────────────────────────────────────────────────────────────
 
-async function showOrders(ctx: any) {
+async function showOrders(ctx: BotCtx): Promise<void> {
   const userId = ctx.from!.id;
   try {
     const orders = await apiClient.getOrders(String(userId));
 
     if (!orders || orders.length === 0) {
-      const text = '🔭 <b>Você ainda não tem pedidos.</b>\n\nFaça sua primeira compra!';
+      const text     = '🔭 <b>Você ainda não tem pedidos.</b>\n\nFaça sua primeira compra!';
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
         [Markup.button.callback('◀️ Voltar', 'show_home')],
@@ -241,12 +267,15 @@ async function showOrders(ctx: any) {
       return;
     }
 
-    const lines = orders.slice(0, 10).map((o: any, i: number) => {
-      const status = o.status === 'DELIVERED' ? '✅' : o.status === 'PENDING' ? '⏳' : o.status === 'CANCELLED' ? '❌' : '❓';
+    const lines = orders.slice(0, 10).map((o, i) => {
+      const status =
+        o.status === 'DELIVERED'  ? '✅' :
+        o.status === 'PENDING'    ? '⏳' :
+        o.status === 'CANCELLED'  ? '❌' : '❓';
       return `${i + 1}. ${status} <b>${o.productName}</b> — R$ ${Number(o.amount).toFixed(2)}`;
     });
 
-    const text = `<b>📦 Seus Últimos Pedidos</b>\n\n${lines.join('\n')}\n\n<i>Exibindo até 10 pedidos mais recentes.</i>`;
+    const text     = `<b>📦 Seus Últimos Pedidos</b>\n\n${lines.join('\n')}\n\n<i>Exibindo até 10 pedidos mais recentes.</i>`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('🛒 Nova Compra', 'show_products')],
       [Markup.button.callback('◀️ Voltar', 'show_home')],
@@ -260,25 +289,25 @@ async function showOrders(ctx: any) {
   }
 }
 
-bot.command('meus_pedidos', showOrders);
+bot.command('meus_pedidos', (ctx) => showOrders(ctx));
 
-bot.action('show_orders', async (ctx) => {
+bot.action('show_orders', async (ctx: CbCtx) => {
   await ctx.answerCbQuery('📦 Carregando pedidos...').catch(() => {});
   await showOrders(ctx);
 });
 
 // ─── Indicações ────────────────────────────────────────────────────────────────
 
-async function showReferral(ctx: any) {
+async function showReferral(ctx: BotCtx): Promise<void> {
   try {
     const userId = ctx.from!.id;
-    let referralInfo: any = null;
+    let referralInfo: { referralCount?: number; bonusEarned?: number } | null = null;
     try {
       referralInfo = await apiClient.getReferralInfo(String(userId));
     } catch { /* ignora se endpoint não existir */ }
 
     const botUsername = (await bot.telegram.getMe()).username;
-    const link = `https://t.me/${botUsername}?start=${userId}`;
+    const link        = `https://t.me/${botUsername}?start=${userId}`;
 
     let statsText = '';
     if (referralInfo) {
@@ -311,16 +340,16 @@ async function showReferral(ctx: any) {
   }
 }
 
-bot.command('indicacoes', showReferral);
+bot.command('indicacoes', (ctx) => showReferral(ctx));
 
-bot.action('show_referral', async (ctx) => {
+bot.action('show_referral', async (ctx: CbCtx) => {
   await ctx.answerCbQuery('👥 Carregando indicações...').catch(() => {});
   await showReferral(ctx);
 });
 
 // ─── Ajuda ────────────────────────────────────────────────────────────────────
 
-async function showHelp(ctx: any) {
+async function showHelp(ctx: BotCtx): Promise<void> {
   const phone = process.env.SUPPORT_PHONE_NUMBER ?? '';
   const whatsappLine = phone
     ? `\n📞 <a href="https://wa.me/${phone}">Falar com suporte no WhatsApp</a>`
@@ -367,9 +396,9 @@ async function showHelp(ctx: any) {
   });
 }
 
-bot.command('ajuda', showHelp);
+bot.command('ajuda', (ctx) => showHelp(ctx));
 
-bot.action('show_help', async (ctx) => {
+bot.action('show_help', async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
   await showHelp(ctx);
 });
@@ -390,18 +419,18 @@ bot.command('suporte', async (ctx) => {
 
 // ─── Seleção de produto → tela de quantidade ──────────────────────────────────
 
-bot.action(/^select_product_(.+)$/, async (ctx) => {
+bot.action(/^select_product_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery('⏳ Carregando produto...').catch(() => {});
   try {
     const productId = ctx.match[1];
-    const userId = ctx.from!.id;
-    const session = await getSession(userId);
+    const userId    = ctx.from.id;
+    const session   = await getSession(userId);
 
     let product: ProductDTO | undefined;
     try {
       const products = await apiClient.getProducts();
       product = products.find((p) => p.id === productId);
-      session.products = products as never;
+      session.products = undefined as never;
       await saveSession(userId, session);
     } catch (err) {
       console.error('[select_product] erro:', err);
@@ -409,12 +438,15 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
       return;
     }
 
-    if (!product) { await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' }); return; }
+    if (!product) {
+      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+      return;
+    }
     if (product.stock != null && product.stock <= 0) {
       await ctx.reply('⚠️ Este produto está esgotado no momento.', { parse_mode: 'HTML' });
       return;
     }
-    await showQuantityScreen(ctx as unknown as Context, product);
+    await showQuantityScreen(ctx, product);
   } catch (err) {
     console.error('[select_product_action] erro:', err);
   }
@@ -422,17 +454,17 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
 
 // ─── Seleção de quantidade → tela de pagamento ────────────────────────────────
 
-bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx) => {
+bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const productId = ctx.match[1];
-    const qty = parseInt(ctx.match[2], 10);
-    const userId = ctx.from!.id;
+    const qty       = parseInt(ctx.match[2], 10);
+    const userId    = ctx.from.id;
 
     const session = await getSession(userId);
-    session.pendingQty = qty;
+    session.pendingQty       = qty;
     session.selectedProductId = productId;
-    session.step = 'selecting_product';
+    session.step             = 'selecting_product';
     await saveSession(userId, session);
 
     const [products, walletData] = await Promise.all([
@@ -440,85 +472,91 @@ bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx) => {
       apiClient.getBalance(String(userId)).catch(() => ({ balance: 0, transactions: [] })),
     ]);
     const product = products.find((p) => p.id === productId);
-    if (!product) { await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' }); return; }
+    if (!product) {
+      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+      return;
+    }
 
-    await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
+    await showPaymentMethodScreen(ctx, product, Number(walletData.balance));
   } catch (err) {
     console.error('[set_qty] erro:', err);
   }
 });
 
-// ─── Métodos de pagamento (com botão cancelar) ───────────────────────────────
-// Nota: showPaymentMethodScreen já deve incluir o botão cancelar no handler/payments.ts
-// Aqui garantimos que as actions de pix/balance/mixed passam o cancel action
+// ─── Métodos de pagamento ────────────────────────────────────────────────────────────
 
-bot.action(/^pay_pix_(.+)$/, async (ctx) => {
+bot.action(/^pay_pix_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await executePayment(ctx as unknown as Context, ctx.match[1], 'PIX');
+  await executePayment(ctx, ctx.match[1], 'PIX');
 });
 
-bot.action(/^pay_balance_(.+)$/, async (ctx) => {
+bot.action(/^pay_balance_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await executePayment(ctx as unknown as Context, ctx.match[1], 'BALANCE');
+  await executePayment(ctx, ctx.match[1], 'BALANCE');
 });
 
-bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
+bot.action(/^pay_mixed_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await executePayment(ctx as unknown as Context, ctx.match[1], 'MIXED');
+  await executePayment(ctx, ctx.match[1], 'MIXED');
 });
 
 // ─── Verificar / cancelar pagamento ──────────────────────────────────────────
 
-bot.action(/^check_payment_(.+)$/, async (ctx) => {
+bot.action(/^check_payment_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await handleCheckPayment(ctx as unknown as Context, ctx.match[1]);
+  await handleCheckPayment(ctx, ctx.match[1]);
 });
 
-bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
+bot.action(/^cancel_payment_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await handleCancelPayment(ctx as unknown as Context, ctx.match[1]);
+  await handleCancelPayment(ctx, ctx.match[1]);
 });
 
-bot.action('cancel_payment', async (ctx) => {
+bot.action('cancel_payment', async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const userId = ctx.from!.id;
+  const userId  = ctx.from.id;
   const session = await getSession(userId);
   cancelPIXTimer(userId);
   await clearSession(userId, session.firstName);
-  await ctx.reply('❌ Pedido cancelado. Use /produtos para começar novamente.', { parse_mode: 'HTML' });
+  await ctx.reply('❌ Pedido cancelado. Use /produtos para começar novamente.', {
+    parse_mode: 'HTML',
+    reply_markup: Markup.inlineKeyboard([
+      [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
+    ]).reply_markup,
+  });
 });
 
 // ─── Cupom ────────────────────────────────────────────────────────────────────
 
-bot.action(/^coupon_input_(.+)$/, async (ctx) => {
+bot.action(/^coupon_input_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
-  await showCouponInputScreen(ctx as unknown as Context, ctx.match[1]);
+  await showCouponInputScreen(ctx, ctx.match[1]);
 });
 
-bot.action(/^back_to_payment_(.+)$/, async (ctx) => {
+bot.action(/^back_to_payment_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const productId = ctx.match[1];
-    const userId = ctx.from!.id;
+    const userId    = ctx.from.id;
     const [products, walletData] = await Promise.all([
       apiClient.getProducts(),
       apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 })),
     ]);
     const product = products.find((p) => p.id === productId);
     if (!product) { await ctx.reply('❌ Produto não encontrado.'); return; }
-    await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
+    await showPaymentMethodScreen(ctx, product, Number(walletData.balance));
   } catch (err) {
     console.error('[back_to_payment] erro:', err);
   }
 });
 
-bot.action(/^remove_coupon_(.+)$/, async (ctx) => {
+bot.action(/^remove_coupon_(.+)$/, async (ctx: CbCtx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const productId = ctx.match[1];
-    const userId = ctx.from!.id;
-    const session = await getSession(userId);
-    session.pendingCoupon = null;
+    const userId    = ctx.from.id;
+    const session   = await getSession(userId);
+    session.pendingCoupon         = null;
     session.pendingCouponDiscount = 0;
     await saveSession(userId, session);
     const [products, walletData] = await Promise.all([
@@ -527,7 +565,7 @@ bot.action(/^remove_coupon_(.+)$/, async (ctx) => {
     ]);
     const product = products.find((p) => p.id === productId);
     if (!product) { await ctx.reply('❌ Produto não encontrado.'); return; }
-    await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
+    await showPaymentMethodScreen(ctx, product, Number(walletData.balance));
   } catch (err) {
     console.error('[remove_coupon] erro:', err);
   }
@@ -535,40 +573,44 @@ bot.action(/^remove_coupon_(.+)$/, async (ctx) => {
 
 // ─── Mensagens de texto (cupom / depósito) ────────────────────────────────────
 
-bot.on('text', async (ctx) => {
+bot.on('text', async (ctx: TxtCtx) => {
   try {
     const userId = ctx.from.id;
     const session = await getSession(userId);
-    const text = ctx.message.text.trim();
+    const text    = ctx.message.text.trim();
 
     // ── Cupom
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
       const couponCode = text.toUpperCase();
       try {
-        const products = await apiClient.getProducts();
-        const product = products.find((p) => p.id === session.pendingProductId);
-        const qty = session.pendingQty ?? 1;
-        const orderAmount = Number(product?.price ?? 0) * qty;
+        const products     = await apiClient.getProducts();
+        const product      = products.find((p) => p.id === session.pendingProductId);
+        const qty          = session.pendingQty ?? 1;
+        const orderAmount  = Number(product?.price ?? 0) * qty;
 
-        const result = await validateCoupon(couponCode, String(userId), orderAmount, session.pendingProductId);
+        const result = await validateCoupon(
+          couponCode,
+          String(userId),
+          orderAmount,
+          session.pendingProductId
+        );
 
         if (result.valid && result.data) {
-          session.pendingCoupon = couponCode;
+          session.pendingCoupon         = couponCode;
           session.pendingCouponDiscount = result.data.discountAmount ?? 0;
-          session.step = 'selecting_product';
+          session.step                  = 'selecting_product';
           await saveSession(userId, session);
 
-          const [, walletData] = await Promise.all([
-            Promise.resolve(),
-            apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 })),
-          ]);
+          const walletData = await apiClient
+            .getBalance(String(userId))
+            .catch(() => ({ balance: 0 }));
 
           if (product) {
             await ctx.reply(
               `✅ Cupom <code>${couponCode}</code> aplicado! Desconto: R$ ${(result.data.discountAmount ?? 0).toFixed(2)}`,
               { parse_mode: 'HTML' }
             );
-            await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
+            await showPaymentMethodScreen(ctx, product, Number(walletData.balance));
           }
         } else {
           await ctx.reply(`❌ ${result.error ?? 'Cupom inválido.'}`, { parse_mode: 'HTML' });
@@ -594,21 +636,24 @@ bot.on('text', async (ctx) => {
           ctx.from.first_name,
           ctx.from.username
         );
-        const qrText = deposit.pixQrCodeText ?? deposit.pixQrCode ?? '';
+        const qrText    = deposit.pixQrCodeText ?? deposit.pixQrCode ?? '';
         const expiresAt = deposit.expiresAt
           ? new Date(deposit.expiresAt).toISOString()
           : new Date(Date.now() + 30 * 60 * 1000).toISOString();
 
-        session.step = 'awaiting_payment';
-        session.depositPaymentId = deposit.paymentId;
-        session.pixExpiresAt = expiresAt;
-        session.pixQrCodeText = qrText;
+        session.step              = 'awaiting_payment';
+        session.depositPaymentId  = deposit.paymentId;
+        session.pixExpiresAt      = expiresAt;
+        session.pixQrCodeText     = qrText;
         await saveSession(userId, session);
 
+        const amountStr = String(amount.toFixed(2)).replace('.', '\\.');
         await ctx.replyWithPhoto(
-          { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
           {
-            caption: `💳 *Depósito de R\\$ ${String(amount.toFixed(2)).replace('.', '\\.')}*\n\nEscaneie o QR ou copie o código abaixo:`,
+            url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}`,
+          },
+          {
+            caption: `💳 *Depósito de R\\$ ${amountStr}*\n\nEscaneie o QR ou copie o código abaixo:`,
             parse_mode: 'MarkdownV2',
             reply_markup: Markup.inlineKeyboard([
               [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
@@ -617,7 +662,7 @@ bot.on('text', async (ctx) => {
           }
         );
         await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
-        await schedulePIXExpiry(ctx as unknown as Context, deposit.paymentId, userId, expiresAt);
+        await schedulePIXExpiry(ctx as Context, deposit.paymentId, userId, expiresAt);
       } catch (err) {
         console.error('[deposit] erro:', err);
         await ctx.reply('❌ Erro ao gerar PIX de depósito.', { parse_mode: 'HTML' });

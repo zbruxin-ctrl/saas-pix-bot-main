@@ -3,7 +3,7 @@
  * Em dev sem Upstash, usa fallback em memória (InMemoryRedis no redis.ts).
  *
  * FEAT: usedCoupons — lista de cupons já utilizados pelo usuário (por código).
- *       Garante que cada cupom possa ser usado apenas 1x por conta.
+ *       Garante que cada cupão possa ser usado apenas 1x por conta.
  */
 import { redis } from './redis';
 
@@ -17,13 +17,15 @@ export interface UserSession {
   depositMessageId?: number;
   mainMessageId?: number;
   firstName?: string;
+  /** Nome do produto pendente — salvo ao criar PIX para usar na mensagem de entrega */
+  pendingProductName?: string;
   lastActivityAt: number;
   pendingProductId?: string;
   pendingCoupon?: string | null;
   pendingCouponDiscount?: number;
   pendingQty?: number;
   products?: never;
-  /** Lista de códigos de cupom já utilizados por este usuário */
+  /** Lista de códigos de cupão já utilizados por este usuário */
   usedCoupons?: string[];
 }
 
@@ -70,7 +72,7 @@ export async function clearSession(userId: number, keepFirstName?: string, keepU
   });
 }
 
-/** Registra um cupom como utilizado pelo usuário. Persiste mesmo após clearSession. */
+/** Registra um cupão como utilizado pelo usuário. Persiste mesmo após clearSession. */
 export async function markCouponUsed(userId: number, couponCode: string): Promise<void> {
   const session = await getSession(userId);
   const used = session.usedCoupons ?? [];
@@ -82,7 +84,7 @@ export async function markCouponUsed(userId: number, couponCode: string): Promis
   await saveSession(userId, session);
 }
 
-/** Verifica se o usuário já usou um determinado cupom. */
+/** Verifica se o usuário já usou um determinado cupão. */
 export async function hasCouponBeenUsed(userId: number, couponCode: string): Promise<boolean> {
   const session = await getSession(userId);
   const used = session.usedCoupons ?? [];
