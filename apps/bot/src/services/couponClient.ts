@@ -20,7 +20,7 @@ export async function validateCoupon(
 ): Promise<{ valid: boolean; error?: string; data?: CouponValidationData }> {
   try {
     const { data } = await axios.post(
-      `${API_URL}/coupons/validate`,
+      `${API_URL}/api/coupons/validate`,
       { code, telegramId, orderAmount, productId },
       { headers: { 'x-bot-secret': BOT_SECRET } }
     );
@@ -37,7 +37,7 @@ export async function applyCoupon(
   paymentId: string
 ): Promise<void> {
   await axios.post(
-    `${API_URL}/coupons/apply`,
+    `${API_URL}/api/coupons/apply`,
     { couponId, telegramUserId, paymentId },
     { headers: { 'x-bot-secret': BOT_SECRET } }
   );
@@ -45,7 +45,7 @@ export async function applyCoupon(
 
 export async function revertCoupon(paymentId: string): Promise<void> {
   await axios.post(
-    `${API_URL}/coupons/revert`,
+    `${API_URL}/api/coupons/revert`,
     { paymentId },
     { headers: { 'x-bot-secret': BOT_SECRET } }
   );

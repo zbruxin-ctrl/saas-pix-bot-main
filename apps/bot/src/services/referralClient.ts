@@ -23,7 +23,7 @@ export async function registerReferral(
 ): Promise<{ success: boolean; reason?: string }> {
   try {
     const { data } = await axios.post(
-      `${API_URL}/referrals/register`,
+      `${API_URL}/api/referrals/register`,
       { referrerTelegramId, referredTelegramId },
       { headers: { 'x-bot-secret': BOT_SECRET } }
     );
@@ -34,7 +34,7 @@ export async function registerReferral(
 }
 
 export async function getReferralStats(telegramId: string): Promise<ReferralStats> {
-  const { data } = await axios.get(`${API_URL}/referrals/stats`, {
+  const { data } = await axios.get(`${API_URL}/api/referrals/stats`, {
     params: { telegramId },
     headers: { 'x-bot-secret': BOT_SECRET },
   });
