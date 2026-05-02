@@ -14,6 +14,7 @@
 // SEC FIX #6: GET /:id/status e POST /:id/cancel agora exigem telegramId e
 //   verificam ownership antes de retornar/cancelar (impede consulta de pagamentos alheios)
 // FIX-COUPON: couponCode e referralCode adicionados ao createPaymentSchema
+// FIX-ZOD: parse() envolto em try/catch para retornar 400 em vez de 500
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -119,13 +120,20 @@ paymentsRouter.post(
   requireBotSecret,
   paymentRateLimit,
   async (req: Request, res: Response) => {
+    // FIX-ZOD: valida antes de checar manutenção para retornar 400 em payload inválido
+    let data: z.infer<typeof createPaymentSchema>;
+    try {
+      data = createPaymentSchema.parse(req.body);
+    } catch (err) {
+      res.status(400).json({ success: false, error: 'Dados inválidos na requisição.' });
+      return;
+    }
+
     const { active, message } = await isMaintenanceActive();
     if (active) {
       res.status(503).json({ success: false, error: message || 'Estamos em manutenção. Voltamos em breve!' });
       return;
     }
-    // Verifica bloqueio antes de criar pagamento
-    const data = createPaymentSchema.parse(req.body);
     const blocked = await isUserBlocked(data.telegramId);
     if (blocked) {
       res.status(403).json({ success: false, error: 'Sua conta está suspensa. Entre em contato com o suporte.' });
@@ -143,12 +151,20 @@ paymentsRouter.post(
   requireBotSecret,
   paymentRateLimit,
   async (req: Request, res: Response) => {
+    // FIX-ZOD: valida antes de checar manutenção
+    let data: z.infer<typeof createDepositSchema>;
+    try {
+      data = createDepositSchema.parse(req.body);
+    } catch (err) {
+      res.status(400).json({ success: false, error: 'Dados inválidos na requisição.' });
+      return;
+    }
+
     const { active, message } = await isMaintenanceActive();
     if (active) {
       res.status(503).json({ success: false, error: message || 'Estamos em manutenção. Voltamos em breve!' });
       return;
     }
-    const data = createDepositSchema.parse(req.body);
     const blocked = await isUserBlocked(data.telegramId);
     if (blocked) {
       res.status(403).json({ success: false, error: 'Sua conta está suspensa. Entre em contato com o suporte.' });

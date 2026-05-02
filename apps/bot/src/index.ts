@@ -36,6 +36,16 @@ const bot = new Telegraf(BOT_TOKEN);
 
 initPaymentHandlers();
 
+// Cache do username do bot (evita chamar getMe() a cada /indicacoes)
+let cachedBotUsername: string | null = null;
+async function getBotUsername(): Promise<string> {
+  if (!cachedBotUsername) {
+    const me = await bot.telegram.getMe();
+    cachedBotUsername = me.username ?? '';
+  }
+  return cachedBotUsername;
+}
+
 // ─── showHome ─────────────────────────────────────────────────────────────────
 
 async function showHome(ctx: Context): Promise<void> {
@@ -116,9 +126,10 @@ async function showProducts(ctx: Context): Promise<void> {
     }
 
     const buttons = products.map((p: ProductDTO) => {
+      // FIX: usa availableStock (campo correto retornado pela API)
       let stockLabel = '';
-      if (p.stock != null) {
-        stockLabel = p.stock <= 0 ? ' ❌ Esgotado' : ` (${p.stock} restantes)`;
+      if (p.availableStock != null) {
+        stockLabel = p.availableStock <= 0 ? ' ❌ Esgotado' : ` (${p.availableStock} restantes)`;
       }
       return [
         Markup.button.callback(
@@ -159,7 +170,6 @@ async function showBalance(ctx: Context): Promise<void> {
     const userId = ctx.from!.id;
     const data   = await apiClient.getBalance(String(userId));
 
-    // WalletBalanceResponse já tem transactions: WalletTransactionDTO[]
     const txs: WalletTransactionDTO[] = data.transactions ?? [];
 
     let historyText = '';
@@ -298,14 +308,15 @@ async function showReferral(ctx: Context): Promise<void> {
       referralInfo = await apiClient.getReferralInfo(String(userId));
     } catch { /* ignora se endpoint não existir */ }
 
-    const botUsername = (await bot.telegram.getMe()).username;
+    // FIX: usa cache em vez de chamar getMe() a cada vez
+    const botUsername = await getBotUsername();
     const link        = `https://t.me/${botUsername}?start=${userId}`;
 
     let statsText = '';
     if (referralInfo) {
-      const usaram   = referralInfo.referralCount ?? 0;
+      const usaram    = referralInfo.referralCount ?? 0;
       const compraram = referralInfo.purchaseCount ?? 0;
-      const bonus    = Number(referralInfo.bonusEarned ?? 0).toFixed(2);
+      const bonus     = Number(referralInfo.bonusEarned ?? 0).toFixed(2);
       statsText =
         `\n\n📊 <b>Suas estatísticas:</b>\n` +
         `👆 Pessoas que usaram seu link: <b>${usaram}</b>\n` +
@@ -426,7 +437,6 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
     try {
       const products = await apiClient.getProducts();
       product = products.find((p) => p.id === productId);
-      session.products = undefined as never;
       await saveSession(userId, session);
     } catch (err) {
       console.error('[select_product] erro:', err);
@@ -438,7 +448,8 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
       await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
       return;
     }
-    if (product.stock != null && product.stock <= 0) {
+    // FIX: usa availableStock em vez de stock
+    if (product.availableStock != null && product.availableStock <= 0) {
       await ctx.reply('⚠️ Este produto está esgotado no momento.', { parse_mode: 'HTML' });
       return;
     }
@@ -632,7 +643,8 @@ bot.on('text', async (ctx) => {
           ctx.from.first_name,
           ctx.from.username
         );
-        const qrText    = deposit.pixQrCodeText ?? deposit.pixQrCode ?? '';
+        // FIX: pixQrCode não existe no tipo — usa apenas pixQrCodeText
+        const qrText    = deposit.pixQrCodeText ?? '';
         const expiresAt = deposit.expiresAt
           ? new Date(deposit.expiresAt).toISOString()
           : new Date(Date.now() + 30 * 60 * 1000).toISOString();
