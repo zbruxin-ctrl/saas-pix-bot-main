@@ -3,14 +3,11 @@
 // GET  /admin/coupons              — lista cupons
 // POST /admin/coupons              — cria cupom
 // PUT  /admin/coupons/:id          — atualiza cupom
+// PATCH /admin/coupons/:id         — alias de PUT (frontend usa PATCH)
 // DELETE /admin/coupons/:id        — remove cupom
 // GET  /admin/coupons/volume-tiers — lista tiers de volume
 // POST /admin/coupons/volume-tiers — cria tier de volume
 // DELETE /admin/coupons/volume-tiers/:id — remove tier
-// FIX L24: _count.uses → _count.couponUses (nome correto da relação no schema)
-// FIX L52: removido campo `description` (não existe no model Coupon)
-// FIX L139: removido campo `label` (não existe no model VolumeTier)
-// FIX-VALIDATION: POST e PUT validam discountType=PERCENT max 100%
 import { Router, Response } from 'express';
 import { prisma } from '../../lib/prisma';
 import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
@@ -25,7 +22,6 @@ adminCouponsRouter.use(requireRole('ADMIN', 'SUPERADMIN'));
 adminCouponsRouter.get('/', async (_req: AuthenticatedRequest, res: Response) => {
   const coupons = await prisma.coupon.findMany({
     orderBy: { createdAt: 'desc' },
-    // FIX: relação se chama couponUses no schema, não uses
     include: { _count: { select: { couponUses: true } } },
   });
   res.json({ success: true, data: coupons });
@@ -34,7 +30,6 @@ adminCouponsRouter.get('/', async (_req: AuthenticatedRequest, res: Response) =>
 adminCouponsRouter.post('/', async (req: AuthenticatedRequest, res: Response) => {
   const {
     code,
-    // FIX: description removido — campo não existe no model Coupon
     discountType = 'PERCENT',
     discountValue,
     minOrderValue,
@@ -73,11 +68,10 @@ adminCouponsRouter.post('/', async (req: AuthenticatedRequest, res: Response) =>
   res.status(201).json({ success: true, data: coupon });
 });
 
-adminCouponsRouter.put('/:id', async (req: AuthenticatedRequest, res: Response) => {
+async function handleCouponUpdate(req: AuthenticatedRequest, res: Response) {
   const { id } = req.params;
   const {
     code,
-    // FIX: description removido — campo não existe no model Coupon
     discountType,
     discountValue,
     minOrderValue,
@@ -90,7 +84,6 @@ adminCouponsRouter.put('/:id', async (req: AuthenticatedRequest, res: Response) 
   const existing = await prisma.coupon.findUnique({ where: { id } });
   if (!existing) throw new AppError('Cupom não encontrado.', 404);
 
-  // Valida discountValue quando discountType é PERCENT (novo ou já existente)
   const effectiveType = discountType ?? existing.discountType;
   const effectiveValue = discountValue !== undefined ? Number(discountValue) : Number(existing.discountValue);
   if (effectiveType === 'PERCENT' && effectiveValue > 100) {
@@ -115,12 +108,15 @@ adminCouponsRouter.put('/:id', async (req: AuthenticatedRequest, res: Response) 
   });
 
   res.json({ success: true, data: updated });
-});
+}
+
+// PUT e PATCH apontam para o mesmo handler
+adminCouponsRouter.put('/:id', handleCouponUpdate);
+adminCouponsRouter.patch('/:id', handleCouponUpdate);
 
 adminCouponsRouter.delete('/:id', async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
   if (id === 'volume-tiers') {
-    // evita conflito com sub-rota — o express já deve rotear corretamente mas guard extra
     throw new AppError('Rota inválida.', 400);
   }
   const existing = await prisma.coupon.findUnique({ where: { id } });
@@ -141,7 +137,6 @@ adminCouponsRouter.get('/volume-tiers', async (_req: AuthenticatedRequest, res: 
 
 adminCouponsRouter.post('/volume-tiers', async (req: AuthenticatedRequest, res: Response) => {
   const { productId, minQty, discountPercent } = req.body;
-  // FIX: label removido — campo não existe no model VolumeTier
 
   if (minQty === undefined || discountPercent === undefined) {
     throw new AppError('minQty e discountPercent são obrigatórios.', 400);
