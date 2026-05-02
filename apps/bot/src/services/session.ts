@@ -2,19 +2,8 @@
  * Gerenciamento de sessões de usuário via Redis (Upstash HTTP).
  * Em dev sem Upstash, usa fallback em memória (InMemoryRedis no redis.ts).
  *
- * P1 FIX: sessions migradas para Redis — sem perda de contexto em restart.
- * FIX #1: campo pixExpiresAt adicionado — permite re-agendar o timer de
- *         expiração do PIX ao receber /start após um restart do bot.
- * FIX-BUILD: adiciona 'awaiting_coupon' ao step + pendingProductId/pendingCoupon à interface
- * FIX-COUPON-DISCOUNT: adiciona pendingCouponDiscount para persistir valor de desconto entre telas
- * FEAT-COPYPASTE-CHECK: adiciona pixQrCodeText para reenviar copia e cola ao verificar pagamento
- * FIX-SESSION-TTL: TTL dinâmico por estado — sessões com PIX pendente expiram
- *   em 35min (margem sobre os 30min do PIX) em vez de ficar 1h no Redis.
- * AUDIT #14: getSession renova TTL do Redis (via saveSession) ao carregar sessão
- *   existente — sem isso, sessões de usuários ativos podiam expirar no Redis se
- *   o caller não chamasse saveSession ao final da operação.
- * FEAT-MULTI-QTY: adiciona pendingQty para compra múltipla de produtos.
- *   step 'awaiting_quantity' adicionado para a tela de seleção de quantidade.
+ * FEAT: usedCoupons — lista de cupons já utilizados pelo usuário (por código).
+ *       Garante que cada cupom possa ser usado apenas 1x por conta.
  */
 import { redis } from './redis';
 
@@ -22,28 +11,22 @@ export interface UserSession {
   step: 'idle' | 'selecting_product' | 'awaiting_payment' | 'awaiting_deposit_amount' | 'awaiting_coupon' | 'awaiting_quantity';
   selectedProductId?: string;
   paymentId?: string;
-  /** ISO string com a data/hora de expiração do PIX em aberto (FIX #1) */
   pixExpiresAt?: string;
-  /** Copia e Cola do PIX gerado — reexibido ao verificar pagamento pendente */
   pixQrCodeText?: string;
   depositPaymentId?: string;
   depositMessageId?: number;
   mainMessageId?: number;
   firstName?: string;
   lastActivityAt: number;
-  /** Produto pendente enquanto aguarda input de cupom ou seleção de quantidade */
   pendingProductId?: string;
-  /** Cupom digitado pelo usuário, antes de confirmar pagamento */
   pendingCoupon?: string | null;
-  /** Valor do desconto do cupom (em reais) para exibir na tela de pagamento */
   pendingCouponDiscount?: number;
-  /** Quantidade de unidades selecionada na tela de compra múltipla */
   pendingQty?: number;
-  /** Armazena produtos em cache local na sessão para evitar re-fetch */
   products?: never;
+  /** Lista de códigos de cupom já utilizados por este usuário */
+  usedCoupons?: string[];
 }
 
-/** TTL em segundos por estado da sessão */
 function getTTL(step: UserSession['step']): number {
   switch (step) {
     case 'awaiting_payment':
@@ -69,7 +52,7 @@ export async function getSession(userId: number): Promise<UserSession> {
     await redis.set(sessionKey(userId), JSON.stringify(session), getTTL(session.step));
     return session;
   }
-  return { step: 'idle', lastActivityAt: Date.now() };
+  return { step: 'idle', lastActivityAt: Date.now(), usedCoupons: [] };
 }
 
 export async function saveSession(userId: number, session: UserSession): Promise<void> {
@@ -78,10 +61,30 @@ export async function saveSession(userId: number, session: UserSession): Promise
   await redis.set(sessionKey(userId), JSON.stringify(session), ttl);
 }
 
-export async function clearSession(userId: number, keepFirstName?: string): Promise<void> {
+export async function clearSession(userId: number, keepFirstName?: string, keepUsedCoupons?: string[]): Promise<void> {
   await saveSession(userId, {
     step: 'idle',
     firstName: keepFirstName,
     lastActivityAt: Date.now(),
+    usedCoupons: keepUsedCoupons ?? [],
   });
+}
+
+/** Registra um cupom como utilizado pelo usuário. Persiste mesmo após clearSession. */
+export async function markCouponUsed(userId: number, couponCode: string): Promise<void> {
+  const session = await getSession(userId);
+  const used = session.usedCoupons ?? [];
+  const upper = couponCode.toUpperCase();
+  if (!used.includes(upper)) {
+    used.push(upper);
+  }
+  session.usedCoupons = used;
+  await saveSession(userId, session);
+}
+
+/** Verifica se o usuário já usou um determinado cupom. */
+export async function hasCouponBeenUsed(userId: number, couponCode: string): Promise<boolean> {
+  const session = await getSession(userId);
+  const used = session.usedCoupons ?? [];
+  return used.includes(couponCode.toUpperCase());
 }
