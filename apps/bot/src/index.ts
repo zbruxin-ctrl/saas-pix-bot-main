@@ -1,15 +1,15 @@
 /**
  * Bot Telegram principal — registro de handlers e inicialização.
  *
- * TIPAGEM: usa BotContext (= Context do Telegraf) nas funções genéricas.
- *          bot.action / bot.command / bot.on recebem callback narrowado
- *          automaticamente pelo Telegraf — basta usar ctx.from, ctx.message,
- *          ctx.callbackQuery diretamente, sem cast para Middleware<...>.
+ * TIPAGEM: os callbacks de bot.action / bot.command / bot.on / bot.start
+ *          NÃO recebem anotação de tipo no parâmetro ctx — o Telegraf já
+ *          infere o NarrowedContext correto automaticamente.
+ *
+ *          Os helpers (showHome, showProducts, etc.) aceitam Context genérico
+ *          pois são chamados tanto de bot.action quanto de bot.command.
  */
 import { Telegraf, Markup } from 'telegraf';
 import type { Context } from 'telegraf';
-import type { CallbackQuery, Update } from 'telegraf/types';
-import type { NarrowedContext } from 'telegraf';
 import { apiClient } from './services/apiClient';
 import { getSession, saveSession, clearSession } from './services/session';
 import { validateCoupon } from './services/couponClient';
@@ -26,11 +26,6 @@ import {
   cancelPIXTimer,
 } from './handlers/payments';
 
-// Tipos de conveniência para os handlers
-type BotCtx = Context;
-type CbCtx  = NarrowedContext<Context, Update.CallbackQueryUpdate<CallbackQuery.DataQuery>>;
-type TxtCtx = NarrowedContext<Context, Update.MessageUpdate>;
-
 type ProductDTO = Awaited<ReturnType<typeof apiClient.getProducts>>[number];
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
@@ -42,7 +37,7 @@ initPaymentHandlers();
 
 // ─── showHome ─────────────────────────────────────────────────────────────────
 
-async function showHome(ctx: BotCtx): Promise<void> {
+async function showHome(ctx: Context): Promise<void> {
   const welcomeMsg = process.env.BOT_WELCOME_MESSAGE
     ?? `🛒 Aqui você pode adquirir nossos produtos de forma rápida e segura.\n\n💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo pré-carregado</b>.`;
 
@@ -92,26 +87,26 @@ bot.start(async (ctx) => {
           ]).reply_markup,
         }
       );
-      await schedulePIXExpiry(ctx as Context, session.paymentId, userId, session.pixExpiresAt);
+      await schedulePIXExpiry(ctx, session.paymentId, userId, session.pixExpiresAt);
       return;
     }
 
     session.firstName = ctx.from.first_name;
     await saveSession(userId, session);
-    await showHome(ctx as Context);
+    await showHome(ctx);
   } catch (err) {
     console.error('[/start] Erro:', err);
   }
 });
 
-bot.action('show_home', async (ctx: CbCtx) => {
+bot.action('show_home', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await showHome(ctx);
 });
 
 // ─── /produtos ────────────────────────────────────────────────────────────────
 
-async function showProducts(ctx: BotCtx): Promise<void> {
+async function showProducts(ctx: Context): Promise<void> {
   try {
     const products = await apiClient.getProducts();
     if (!products.length) {
@@ -151,14 +146,14 @@ async function showProducts(ctx: BotCtx): Promise<void> {
 
 bot.command('produtos', (ctx) => showProducts(ctx));
 
-bot.action('show_products', async (ctx: CbCtx) => {
+bot.action('show_products', async (ctx) => {
   await ctx.answerCbQuery('⏳ Carregando produtos...').catch(() => {});
   await showProducts(ctx);
 });
 
 // ─── /saldo ───────────────────────────────────────────────────────────────────
 
-async function showBalance(ctx: BotCtx): Promise<void> {
+async function showBalance(ctx: Context): Promise<void> {
   try {
     const userId = ctx.from!.id;
     const data   = await apiClient.getBalance(String(userId));
@@ -210,12 +205,12 @@ async function showBalance(ctx: BotCtx): Promise<void> {
 
 bot.command('saldo', (ctx) => showBalance(ctx));
 
-bot.action('show_balance', async (ctx: CbCtx) => {
+bot.action('show_balance', async (ctx) => {
   await ctx.answerCbQuery('⏳ Buscando saldo...').catch(() => {});
   await showBalance(ctx);
 });
 
-bot.action('deposit_balance', async (ctx: CbCtx) => {
+bot.action('deposit_balance', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const userId  = ctx.from.id;
@@ -238,7 +233,7 @@ bot.action('deposit_balance', async (ctx: CbCtx) => {
   }
 });
 
-bot.action('cancel_deposit', async (ctx: CbCtx) => {
+bot.action('cancel_deposit', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const userId  = ctx.from.id;
   const session = await getSession(userId);
@@ -249,7 +244,7 @@ bot.action('cancel_deposit', async (ctx: CbCtx) => {
 
 // ─── /pedidos ─────────────────────────────────────────────────────────────────
 
-async function showOrders(ctx: BotCtx): Promise<void> {
+async function showOrders(ctx: Context): Promise<void> {
   const userId = ctx.from!.id;
   try {
     const orders = await apiClient.getOrders(String(userId));
@@ -291,14 +286,14 @@ async function showOrders(ctx: BotCtx): Promise<void> {
 
 bot.command('meus_pedidos', (ctx) => showOrders(ctx));
 
-bot.action('show_orders', async (ctx: CbCtx) => {
+bot.action('show_orders', async (ctx) => {
   await ctx.answerCbQuery('📦 Carregando pedidos...').catch(() => {});
   await showOrders(ctx);
 });
 
 // ─── Indicações ────────────────────────────────────────────────────────────────
 
-async function showReferral(ctx: BotCtx): Promise<void> {
+async function showReferral(ctx: Context): Promise<void> {
   try {
     const userId = ctx.from!.id;
     let referralInfo: { referralCount?: number; bonusEarned?: number } | null = null;
@@ -342,14 +337,14 @@ async function showReferral(ctx: BotCtx): Promise<void> {
 
 bot.command('indicacoes', (ctx) => showReferral(ctx));
 
-bot.action('show_referral', async (ctx: CbCtx) => {
+bot.action('show_referral', async (ctx) => {
   await ctx.answerCbQuery('👥 Carregando indicações...').catch(() => {});
   await showReferral(ctx);
 });
 
 // ─── Ajuda ────────────────────────────────────────────────────────────────────
 
-async function showHelp(ctx: BotCtx): Promise<void> {
+async function showHelp(ctx: Context): Promise<void> {
   const phone = process.env.SUPPORT_PHONE_NUMBER ?? '';
   const whatsappLine = phone
     ? `\n📞 <a href="https://wa.me/${phone}">Falar com suporte no WhatsApp</a>`
@@ -398,7 +393,7 @@ async function showHelp(ctx: BotCtx): Promise<void> {
 
 bot.command('ajuda', (ctx) => showHelp(ctx));
 
-bot.action('show_help', async (ctx: CbCtx) => {
+bot.action('show_help', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await showHelp(ctx);
 });
@@ -419,7 +414,7 @@ bot.command('suporte', async (ctx) => {
 
 // ─── Seleção de produto → tela de quantidade ──────────────────────────────────
 
-bot.action(/^select_product_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^select_product_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery('⏳ Carregando produto...').catch(() => {});
   try {
     const productId = ctx.match[1];
@@ -454,7 +449,7 @@ bot.action(/^select_product_(.+)$/, async (ctx: CbCtx) => {
 
 // ─── Seleção de quantidade → tela de pagamento ────────────────────────────────
 
-bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx: CbCtx) => {
+bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const productId = ctx.match[1];
@@ -462,9 +457,9 @@ bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx: CbCtx) => {
     const userId    = ctx.from.id;
 
     const session = await getSession(userId);
-    session.pendingQty       = qty;
+    session.pendingQty        = qty;
     session.selectedProductId = productId;
-    session.step             = 'selecting_product';
+    session.step              = 'selecting_product';
     await saveSession(userId, session);
 
     const [products, walletData] = await Promise.all([
@@ -485,34 +480,34 @@ bot.action(/^set_qty_(.+)_(\d+)$/, async (ctx: CbCtx) => {
 
 // ─── Métodos de pagamento ────────────────────────────────────────────────────────────
 
-bot.action(/^pay_pix_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^pay_pix_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await executePayment(ctx, ctx.match[1], 'PIX');
 });
 
-bot.action(/^pay_balance_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^pay_balance_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await executePayment(ctx, ctx.match[1], 'BALANCE');
 });
 
-bot.action(/^pay_mixed_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await executePayment(ctx, ctx.match[1], 'MIXED');
 });
 
 // ─── Verificar / cancelar pagamento ──────────────────────────────────────────
 
-bot.action(/^check_payment_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^check_payment_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await handleCheckPayment(ctx, ctx.match[1]);
 });
 
-bot.action(/^cancel_payment_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await handleCancelPayment(ctx, ctx.match[1]);
 });
 
-bot.action('cancel_payment', async (ctx: CbCtx) => {
+bot.action('cancel_payment', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const userId  = ctx.from.id;
   const session = await getSession(userId);
@@ -528,12 +523,12 @@ bot.action('cancel_payment', async (ctx: CbCtx) => {
 
 // ─── Cupom ────────────────────────────────────────────────────────────────────
 
-bot.action(/^coupon_input_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^coupon_input_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await showCouponInputScreen(ctx, ctx.match[1]);
 });
 
-bot.action(/^back_to_payment_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^back_to_payment_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const productId = ctx.match[1];
@@ -550,7 +545,7 @@ bot.action(/^back_to_payment_(.+)$/, async (ctx: CbCtx) => {
   }
 });
 
-bot.action(/^remove_coupon_(.+)$/, async (ctx: CbCtx) => {
+bot.action(/^remove_coupon_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   try {
     const productId = ctx.match[1];
@@ -573,9 +568,9 @@ bot.action(/^remove_coupon_(.+)$/, async (ctx: CbCtx) => {
 
 // ─── Mensagens de texto (cupom / depósito) ────────────────────────────────────
 
-bot.on('text', async (ctx: TxtCtx) => {
+bot.on('text', async (ctx) => {
   try {
-    const userId = ctx.from.id;
+    const userId  = ctx.from.id;
     const session = await getSession(userId);
     const text    = ctx.message.text.trim();
 
@@ -583,10 +578,10 @@ bot.on('text', async (ctx: TxtCtx) => {
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
       const couponCode = text.toUpperCase();
       try {
-        const products     = await apiClient.getProducts();
-        const product      = products.find((p) => p.id === session.pendingProductId);
-        const qty          = session.pendingQty ?? 1;
-        const orderAmount  = Number(product?.price ?? 0) * qty;
+        const products    = await apiClient.getProducts();
+        const product     = products.find((p) => p.id === session.pendingProductId);
+        const qty         = session.pendingQty ?? 1;
+        const orderAmount = Number(product?.price ?? 0) * qty;
 
         const result = await validateCoupon(
           couponCode,
@@ -641,10 +636,10 @@ bot.on('text', async (ctx: TxtCtx) => {
           ? new Date(deposit.expiresAt).toISOString()
           : new Date(Date.now() + 30 * 60 * 1000).toISOString();
 
-        session.step              = 'awaiting_payment';
-        session.depositPaymentId  = deposit.paymentId;
-        session.pixExpiresAt      = expiresAt;
-        session.pixQrCodeText     = qrText;
+        session.step             = 'awaiting_payment';
+        session.depositPaymentId = deposit.paymentId;
+        session.pixExpiresAt     = expiresAt;
+        session.pixQrCodeText    = qrText;
         await saveSession(userId, session);
 
         const amountStr = String(amount.toFixed(2)).replace('.', '\\.');
@@ -662,7 +657,7 @@ bot.on('text', async (ctx: TxtCtx) => {
           }
         );
         await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
-        await schedulePIXExpiry(ctx as Context, deposit.paymentId, userId, expiresAt);
+        await schedulePIXExpiry(ctx, deposit.paymentId, userId, expiresAt);
       } catch (err) {
         console.error('[deposit] erro:', err);
         await ctx.reply('❌ Erro ao gerar PIX de depósito.', { parse_mode: 'HTML' });
