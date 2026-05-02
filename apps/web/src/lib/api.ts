@@ -12,7 +12,7 @@ import type {
   DeliveryMediaDTO,
 } from '@saas-pix/shared';
 
-// ─── Tipo local para mídias de produto (usado em products-client.tsx) ─────────
+// ─── Tipo local para mídias de produto (usado em products-client.tsx) ─────────────
 export interface ProductMedia {
   url: string;
   mediaType: 'IMAGE' | 'VIDEO' | 'FILE';
@@ -40,13 +40,13 @@ api.interceptors.response.use(
 
 export default api;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────────────────────────────
 
 function data<T>(res: AxiosResponse<ApiResponse<T>>): T {
   return res.data.data as T;
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
+// ─── Auth ───────────────────────────────────────────────────────────────────────
 
 export async function login(email: string, password: string) {
   const res = await axios.post('/api/auth/login', { email, password }, { withCredentials: true });
@@ -108,7 +108,7 @@ export async function deleteProduct(id: string): Promise<void> {
   await api.delete(`/admin/products/${id}`);
 }
 
-// ─── Reorder Products ────────────────────────────────────────────────────────
+// ─── Reorder Products ────────────────────────────────────────────────────────────────
 
 export async function reorderProducts(
   items: Array<{ id: string; sortOrder: number }>
@@ -116,7 +116,7 @@ export async function reorderProducts(
   await api.patch('/admin/products/reorder', { items });
 }
 
-// ─── Product Medias ───────────────────────────────────────────────────────────
+// ─── Product Medias ────────────────────────────────────────────────────────────────────
 
 export async function getProductMedias(productId: string): Promise<ProductMedia[]> {
   try {
@@ -155,7 +155,7 @@ export async function uploadMediaFile(
   return url;
 }
 
-// ─── Stock Items ──────────────────────────────────────────────────────────────
+// ─── Stock Items ──────────────────────────────────────────────────────────────────────
 
 export async function getStockItems(productId: string): Promise<StockItemDTO[]> {
   const res = await api.get<ApiResponse<StockItemDTO[]>>(`/admin/products/${productId}/stock-items`);
@@ -174,7 +174,7 @@ export async function deleteStockItem(itemId: string): Promise<void> {
   await api.delete(`/admin/products/stock-items/${itemId}`);
 }
 
-// ─── Payments ─────────────────────────────────────────────────────────────────
+// ─── Payments ───────────────────────────────────────────────────────────────────
 
 export async function getPayments(
   params?: Partial<{
@@ -205,7 +205,7 @@ export async function reprocessPayment(
   return res.data;
 }
 
-// ─── CSV exports ──────────────────────────────────────────────────────────────
+// ─── CSV exports ────────────────────────────────────────────────────────────────────
 
 export function getPaymentsExportUrl(params?: {
   status?: string;
@@ -228,7 +228,7 @@ export function getUsersExportUrl(): string {
   return '/api/proxy/admin/users/export/csv';
 }
 
-// ─── Users ────────────────────────────────────────────────────────────────────
+// ─── Users ─────────────────────────────────────────────────────────────────────────
 
 export async function getUsers(
   params?: Partial<{ page: number; perPage: number; search: string }>
@@ -247,7 +247,7 @@ export async function toggleBlockUser(id: string): Promise<{ isBlocked: boolean;
   return res.data.data;
 }
 
-// ─── Wallet ───────────────────────────────────────────────────────────────────
+// ─── Wallet ───────────────────────────────────────────────────────────────────────
 
 export async function getWalletBalance(userId: string) {
   const res = await api.get(`/admin/wallet/${userId}/balance`);
@@ -263,7 +263,7 @@ export async function adjustWalletBalance(
   return res.data.data;
 }
 
-// ─── Delivery Medias ──────────────────────────────────────────────────────────
+// ─── Delivery Medias ────────────────────────────────────────────────────────────────────
 
 export async function getOrderMedias(orderId: string): Promise<DeliveryMediaDTO[]> {
   const res = await api.get<ApiResponse<DeliveryMediaDTO[]>>(
@@ -283,9 +283,41 @@ export async function createOrderMedia(
   return data(res);
 }
 
-// ─── Me ───────────────────────────────────────────────────────────────────────
+// ─── Me ───────────────────────────────────────────────────────────────────────────
 
 export async function getMe() {
   const res = await api.get('/admin/me');
   return res.data;
+}
+
+// ─── Referrals ────────────────────────────────────────────────────────────────
+
+export async function getReferrals(params?: {
+  page?: number;
+  perPage?: number;
+  search?: string;
+}): Promise<any> {
+  const res = await api.get('/admin/referrals', { params });
+  return res.data.data;
+}
+
+// ─── Coupons ───────────────────────────────────────────────────────────────────────
+
+export async function getCoupons(params?: { search?: string }): Promise<any[]> {
+  const res = await api.get('/admin/coupons', { params });
+  return res.data.data ?? [];
+}
+
+export async function createCoupon(payload: object): Promise<any> {
+  const res = await api.post('/admin/coupons', payload);
+  return res.data.data;
+}
+
+export async function updateCoupon(id: string, payload: object): Promise<any> {
+  const res = await api.patch(`/admin/coupons/${id}`, payload);
+  return res.data.data;
+}
+
+export async function deleteCoupon(id: string): Promise<void> {
+  await api.delete(`/admin/coupons/${id}`);
 }
