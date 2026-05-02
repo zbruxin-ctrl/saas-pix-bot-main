@@ -51,7 +51,9 @@ async function showHome(ctx: any) {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
-    [Markup.button.callback('💰 Meu Saldo', 'show_balance'), Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+    [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
+    [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+    [Markup.button.callback('❓ Ajuda', 'show_help')],
   ]);
 
   if (ctx.callbackQuery) {
@@ -509,7 +511,7 @@ bot.on('text', async (ctx) => {
         await ctx.replyWithPhoto(
           { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
           {
-            caption: `💳 *Depósito de R\$ ${String(amount.toFixed(2)).replace('.', '\\.')}*\n\nEscaneie o QR ou copie o código abaixo:`,
+            caption: `💳 *Depósito de R\\$ ${String(amount.toFixed(2)).replace('.', '\\.')}*\n\nEscaneie o QR ou copie o código abaixo:`,
             parse_mode: 'MarkdownV2',
             reply_markup: Markup.inlineKeyboard([
               [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
