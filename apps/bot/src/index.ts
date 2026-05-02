@@ -6,6 +6,9 @@
  * FIX #1: ao receber /start, re-agenda o timer de expiração do PIX para
  *         usuários com pagamento em aberto (resistência a restarts via Redis).
  * BUG FIX: todos os handlers têm try/catch global para nunca silenciar o bot.
+ * FIX-COUPON: remove .catch() silencioso na validação de cupom; corrige ordem
+ *             do guard result.data (deve vir ANTES do saveSession); corrige
+ *             typos "cupão" → "cupom".
  */
 
 import { initSentry, captureError } from './config/sentry';
@@ -251,6 +254,10 @@ bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
   await executePayment(ctx, ctx.match[1], 'MIXED');
 });
 
+bot.action(/^pay_mixed_coupon_(.+)$/, async (ctx) => {
+  await executePayment(ctx, ctx.match[1], 'MIXED');
+});
+
 bot.action(/^check_payment_(.+)$/, async (ctx) => {
   await handleCheckPayment(ctx, ctx.match[1]);
 });
@@ -271,22 +278,24 @@ bot.on(message('text'), async (ctx) => {
       return;
     }
 
-    // Usuário digitou o código do cupão
+    // Usuário digitou o código do cupom
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
       const productId = session.pendingProductId;
       const couponCode = text.toUpperCase().trim();
 
-      // Valida o cupão na API antes de prosseguir
       const { validateCoupon } = await import('./services/couponClient');
       const products = await apiClient.getProducts();
       const product = products.find((p) => p.id === productId);
       const price = product ? Number(product.price) : 0;
 
-      const result = await validateCoupon(couponCode, String(userId), price, productId).catch(() => ({ valid: false, error: 'Erro ao validar cupão.' }));
+      // FIX: sem .catch() silencioso — erros reais de rede são capturados pelo
+      // try/catch externo e logados pelo Sentry. O .catch() anterior engolia
+      // falhas de conexão e retornava "inválido" sem nunca chamar a API.
+      const result = await validateCoupon(couponCode, String(userId), price, productId);
 
       if (!result.valid) {
         await ctx.reply(
-          `❌ <b>${result.error ?? 'Cupão inválido.'}</b>\n\nDigite outro código ou clique em Pular.`,
+          `❌ <b>${result.error ?? 'Cupom inválido ou expirado.'}</b>\n\nDigite outro código ou clique em Pular.`,
           {
             parse_mode: 'HTML',
             reply_markup: {
@@ -300,15 +309,23 @@ bot.on(message('text'), async (ctx) => {
         return;
       }
 
-      // Cupão válido — salva na sessão e vai para tela de método
+      // FIX: guard ANTES do saveSession para não sujar a sessão em caso de
+      // result.data ausente (não deveria ocorrer, mas defesa extra).
+      if (!result.data) {
+        captureError(new Error('validateCoupon retornou valid=true mas sem data'), { couponCode, productId });
+        await ctx.reply('❌ Erro ao processar cupom. Tente novamente.', { parse_mode: 'HTML' });
+        return;
+      }
+
+      const d = result.data;
+
+      // Salva na sessão somente após validar tudo
       session.pendingCoupon = couponCode;
       session.step = 'selecting_product';
       await saveSession(userId, session);
 
-      if (!result.valid || !("data" in result) || !result.data) return;
-      const d = result.data;
       await ctx.reply(
-        `✅ <b>Cupão aplicado!</b>\n\n` +
+        `✅ <b>Cupom aplicado!</b>\n\n` +
         `🏷️ Código: <code>${couponCode}</code>\n` +
         `💰 Desconto: <b>R$ ${d.discountAmount.toFixed(2)}</b>\n` +
         `✅ Total com desconto: <b>R$ ${d.finalAmount.toFixed(2)}</b>\n\n` +
