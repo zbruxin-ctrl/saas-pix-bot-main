@@ -1,9 +1,21 @@
 // referralService.ts — programa de indicação
+// FIX: payReferralReward agora aceita (tx, paymentId, rewardCallback) para ser
+//      chamado dentro de prisma.$transaction no paymentService
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { getSetting } from '../routes/admin/settings';
+import type { Prisma } from '@prisma/client';
 
 const DEFAULT_REWARD = 5.0; // R$ 5,00 por indicação
+
+type TransactionClient = Prisma.TransactionClient;
+
+type RewardCallback = (
+  userId: string,
+  amount: number,
+  description: string,
+  tx: TransactionClient
+) => Promise<void>;
 
 /**
  * Registra que referredTelegramId foi indicado por referrerId.
@@ -18,7 +30,6 @@ export async function registerReferral(
     return { registered: false, reason: 'Auto-indicação não permitida.' };
   }
 
-  // Garante que ambos existam (usuário novo pode não estar no DB ainda)
   const [referrer, referred] = await Promise.all([
     prisma.telegramUser.findUnique({ where: { telegramId: referrerTelegramId }, select: { id: true } }),
     prisma.telegramUser.findUnique({ where: { telegramId: referredTelegramId }, select: { id: true } }),
@@ -27,7 +38,6 @@ export async function registerReferral(
   if (!referrer) return { registered: false, reason: 'Indicador não encontrado.' };
   if (!referred) return { registered: false, reason: 'Usuário indicado não encontrado.' };
 
-  // Verifica se o indicado já tem uma indicação registrada (referredId é @unique)
   const existing = await prisma.referral.findUnique({
     where: { referredId: referred.id },
   });
@@ -47,49 +57,49 @@ export async function registerReferral(
 }
 
 /**
- * Paga a recompensa ao indicador quando o pagamento de um indicado é aprovado.
- * Deve ser chamado no webhook de pagamento aprovado.
- * Idempotente: ignora se rewardPaid=true.
+ * Paga a recompensa ao indicador quando um pagamento do indicado é aprovado.
+ * Deve ser chamado DENTRO de um prisma.$transaction existente.
+ *
+ * @param tx      - TransactionClient da transação em andamento
+ * @param paymentId - ID do pagamento aprovado
+ * @param onReward  - Callback que executa o crédito de saldo + WalletTransaction dentro da tx
  */
-export async function payReferralReward(paymentId: string): Promise<void> {
-  // Busca o pagamento e o usuário
-  const payment = await prisma.payment.findUnique({
+export async function payReferralReward(
+  tx: TransactionClient,
+  paymentId: string,
+  onReward: RewardCallback
+): Promise<void> {
+  // Busca o pagamento para obter o telegramUserId
+  const payment = await tx.payment.findUnique({
     where: { id: paymentId },
     select: { telegramUserId: true },
   });
   if (!payment) return;
 
   // Verifica se este usuário foi indicado e se a recompensa ainda não foi paga
-  const referral = await prisma.referral.findUnique({
+  const referral = await tx.referral.findUnique({
     where: { referredId: payment.telegramUserId },
   });
   if (!referral || referral.rewardPaid) return;
 
-  // Lê o valor de recompensa configurado no painel admin
+  // Lê o valor de recompensa configurado no painel admin (fora da tx para não bloquear)
   const rewardRaw = await getSetting('referral_reward_amount');
   const rewardAmount = rewardRaw ? parseFloat(rewardRaw) : DEFAULT_REWARD;
   if (isNaN(rewardAmount) || rewardAmount <= 0) return;
 
-  // Credita saldo do indicador e marca recompensa como paga atomicamente
-  await prisma.$transaction([
-    prisma.telegramUser.update({
-      where: { id: referral.referrerId },
-      data: { balance: { increment: rewardAmount } },
-    }),
-    prisma.walletTransaction.create({
-      data: {
-        telegramUserId: referral.referrerId,
-        type: 'DEPOSIT',
-        amount: rewardAmount,
-        description: 'Recompensa por indicação',
-        paymentId,
-      },
-    }),
-    prisma.referral.update({
-      where: { id: referral.id },
-      data: { rewardPaid: true, rewardAmount, paymentId },
-    }),
-  ]);
+  // Delega o crédito ao callback (quem chama decide o tipo de WalletTransaction)
+  await onReward(
+    referral.referrerId,
+    rewardAmount,
+    'Recompensa por indicação',
+    tx
+  );
+
+  // Marca recompensa como paga
+  await tx.referral.update({
+    where: { id: referral.id },
+    data: { rewardPaid: true, rewardAmount, paymentId },
+  });
 
   logger.info(`[referral] Recompensa R$${rewardAmount} paga ao indicador userId=${referral.referrerId} paymentId=${paymentId}`);
 }
