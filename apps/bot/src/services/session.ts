@@ -1,7 +1,6 @@
 /**
  * Gerenciamento de sessões de usuário via Redis (Upstash HTTP).
  * Em dev sem Upstash, usa fallback em memória (InMemoryRedis no redis.ts).
- * TTL: 1 hora de inatividade.
  *
  * P1 FIX: sessions migradas para Redis — sem perda de contexto em restart.
  * FIX #1: campo pixExpiresAt adicionado — permite re-agendar o timer de
@@ -9,6 +8,8 @@
  * FIX-BUILD: adiciona 'awaiting_coupon' ao step + pendingProductId/pendingCoupon à interface
  * FIX-COUPON-DISCOUNT: adiciona pendingCouponDiscount para persistir valor de desconto entre telas
  * FEAT-COPYPASTE-CHECK: adiciona pixQrCodeText para reenviar copia e cola ao verificar pagamento
+ * FIX-SESSION-TTL: TTL dinâmico por estado — sessões com PIX pendente expiram
+ *   em 35min (margem sobre os 30min do PIX) em vez de ficar 1h no Redis.
  */
 import { redis } from './redis';
 
@@ -35,7 +36,21 @@ export interface UserSession {
   products?: never;
 }
 
-const SESSION_TTL_SECONDS = 3600; // 1 hora
+/** TTL em segundos por estado da sessão */
+function getTTL(step: UserSession['step']): number {
+  switch (step) {
+    case 'awaiting_payment':
+      // PIX expira em 30min — 5min de margem para o timer de expiração limpar antes
+      return 35 * 60;
+    case 'awaiting_deposit_amount':
+    case 'awaiting_coupon':
+      // Inputs curtos: usuário não precisa de mais de 10min para digitar
+      return 10 * 60;
+    default:
+      // idle / selecting_product: 1h (comportamento anterior)
+      return 60 * 60;
+  }
+}
 
 function sessionKey(userId: number): string {
   return `session:${userId}`;
@@ -53,7 +68,8 @@ export async function getSession(userId: number): Promise<UserSession> {
 
 export async function saveSession(userId: number, session: UserSession): Promise<void> {
   session.lastActivityAt = Date.now();
-  await redis.set(sessionKey(userId), JSON.stringify(session), SESSION_TTL_SECONDS);
+  const ttl = getTTL(session.step);
+  await redis.set(sessionKey(userId), JSON.stringify(session), ttl);
 }
 
 export async function clearSession(userId: number, keepFirstName?: string): Promise<void> {
