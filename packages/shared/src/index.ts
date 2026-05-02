@@ -8,6 +8,8 @@
 // PAYMENT METHOD: paymentMethod em CreatePaymentRequest (BALANCE | PIX | MIXED)
 // PRICING: couponCode, referralCode, quantity em CreatePaymentRequest
 //          CouponDTO, ReferralDTO, VolumeTierDTO adicionados
+// AUDIT #13: CreatePaymentResponse tipado com todos os campos opcionais —
+//            elimina double cast `as unknown as Record<string, unknown>` em payments.ts
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -254,18 +256,18 @@ export interface CreatePaymentRequest {
 
 export interface CreatePaymentResponse {
   paymentId: string;
-  pixQrCode: string;       // base64 (vazio se paidWithBalance)
-  pixQrCodeText: string;   // copia e cola (vazio se paidWithBalance)
-  amount: number;          // valor final após descontos
-  originalAmount?: number; // valor original antes de descontos
-  discountAmount?: number; // valor do desconto aplicado
-  pixAmount?: number;      // valor cobrado via PIX (MIXED: amount - balanceUsed)
-  balanceUsed?: number;    // valor debitado do saldo (MIXED ou BALANCE)
+  pixQrCode: string;         // base64 (vazio se paidWithBalance)
+  pixQrCodeText: string;     // copia e cola (vazio se paidWithBalance)
+  amount: number;            // valor final após descontos
+  originalAmount?: number;   // valor original antes de descontos
+  discountAmount?: number;   // valor do desconto aplicado
+  pixAmount?: number;        // valor cobrado via PIX (MIXED: amount - balanceUsed)
+  balanceUsed?: number;      // valor debitado do saldo (MIXED ou BALANCE)
   expiresAt: string;
   productName: string;
   paidWithBalance?: boolean; // true = 100% debitado do saldo
   isMixed?: boolean;         // true = saldo parcial + PIX pela diferença
-  /** Nome do cupom aplicado (se houver) */
+  /** Nome do cupom aplicado (se houver) — AUDIT #13: campo tipado, sem double cast */
   couponApplied?: string;
 }
 

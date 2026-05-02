@@ -9,6 +9,10 @@
  * - DESENVOLVIMENTO: usa Map em memória como fallback com aviso explícito.
  *   Dados NÃO sobrevivem a restarts em dev — comportamento esperado.
  *
+ * AUDIT #17: UpstashRedis.command() usa AbortController com timeout de 3s.
+ *            Sem timeout, o fetch pode travar indefinidamente se o Upstash
+ *            estiver lento/indisponível, bloqueando o event loop do Node.js.
+ *
  * Upstash plano gratuito: https://console.upstash.com
  * Após criar um banco Redis, copie UPSTASH_REDIS_REST_URL e
  * UPSTASH_REDIS_REST_TOKEN para o .env e para as variáveis do Railway.
@@ -25,6 +29,8 @@ export interface RedisAdapter {
 
 // ─── Upstash HTTP adapter ────────────────────────────────────────────────────
 
+const UPSTASH_TIMEOUT_MS = 3_000;
+
 class UpstashRedis implements RedisAdapter {
   private url: string;
   private token: string;
@@ -35,17 +41,31 @@ class UpstashRedis implements RedisAdapter {
   }
 
   private async command<T>(args: (string | number)[]): Promise<T> {
-    const res = await fetch(`${this.url}`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(args),
-    });
-    if (!res.ok) throw new Error(`Upstash error: ${res.status} ${await res.text()}`);
-    const json = (await res.json()) as { result: T };
-    return json.result;
+    // AUDIT #17: AbortController com timeout de 3s — evita hang em Upstash lento
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), UPSTASH_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(`${this.url}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(args),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`Upstash error: ${res.status} ${await res.text()}`);
+      const json = (await res.json()) as { result: T };
+      return json.result;
+    } catch (err) {
+      if ((err as Error).name === 'AbortError') {
+        throw new Error(`Upstash timeout após ${UPSTASH_TIMEOUT_MS}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async get(key: string): Promise<string | null> {

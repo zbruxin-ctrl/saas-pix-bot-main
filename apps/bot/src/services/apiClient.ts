@@ -13,7 +13,14 @@
 // PERF #7: timeout por operacao — createPayment/createDeposit usam 25s
 //   (Neon cold start + chamada Mercado Pago podem exceder 8s facilmente)
 // FIX-COUPON: createPayment aceita e envia couponCode e referralCode
+// AUDIT #2: Idempotency-Key em createPayment — janela de 2 minutos por
+//   userId+productId evita criar pagamento duplicado em retry de timeout.
+// AUDIT #12: fallback B17 filtra por productId — evita retornar pedido de
+//   produto diferente do solicitado na janela de 60s.
+// AUDIT #18: Axios com httpsAgent keepAlive:true — reutiliza conexões TCP
+//   e reduz latência de handshake em múltiplas requisições.
 import axios, { AxiosInstance, AxiosError } from 'axios';
+import https from 'https';
 import { env } from '../config/env';
 import type {
   CreatePaymentResponse,
@@ -72,6 +79,7 @@ export interface OrderSummary {
   createdAt: string;
   deliveredAt: string | null;
   productName: string;
+  productId?: string;
   amount: number | null;
   paymentMethod: PaymentMethod | null;
 }
@@ -90,6 +98,13 @@ const BASE_HEADERS = (secret: string | undefined) => ({
   'x-bot-secret': secret,
 });
 
+// AUDIT #18: agente HTTPS com keep-alive — reutiliza conexões TCP entre requests,
+// reduzindo overhead de handshake em requisições frequentes ao serviço da API.
+const keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+});
+
 class ApiClient {
   /** Cliente para leituras rápidas: 8s */
   private client: AxiosInstance;
@@ -100,6 +115,7 @@ class ApiClient {
     const baseConfig = {
       baseURL: env.API_URL,
       headers: BASE_HEADERS(env.TELEGRAM_BOT_SECRET),
+      httpsAgent: keepAliveAgent,
     };
 
     this.client = axios.create({ ...baseConfig, timeout: 8_000 });
@@ -245,13 +261,26 @@ class ApiClient {
     referralCode?: string;
   }): Promise<CreatePaymentResponse> {
     invalidateBalanceCache(params.telegramId);
+
+    // AUDIT #2: Idempotency-Key determinística por userId + productId + janela de 2min.
+    // Garante que retries de timeout não criem pagamentos duplicados na gateway.
+    // Janela de 2min: mesmo usuário comprando o mesmo produto duas vezes seguidas
+    // em menos de 2 minutos ainda resultará na mesma key — comportamento aceitável
+    // pois o segundo request retornará a resposta cacheada pelo servidor.
+    const window2min = Math.floor(Date.now() / 120_000);
+    const idempotencyKey = `create-${params.telegramId}-${params.productId}-${window2min}`;
+
     try {
       const { data } = await this.withRetrySlowClient(() =>
-        this.slowClient.post<ApiResponse<CreatePaymentResponse>>('/api/payments/create', params)
+        this.slowClient.post<ApiResponse<CreatePaymentResponse>>('/api/payments/create', params, {
+          headers: { 'Idempotency-Key': idempotencyKey },
+        })
       );
       return data.data!;
     } catch (err) {
-      // FIX-B17: fallback idempotente para 400 saldo insuficiente em BALANCE
+      // AUDIT #12: fallback B17 agora filtra por productId — evita retornar pedido
+      // de produto diferente do solicitado quando dois produtos foram comprados
+      // pelo mesmo usuário na janela de 60s.
       if (
         err instanceof ApiHttpError &&
         err.statusCode === 400 &&
@@ -263,6 +292,8 @@ class ApiClient {
           const sixtySecondsAgo = Date.now() - 60_000;
           const recentByTime = orders.find(
             (o) =>
+              // AUDIT #12: filtra pelo productId solicitado (quando disponível na resposta)
+              (!o.productId || o.productId === params.productId) &&
               (o.status === 'DELIVERED' || o.status === 'PROCESSING') &&
               new Date(o.createdAt).getTime() > sixtySecondsAgo
           );

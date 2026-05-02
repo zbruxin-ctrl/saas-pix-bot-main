@@ -10,6 +10,10 @@
 //   2. Legacy (V1): ?id=...&topic=payment — NÃO inclui x-signature
 //   O formato legacy é ignorado silenciosamente (200 imediato) antes de qualquer
 //   validação HMAC, eliminando o log "assinatura inválida" que era falso-positivo.
+// AUDIT #3: Webhook retorna 503 em produção quando HMAC não está configurado —
+//   antes, aceitava silenciosamente qualquer request sem assinatura, permitindo fraude.
+// AUDIT #10: validateWebhookSignature valida que o timestamp `ts` está dentro de
+//   ±5 minutos da hora atual — proteção anti-replay attack.
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { Prisma, WebhookEventStatus } from '@prisma/client';
@@ -33,7 +37,7 @@ const isWebhookSignatureEnabled =
 
 if (!isWebhookSignatureEnabled && env.NODE_ENV === 'production') {
   logger.error(
-    '\uD83D\uDEA8 [CRÍTICO] MERCADO_PAGO_WEBHOOK_SECRET não configurado ou inválido. ' +
+    '🚨 [CRÍTICO] MERCADO_PAGO_WEBHOOK_SECRET não configurado ou inválido. ' +
     'Validação HMAC DESABILITADA — configure a variável no Railway imediatamente.'
   );
 }
@@ -42,10 +46,8 @@ webhooksRouter.post(
   '/mercadopago',
   webhookRateLimit,
   async (req: Request, res: Response) => {
-    // FIX LEGACY-WEBHOOK: O MP envia dois requests por evento.
-    // O formato legacy (V1) usa ?topic=payment e NÃO inclui x-signature.
-    // Como já processamos o formato novo (V2) que tem x-signature,
-    // ignoramos o legacy silenciosamente para evitar falso "assinatura inválida" nos logs.
+    // FIX LEGACY-WEBHOOK: formato legacy (V1) usa ?topic=payment e NÃO inclui x-signature.
+    // Ignorado silenciosamente para evitar falso "assinatura inválida" nos logs.
     if (req.query.topic) {
       res.status(200).json({ status: 'legacy_ignored' });
       return;
@@ -63,18 +65,21 @@ webhooksRouter.post(
       return;
     }
 
-    const isValid = isWebhookSignatureEnabled
-      ? validateWebhookSignature(req, bodyString)
-      : true;
-
-    if (!isValid) {
-      logger.warn('Webhook: assinatura inválida', { ip: req.ip });
-      res.status(200).json({ status: 'ignored' });
-      return;
-    }
-
-    if (!isWebhookSignatureEnabled && env.NODE_ENV === 'production') {
-      logger.warn('Webhook aceito SEM validação HMAC — configure MERCADO_PAGO_WEBHOOK_SECRET');
+    // AUDIT #3: em produção, rejeita com 503 se HMAC não estiver configurado.
+    // Antes, aceitava silenciosamente qualquer POST sem assinatura — vetor de fraude.
+    if (!isWebhookSignatureEnabled) {
+      if (env.NODE_ENV === 'production') {
+        logger.error('[webhook] BLOQUEADO: HMAC não configurado em produção. Configure MERCADO_PAGO_WEBHOOK_SECRET.');
+        res.status(503).json({ error: 'Webhook desabilitado: configure MERCADO_PAGO_WEBHOOK_SECRET no Railway' });
+        return;
+      }
+      // dev: passa sem validação (aviso já logado na inicialização)
+    } else {
+      if (!validateWebhookSignature(req, bodyString)) {
+        logger.warn('Webhook: assinatura inválida', { ip: req.ip });
+        res.status(200).json({ status: 'ignored' });
+        return;
+      }
     }
 
     const eventType = payload.type as string | undefined;
@@ -112,8 +117,6 @@ async function processWebhookAsync(
   }
 
   // FIX RACE: tenta CREATE com status=PROCESSING diretamente.
-  // Se unique constraint falhar (já existe), tenta assumir o lock
-  // só se o registro ainda estiver em RECEIVED.
   let webhookEventId: string;
 
   try {
@@ -129,7 +132,6 @@ async function processWebhookAsync(
     });
     webhookEventId = created.id;
   } catch {
-    // Unique constraint: registro já existe. Verifica se ainda está em RECEIVED.
     const existing = await prisma.webhookEvent.findUnique({
       where: {
         provider_externalId_eventType: {
@@ -151,7 +153,6 @@ async function processWebhookAsync(
       return;
     }
 
-    // Tenta transição atômica RECEIVED → PROCESSING
     const locked = await prisma.webhookEvent.updateMany({
       where: { id: existing.id, status: WebhookEventStatus.RECEIVED },
       data: { status: WebhookEventStatus.PROCESSING },
@@ -165,7 +166,6 @@ async function processWebhookAsync(
     webhookEventId = existing.id;
   }
 
-  // Apenas UM processo chega aqui por externalId+resolvedEventType
   try {
     const mpPayment = await mercadoPagoService.getPaymentById(externalId);
 
@@ -235,6 +235,14 @@ function validateWebhookSignature(req: Request, body: string): boolean {
 
     const ts = tsPart.split('=')[1];
     const signature = v1Part.split('=')[1];
+
+    // AUDIT #10: valida que o timestamp está dentro de ±5 minutos.
+    // Evita replay attack: webhook legítimo interceptado e reenviado indefinidamente.
+    const tsMs = parseInt(ts, 10) * 1000;
+    if (isNaN(tsMs) || Math.abs(Date.now() - tsMs) > 5 * 60 * 1000) {
+      logger.warn('Webhook rejeitado: timestamp expirado ou inválido (possível replay attack)', { ts });
+      return false;
+    }
 
     let dataId = (req.query['data.id'] as string) || (req.query['id'] as string) || '';
     if (!dataId) {

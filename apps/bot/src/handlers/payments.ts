@@ -16,7 +16,8 @@
  * BUG FIX: answerCbQuery chamado ANTES de qualquer operação async para evitar
  *          timeout de 30s do Telegram que silencia o bot.
  * FEAT-PRICING: tela de cupom/referral antes de gerar PIX; exibe desconto no resumo.
- * FIX-TS2352: double cast via unknown para acessar campos opcionais de CreatePaymentResponse
+ * FIX-TS2352: campos opcionais adicionados ao tipo CreatePaymentResponse em @saas-pix/shared
+ *             — double cast removido (AUDIT #13).
  * FIX-COUPON-DISCOUNT: aplica pendingCouponDiscount ao preço exibido na tela de método;
  *                      oculta botão de cupom quando já existe cupom aplicado.
  * FIX-MDV2: escapa '!' e demais caracteres reservados do MarkdownV2 na caption do PIX.
@@ -34,19 +35,28 @@
  * FIX-DOUBLE-GETSESSION: executePayment unificado para uma única leitura de sessão
  *                        (sessionForCoupon e sessionAfterSend fundidos em `session`).
  * FIX-ESCAPEHTML-DISCOUNT: escapeHtml() removido de discountAmount.toFixed(2).
+ * AUDIT #4: schedulePIXExpiry usa registerPIXTimer/cancelPIXTimer — evita memory leak
+ *           de timers órfãos; cancelPIXTimer chamado em handleCheckPayment e clearSession.
+ * AUDIT #7: mensagem de erro diferenciada para método MIXED — avisa usuário que saldo
+ *           foi reservado mesmo se replyWithPhoto falhar.
+ * AUDIT #19: caption MarkdownV2 limitada a 900 chars; copia-e-cola enviado em mensagem
+ *            separada se a caption exceder o limite — elimina erro 400 por caption longa.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
 import { escapeHtml, escapeMd } from '../utils/escape';
 import { editOrReply, deletePhotoAndReply } from '../utils/helpers';
 import { getSession, saveSession, clearSession } from '../services/session';
-import { acquireLock, releaseLock } from '../services/locks';
+import { acquireLock, releaseLock, registerPIXTimer, cancelPIXTimer } from '../services/locks';
 import { apiClient } from '../services/apiClient';
 import { captureError } from '../config/sentry';
 import { showBlockedMessage } from './navigation';
-import type { ProductDTO } from '@saas-pix/shared';
+import type { CreatePaymentResponse, ProductDTO } from '@saas-pix/shared';
 
 const PIX_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutos
+
+// Limite de caracteres para caption do Telegram (margem de segurança abaixo de 1024)
+const MAX_CAPTION_LENGTH = 900;
 
 // Referência ao bot injetada em initPaymentHandlers
 let _bot: Telegraf;
@@ -74,13 +84,12 @@ export async function showPaymentMethodScreen(
     }
   }
 
-  // FIX-COUPON-DISCOUNT: aplica desconto do cupão ao preço exibido
+  // FIX-COUPON-DISCOUNT: aplica desconto do cupom ao preço exibido
   const session = await getSession(userId);
   const rawPrice = Number(product.price);
   const couponDiscount = session.pendingCouponDiscount ?? 0;
   const price = Math.max(0, rawPrice - couponDiscount);
 
-  // FIX-ESCAPEHTML-NUMERIC: valores numéricos não precisam de escapeHtml
   const balanceStr = balance.toFixed(2);
   const descLine = product.description
     ? `\n📝 <i>${escapeHtml(product.description)}</i>\n`
@@ -178,8 +187,8 @@ export async function executePayment(
     await ctx.answerCbQuery('⏳ Processando...').catch(() => {});
   }
 
-  const acquired = await acquireLock(lockKey, 60);
-  if (!acquired) {
+  const lockToken = await acquireLock(lockKey, 60);
+  if (!lockToken) {
     console.warn(`[executePayment] Lock ativo para ${userId}`);
     return;
   }
@@ -203,13 +212,11 @@ export async function executePayment(
     } as Parameters<typeof apiClient.createPayment>[0]);
 
     // ── Pagamento por saldo puro: salva sessão e finaliza ───────────────────────
-    const paymentAny = payment as unknown as Record<string, unknown>;
-
+    // AUDIT #13: campos tipados em CreatePaymentResponse — sem double cast
     if (payment.paidWithBalance) {
-      // FIX-ESCAPEHTML-DISCOUNT: discountAmount.toFixed(2) é numérico — sem escapeHtml.
-      // couponCode mantido com escapeHtml pois é dado externo (API).
-      const discountLine = paymentAny.discountAmount
-        ? `\n🏷️ <b>Desconto aplicado:</b> R$ ${Number(paymentAny.discountAmount).toFixed(2)} (cupão ${escapeHtml(String(paymentAny.couponCode ?? ''))})\n`
+      const discountLine = payment.discountAmount
+        ? `\n🏷️ <b>Desconto aplicado:</b> R$ ${Number(payment.discountAmount).toFixed(2)}` +
+          (payment.couponApplied ? ` (cupão ${escapeHtml(payment.couponApplied)})` : '') + `\n`
         : '';
 
       await editOrReply(
@@ -242,20 +249,20 @@ export async function executePayment(
       ? `\n💳 *Saldo usado:* R$ ${escapeMd(Number(payment.balanceUsed).toFixed(2))}\n📱 *PIX a pagar:* R$ ${escapeMd(Number(payment.pixAmount).toFixed(2))}`
       : '';
 
-    const discountMdLine = paymentAny.discountAmount
-      ? `\n🏷️ *Desconto:* R$ ${escapeMd(Number(paymentAny.discountAmount).toFixed(2))}`
+    const discountMdLine = payment.discountAmount
+      ? `\n🏷️ *Desconto:* R$ ${escapeMd(Number(payment.discountAmount).toFixed(2))}`
       : '';
 
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
 
     // FIX-MDV2: '!' é reservado no MarkdownV2 — escapado manualmente no literal
     // e via escapeMd() em todos os valores dinâmicos.
-    const caption =
+    const fullCaption =
       `💳 *Pagamento PIX Gerado\\!*\n\n` +
       `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
       `💰 *Valor total:* R$ ${escapeMd(Number(payment.amount).toFixed(2))}${mixedLine}${discountMdLine}\n` +
       `⏰ *Válido até:* ${escapeMd(expiresStr)}\n` +
-      `�fa *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
+      `🆔 *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
       `📋 *Copia e Cola:*\n\`${escapeMd(payment.pixQrCodeText)}\``;
 
     const chatId = ctx.chat?.id;
@@ -263,19 +270,38 @@ export async function executePayment(
       await ctx.telegram.deleteMessage(chatId, session.mainMessageId).catch(() => {});
     }
 
-    // FIX-SESSION-ORDER: envia a foto PRIMEIRO. Se falhar, a sessão NÃO é marcada
-    // como awaiting_payment e o pagamento não fica pendente fantasma no Redis.
-    const qrMsg = await ctx.replyWithPhoto(
-      { source: qrBuffer },
-      {
-        caption,
-        parse_mode: 'MarkdownV2',
-        reply_markup: Markup.inlineKeyboard([
-          [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
-          [Markup.button.callback('❌ Cancelar', `cancel_payment_${payment.paymentId}`)],
-        ]).reply_markup,
-      }
-    );
+    const pixKeyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🔄 Verificar Pagamento', `check_payment_${payment.paymentId}`)],
+      [Markup.button.callback('❌ Cancelar', `cancel_payment_${payment.paymentId}`)],
+    ]).reply_markup;
+
+    // FIX-SESSION-ORDER + AUDIT #19: envia a foto PRIMEIRO.
+    // Se a caption completa exceder 900 chars (limite seguro abaixo do máximo 1024 do Telegram),
+    // envia a foto com caption resumida e o copia-e-cola em mensagem separada para evitar erro 400.
+    let qrMsg;
+    const shortCaption =
+      `💳 *Pagamento PIX Gerado\\!*\n\n` +
+      `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
+      `💰 *Valor total:* R$ ${escapeMd(Number(payment.amount).toFixed(2))}${mixedLine}${discountMdLine}\n` +
+      `⏰ *Válido até:* ${escapeMd(expiresStr)}\n` +
+      `🆔 *ID:* \`${escapeMd(payment.paymentId)}\``;
+
+    if (fullCaption.length > MAX_CAPTION_LENGTH) {
+      // Caption longa: envia foto sem copia-e-cola, depois envia copia-e-cola separado
+      qrMsg = await ctx.replyWithPhoto(
+        { source: qrBuffer },
+        { caption: shortCaption, parse_mode: 'MarkdownV2', reply_markup: pixKeyboard }
+      );
+      await ctx.reply(
+        `📋 *Copia e Cola:*\n\`${escapeMd(payment.pixQrCodeText)}\``,
+        { parse_mode: 'MarkdownV2' }
+      ).catch(() => {});
+    } else {
+      qrMsg = await ctx.replyWithPhoto(
+        { source: qrBuffer },
+        { caption: fullCaption, parse_mode: 'MarkdownV2', reply_markup: pixKeyboard }
+      );
+    }
 
     // Foto enviada com sucesso — agora é seguro persistir o estado de pagamento.
     // FIX-DOUBLE-GETSESSION: reutiliza `session` em vez de fazer novo getSession.
@@ -363,6 +389,25 @@ export async function executePayment(
     }
 
     const isTimeout = errMsg.toLowerCase().includes('timeout') || errMsg.toLowerCase().includes('econnreset');
+
+    // AUDIT #7: mensagem diferenciada para MIXED — saldo pode ter sido reservado
+    // antes do replyWithPhoto falhar; avisa o usuário para usar /start e verificar.
+    if (paymentMethod === 'MIXED') {
+      await editOrReply(
+        ctx,
+        `⚠️ <b>Erro ao exibir o QR Code</b>\n\n` +
+        `Seu saldo foi reservado e o PIX foi criado.\n` +
+        `Use /start para ver o pagamento em andamento e escaneie o QR.`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🏠 Menu Inicial', 'show_home')],
+          ]).reply_markup,
+        }
+      );
+      return;
+    }
+
     await editOrReply(
       ctx,
       isTimeout
@@ -377,7 +422,7 @@ export async function executePayment(
       }
     );
   } finally {
-    await releaseLock(lockKey);
+    await releaseLock(lockKey, lockToken);
   }
 }
 
@@ -389,7 +434,9 @@ export function schedulePIXExpiry(
   chatId: number,
   delayMs: number
 ): void {
-  setTimeout(async () => {
+  // AUDIT #4: registra via registerPIXTimer — cancela timer anterior do mesmo userId
+  // e armazena o handle para cancelamento explícito ao aprovar/cancelar.
+  const timer = setTimeout(async () => {
     try {
       const session = await getSession(userId);
       if (session.step !== 'awaiting_payment' || session.paymentId !== paymentId) return;
@@ -397,6 +444,7 @@ export function schedulePIXExpiry(
       try {
         const { status } = await apiClient.getPaymentStatus(paymentId, String(userId));
         if (status === 'APPROVED' || status === 'CANCELLED') {
+          cancelPIXTimer(userId);
           await clearSession(userId, session.firstName);
           return;
         }
@@ -407,11 +455,14 @@ export function schedulePIXExpiry(
       await _bot.telegram
         .sendMessage(chatId, '⌛ Seu PIX expirou. Use /start para gerar um novo.', { parse_mode: 'HTML' })
         .catch(() => {});
+      cancelPIXTimer(userId);
       await clearSession(userId, session.firstName);
     } catch (err) {
       console.warn(`[schedulePIXExpiry] Erro ao expirar PIX ${paymentId}:`, err);
     }
   }, delayMs);
+
+  registerPIXTimer(userId, timer);
 }
 
 // ─── Verificar pagamento ───────────────────────────────────────────────────────────────────────────────────────────
@@ -473,6 +524,8 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
       }
     );
 
+    // AUDIT #4: cancela timer explicitamente ao confirmar status terminal
+    cancelPIXTimer(userId);
     // Limpa sessão após confirmar que a mensagem foi entregue
     await clearSession(userId, session.firstName);
   } catch (err) {
@@ -483,7 +536,7 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
   }
 }
 
-// ─── Cancelar pagamento ────────────────────────────────────────────────────────���──────────────────────────────
+// ─── Cancelar pagamento ──────────────────────────────────────────────────────────────────────────────────────────
 
 export async function handleCancelPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
@@ -498,8 +551,8 @@ export async function handleCancelPayment(ctx: Context, paymentId: string): Prom
   }
 
   const lockKey = `cancel:${paymentId}`;
-  const acquired = await acquireLock(lockKey, 15);
-  if (!acquired) {
+  const lockToken = await acquireLock(lockKey, 15);
+  if (!lockToken) {
     await ctx.reply('⏳ Cancelamento já em andamento.', { parse_mode: 'HTML' }).catch(() => {});
     return;
   }
@@ -515,6 +568,8 @@ export async function handleCancelPayment(ctx: Context, paymentId: string): Prom
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
     });
+    // AUDIT #4: cancela timer explicitamente ao cancelar pagamento
+    cancelPIXTimer(userId);
     await clearSession(userId, session.firstName);
   } catch (err) {
     console.error('[handleCancelPayment] Erro ao finalizar cancelamento:', err);
@@ -522,8 +577,9 @@ export async function handleCancelPayment(ctx: Context, paymentId: string): Prom
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup,
     }).catch(() => {});
+    cancelPIXTimer(userId);
     await clearSession(userId, session.firstName).catch(() => {});
   } finally {
-    await releaseLock(lockKey);
+    await releaseLock(lockKey, lockToken);
   }
 }
