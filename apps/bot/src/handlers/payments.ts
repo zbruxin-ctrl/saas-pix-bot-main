@@ -31,6 +31,9 @@
  *                          clearSession sempre recebe firstName; clearSession
  *                          movida para após editOrReply nos status terminais.
  * FIX-ESCAPEHTML-NUMERIC: escapeHtml() removido de valores numéricos puros.
+ * FIX-DOUBLE-GETSESSION: executePayment unificado para uma única leitura de sessão
+ *                        (sessionForCoupon e sessionAfterSend fundidos em `session`).
+ * FIX-ESCAPEHTML-DISCOUNT: escapeHtml() removido de discountAmount.toFixed(2).
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -52,7 +55,7 @@ export function initPaymentHandlers(bot: Telegraf): void {
   _bot = bot;
 }
 
-// ─── Tela de seleção de método de pagamento ────────────────────────────────────────
+// ─── Tela de seleção de método de pagamento ──────────────────────────────────────────────────────
 
 export async function showPaymentMethodScreen(
   ctx: Context,
@@ -71,7 +74,7 @@ export async function showPaymentMethodScreen(
     }
   }
 
-  // FIX-COUPON-DISCOUNT: aplica desconto do cupom ao preço exibido
+  // FIX-COUPON-DISCOUNT: aplica desconto do cupão ao preço exibido
   const session = await getSession(userId);
   const rawPrice = Number(product.price);
   const couponDiscount = session.pendingCouponDiscount ?? 0;
@@ -84,7 +87,7 @@ export async function showPaymentMethodScreen(
     : '';
 
   const couponLine = session.pendingCoupon
-    ? `🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${couponDiscount.toFixed(2)})</b>\n` +
+    ? `🏷️ <b>Cupão:</b> <code>${escapeHtml(session.pendingCoupon)}</code> <b>(-R$ ${couponDiscount.toFixed(2)})</b>\n` +
       `💵 <b>Total com desconto:</b> R$ ${price.toFixed(2)}\n`
     : '';
 
@@ -119,9 +122,9 @@ export async function showPaymentMethodScreen(
   }
 
   if (session.pendingCoupon) {
-    buttons.push([Markup.button.callback('🗑️ Remover cupom', `remove_coupon_${product.id}`)]);
+    buttons.push([Markup.button.callback('🗑️ Remover cupão', `remove_coupon_${product.id}`)]);
   } else {
-    buttons.push([Markup.button.callback('🏷️ Tenho um cupom', `coupon_input_${product.id}`)]);
+    buttons.push([Markup.button.callback('🏷️ Tenho um cupão', `coupon_input_${product.id}`)]);
   }
 
   buttons.push([Markup.button.callback('◀️ Voltar', 'show_products')]);
@@ -132,7 +135,7 @@ export async function showPaymentMethodScreen(
   });
 }
 
-// ─── Tela de input de cupom ─────────────────────────────────────────────────────────
+// ─── Tela de input de cupão ────────────────────────────────────────────────────────────────────────────────────
 
 export async function showCouponInputScreen(
   ctx: Context,
@@ -146,8 +149,8 @@ export async function showCouponInputScreen(
 
   await editOrReply(
     ctx,
-    `🏷️ <b>Digite seu cupom de desconto:</b>\n\n` +
-    `<i>Envie o código do cupom ou clique em Pular para continuar sem desconto.</i>`,
+    `🏷️ <b>Digite seu cupão de desconto:</b>\n\n` +
+    `<i>Envie o código do cupão ou clique em Pular para continuar sem desconto.</i>`,
     {
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([
@@ -158,7 +161,7 @@ export async function showCouponInputScreen(
   );
 }
 
-// ─── Execução de pagamento ─────────────────────────────────────────────────────────────────
+// ─── Execução de pagamento ───────────────────────────────────────────────────────────────────────────────────────
 
 export async function executePayment(
   ctx: Context,
@@ -184,8 +187,10 @@ export async function executePayment(
   try {
     await editOrReply(ctx, '⏳ Processando sua compra, aguarde...', { parse_mode: 'HTML' });
 
-    const sessionForCoupon = await getSession(userId);
-    const effectiveCoupon = couponCode ?? sessionForCoupon.pendingCoupon ?? undefined;
+    // FIX-DOUBLE-GETSESSION: sessão carregada uma única vez e reutilizada
+    // em todo o fluxo (cupão, pagamento por saldo e PIX).
+    const session = await getSession(userId);
+    const effectiveCoupon = couponCode ?? session.pendingCoupon ?? undefined;
 
     const payment = await apiClient.createPayment({
       telegramId: String(userId),
@@ -197,12 +202,14 @@ export async function executePayment(
       ...(referralCode ? { referralCode } : {}),
     } as Parameters<typeof apiClient.createPayment>[0]);
 
-    // ── Pagamento por saldo puro: salva sessão e finaliza ──────────────────────
+    // ── Pagamento por saldo puro: salva sessão e finaliza ───────────────────────
     const paymentAny = payment as unknown as Record<string, unknown>;
 
     if (payment.paidWithBalance) {
+      // FIX-ESCAPEHTML-DISCOUNT: discountAmount.toFixed(2) é numérico — sem escapeHtml.
+      // couponCode mantido com escapeHtml pois é dado externo (API).
       const discountLine = paymentAny.discountAmount
-        ? `\n🏷️ <b>Desconto aplicado:</b> R$ ${escapeHtml(Number(paymentAny.discountAmount).toFixed(2))} (cupom ${escapeHtml(String(paymentAny.couponCode ?? ''))})\n`
+        ? `\n🏷️ <b>Desconto aplicado:</b> R$ ${Number(paymentAny.discountAmount).toFixed(2)} (cupão ${escapeHtml(String(paymentAny.couponCode ?? ''))})\n`
         : '';
 
       await editOrReply(
@@ -219,7 +226,7 @@ export async function executePayment(
           ]).reply_markup,
         }
       );
-      await clearSession(userId, sessionForCoupon.firstName);
+      await clearSession(userId, session.firstName);
       return;
     }
 
@@ -248,13 +255,12 @@ export async function executePayment(
       `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
       `💰 *Valor total:* R$ ${escapeMd(Number(payment.amount).toFixed(2))}${mixedLine}${discountMdLine}\n` +
       `⏰ *Válido até:* ${escapeMd(expiresStr)}\n` +
-      `🪺 *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
+      `�fa *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
       `📋 *Copia e Cola:*\n\`${escapeMd(payment.pixQrCodeText)}\``;
 
     const chatId = ctx.chat?.id;
-    const sessionBeforeSend = await getSession(userId);
-    if (chatId && sessionBeforeSend.mainMessageId) {
-      await ctx.telegram.deleteMessage(chatId, sessionBeforeSend.mainMessageId).catch(() => {});
+    if (chatId && session.mainMessageId) {
+      await ctx.telegram.deleteMessage(chatId, session.mainMessageId).catch(() => {});
     }
 
     // FIX-SESSION-ORDER: envia a foto PRIMEIRO. Se falhar, a sessão NÃO é marcada
@@ -271,17 +277,17 @@ export async function executePayment(
       }
     );
 
-    // Foto enviada com sucesso — agora é seguro persistir o estado de pagamento
-    const sessionAfterSend = await getSession(userId);
-    sessionAfterSend.paymentId = payment.paymentId;
-    sessionAfterSend.step = 'awaiting_payment';
-    sessionAfterSend.pixExpiresAt = payment.expiresAt;
-    sessionAfterSend.pixQrCodeText = payment.pixQrCodeText;
-    sessionAfterSend.mainMessageId = qrMsg.message_id;
-    delete sessionAfterSend.pendingProductId;
-    delete sessionAfterSend.pendingCoupon;
-    delete sessionAfterSend.pendingCouponDiscount;
-    await saveSession(userId, sessionAfterSend);
+    // Foto enviada com sucesso — agora é seguro persistir o estado de pagamento.
+    // FIX-DOUBLE-GETSESSION: reutiliza `session` em vez de fazer novo getSession.
+    session.paymentId = payment.paymentId;
+    session.step = 'awaiting_payment';
+    session.pixExpiresAt = payment.expiresAt;
+    session.pixQrCodeText = payment.pixQrCodeText;
+    session.mainMessageId = qrMsg.message_id;
+    delete session.pendingProductId;
+    delete session.pendingCoupon;
+    delete session.pendingCouponDiscount;
+    await saveSession(userId, session);
 
     const effectiveChatId = chatId ?? userId;
     schedulePIXExpiry(userId, payment.paymentId, effectiveChatId, PIX_TIMEOUT_MS);
@@ -323,17 +329,17 @@ export async function executePayment(
     }
 
     if (errStatus === 400 && (
-      errMsg.includes('Cupom') || errMsg.includes('cupom') ||
+      errMsg.includes('Cupão') || errMsg.includes('cupão') ||
       errMsg.includes('COUPON')
     )) {
       await editOrReply(
         ctx,
-        `❌ <b>${escapeHtml(errMsg)}</b>\n\nTente outro cupom ou pague sem desconto.`,
+        `❌ <b>${escapeHtml(errMsg)}</b>\n\nTente outro cupão ou pague sem desconto.`,
         {
           parse_mode: 'HTML',
           reply_markup: Markup.inlineKeyboard([
-            [Markup.button.callback('🏷️ Tentar outro cupom', `coupon_input_${productId}`)],
-            [Markup.button.callback('📱 Pagar sem cupom', `pay_pix_${productId}`)],
+            [Markup.button.callback('🏷️ Tentar outro cupão', `coupon_input_${productId}`)],
+            [Markup.button.callback('📱 Pagar sem cupão', `pay_pix_${productId}`)],
             [Markup.button.callback('◀️ Voltar', `select_product_${productId}`)],
           ]).reply_markup,
         }
@@ -375,7 +381,7 @@ export async function executePayment(
   }
 }
 
-// ─── Timeout de PIX ─────────────────────────────────────────────────────────────────────────────────────
+// ─── Timeout de PIX ───────────────────────────────────────────────────────────────────────────────────────────────
 
 export function schedulePIXExpiry(
   userId: number,
@@ -408,7 +414,7 @@ export function schedulePIXExpiry(
   }, delayMs);
 }
 
-// ─── Verificar pagamento ───────────────────────────────────────────────────────────────────────────────
+// ─── Verificar pagamento ───────────────────────────────────────────────────────────────────────────────────────────
 
 export async function handleCheckPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
@@ -477,7 +483,7 @@ export async function handleCheckPayment(ctx: Context, paymentId: string): Promi
   }
 }
 
-// ─── Cancelar pagamento ───────────────────────────────────────────────────────────────────────────────
+// ─── Cancelar pagamento ────────────────────────────────────────────────────────���──────────────────────────────
 
 export async function handleCancelPayment(ctx: Context, paymentId: string): Promise<void> {
   const userId = ctx.from!.id;
