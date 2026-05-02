@@ -3,7 +3,7 @@
 // WebhookEvent, StockItem, OrderDetail), DashboardStats com métricas operacionais
 // WALLET: WalletTransactionType, WalletTransactionDTO, CreateDepositRequest/Response,
 //         WalletBalanceResponse, WalletAdjustRequest
-// PRODUCT: sortOrder em ProductDTO
+// PRODUCT: sortOrder em ProductDTO, availableStock
 // PAYMENT: paidWithBalance em CreatePaymentResponse
 // PAYMENT METHOD: paymentMethod em CreatePaymentRequest (BALANCE | PIX | MIXED)
 // PRICING: couponCode, referralCode, quantity em CreatePaymentRequest
@@ -59,6 +59,8 @@ export interface ProductDTO {
   deliveryType: DeliveryType;
   isActive: boolean;
   stock?: number | null;
+  /** Estoque disponível já descontado de reservas pendentes */
+  availableStock?: number | null;
   sortOrder: number;
   metadata?: Record<string, unknown> | null;
   createdAt: string;

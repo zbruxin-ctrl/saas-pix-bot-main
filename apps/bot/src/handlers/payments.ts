@@ -389,15 +389,19 @@ export async function handleCheckPayment(
   paymentId: string
 ): Promise<void> {
   try {
-    const status = await apiClient.getPaymentStatus(paymentId);
+    const userId    = ctx.from!.id;
+    const firstName = ctx.from!.first_name;
+    // FIX: getPaymentStatus exige telegramId como segundo argumento
+    const status = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'APPROVED') {
-      const userId    = ctx.from!.id;
-      const firstName = ctx.from!.first_name;
       cancelPIXTimer(userId);
       await clearSession(userId, firstName);
       await ctx.reply(
-        buildDeliveryMessage('seu produto'),
+        buildDeliveryMessage(
+          status.productName ?? 'seu produto',
+          status.deliveryContent
+        ),
         {
           parse_mode: 'HTML',
           reply_markup: afterPurchaseKeyboard().reply_markup,
@@ -437,9 +441,10 @@ export async function handleCancelPayment(
   paymentId: string
 ): Promise<void> {
   try {
-    const result = await apiClient.cancelPayment(paymentId);
     const userId    = ctx.from!.id;
     const firstName = ctx.from!.first_name;
+    // FIX: cancelPayment exige telegramId como segundo argumento
+    const result = await apiClient.cancelPayment(paymentId, String(userId));
     cancelPIXTimer(userId);
     await clearSession(userId, firstName);
 
@@ -449,8 +454,9 @@ export async function handleCancelPayment(
         { parse_mode: 'HTML' }
       );
     } else {
+      // FIX: campo correto é .message (não .reason)
       await ctx.reply(
-        `⚠️ ${escapeHtml(result.reason ?? 'Não foi possível cancelar o pagamento.')}`,
+        `⚠️ ${escapeHtml(result.message ?? 'Não foi possível cancelar o pagamento.')}`,
         { parse_mode: 'HTML' }
       );
     }
