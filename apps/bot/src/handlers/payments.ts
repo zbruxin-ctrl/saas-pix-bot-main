@@ -19,6 +19,8 @@
  * FIX-TS2352: double cast via unknown para acessar campos opcionais de CreatePaymentResponse
  * FIX-COUPON-DISCOUNT: aplica pendingCouponDiscount ao preço exibido na tela de método;
  *                      oculta botão de cupom quando já existe cupom aplicado.
+ * FIX-MDV2: escapa '!' e demais caracteres reservados do MarkdownV2 na caption do PIX.
+ * FEAT-REMOVE-COUPON: botão 🗑️ Remover cupom na tela de método de pagamento.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -105,8 +107,11 @@ export async function showPaymentMethodScreen(
     ]);
   }
 
-  // Oculta botão de cupom se já existe um cupom aplicado na sessão
-  if (!session.pendingCoupon) {
+  if (session.pendingCoupon) {
+    // Cupom aplicado: mostra botão para remover
+    buttons.push([Markup.button.callback('🗑️ Remover cupom', `remove_coupon_${product.id}`)]);
+  } else {
+    // Sem cupom: mostra botão para adicionar
     buttons.push([Markup.button.callback('🏷️ Tenho um cupom', `coupon_input_${product.id}`)]);
   }
 
@@ -234,6 +239,9 @@ export async function executePayment(
       : '';
 
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
+
+    // FIX-MDV2: todos os literais da caption devem ter caracteres reservados escapados.
+    // '!' é reservado no MarkdownV2 e causa 400 se não escapado.
     const caption =
       `💳 *Pagamento PIX Gerado\!*\n\n` +
       `📦 *Produto:* ${escapeMd(payment.productName)}\n` +

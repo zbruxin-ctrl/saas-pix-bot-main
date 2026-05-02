@@ -10,6 +10,8 @@
  *             do guard result.data (deve vir ANTES do saveSession); corrige
  *             typos "cupão" → "cupom".
  * FIX-COUPON-DISCOUNT: salva discountAmount na sessão para uso na tela de pagamento.
+ * FEAT-REMOVE-COUPON: action remove_coupon_ limpa cupom da sessão e volta para
+ *                     tela de método de pagamento sem desconto.
  */
 
 import { initSentry, captureError } from './config/sentry';
@@ -193,6 +195,29 @@ bot.action(/^skip_coupon_(.+)$/, async (ctx) => {
     await showPaymentMethodScreen(ctx, product);
   } catch (err) {
     captureError(err, { handler: 'skip_coupon' });
+  }
+});
+
+// FEAT-REMOVE-COUPON: remove cupom aplicado e volta para tela de método sem desconto
+bot.action(/^remove_coupon_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('🗑️ Cupom removido!').catch(() => {});
+  try {
+    const productId = ctx.match[1];
+    const userId = ctx.from!.id;
+    const session = await getSession(userId);
+    delete session.pendingCoupon;
+    delete session.pendingCouponDiscount;
+    session.step = 'selecting_product';
+    await saveSession(userId, session);
+    const products = await apiClient.getProducts();
+    const product = products.find((p) => p.id === productId);
+    if (!product) {
+      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+      return;
+    }
+    await showPaymentMethodScreen(ctx, product);
+  } catch (err) {
+    captureError(err, { handler: 'remove_coupon' });
   }
 });
 
