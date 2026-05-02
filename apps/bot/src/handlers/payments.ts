@@ -5,16 +5,10 @@
  * PADRÃO: parse_mode HTML em mensagens de texto.
  *         parse_mode MarkdownV2 APENAS em captions de replyWithPhoto.
  *
- * FIX-BUILD: remove imports inexistentes (../lib/logger, sentry, lock).
- *            usa ../services/locks para acquireLock/releaseLock.
- *            usa console.error/warn em vez de logger/captureError.
- *            corrige pixQrCodeText (não pixCopyPaste).
- *            corrige payment.paymentId (não payment.id).
- * FEAT-MULTI-QTY: showQuantityScreen exportada;
- *                 stockLine no card de pagamento;
- *                 quantity no createPayment.
- * FEAT: emoji 👛 carteira no botão de saldo; botão cancelar depósito na tela PIX;
- *       cupom único por usuário (markCouponUsed/hasCouponBeenUsed).
+ * FEAT: mensagem de entrega mostra conteúdo do produto (deliveryContent).
+ * FEAT: botão "Comprar Novamente" após pedido confirmado.
+ * FEAT: mensagem de PIX expirado com botão de novo pedido.
+ * FEAT: boas-vindas personalizável via BOT_WELCOME_MESSAGE.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -72,6 +66,48 @@ export function cancelPIXTimer(userId: number) {
     clearTimeout(existing);
     pixTimers.delete(userId);
   }
+}
+
+// ─── Helpers de entrega ──────────────────────────────────────────────────────
+
+/**
+ * Monta a mensagem de confirmação de pagamento + entrega.
+ * Se deliveryContent estiver disponível, exibe o conteúdo após "✅ Pagamento confirmado!".
+ * Se não houver conteúdo (produto digital sem conteúdo automático), exibe mensagem padrão.
+ */
+function buildDeliveryMessage(
+  productName: string,
+  deliveryContent?: string | null
+): string {
+  const header = `✅ <b>Pagamento confirmado!</b>\n\n📦 <b>${escapeHtml(productName)}</b>\n`;
+
+  if (deliveryContent && deliveryContent.trim().length > 0) {
+    return (
+      header +
+      `\n🎁 <b>Seu produto:</b>\n` +
+      `<pre>${escapeHtml(deliveryContent.trim())}</pre>\n\n` +
+      `<i>Guarde essa mensagem em local seguro.</i>`
+    );
+  }
+
+  return (
+    header +
+    `\n✔️ Seu pedido foi processado com sucesso.\n` +
+    `<i>Em caso de dúvidas, acesse /ajuda.</i>`
+  );
+}
+
+/**
+ * Teclado exibido após uma compra confirmada.
+ * Inclui "Comprar Novamente" (volta para o produto) e "Menu".
+ */
+function afterPurchaseKeyboard(productId?: string) {
+  const rows: ReturnType<typeof Markup.button.callback>[][] = [];
+  if (productId) {
+    rows.push([Markup.button.callback('🔄 Comprar Novamente', `select_product_${productId}`)]);
+  }
+  rows.push([Markup.button.callback('🏠 Menu Principal', 'show_home')]);
+  return Markup.inlineKeyboard(rows);
 }
 
 // ─── Tela de quantidade ──────────────────────────────────────────────────────
@@ -301,16 +337,23 @@ export async function executePayment(
       session.pixExpiresAt = expiresAt;
       session.pixQrCodeText = qrText;
       session.mainMessageId = pixMsg.message_id;
+      session.selectedProductId = productId;
       await saveSession(userId, session);
 
       await schedulePIXExpiry(ctx, payment.paymentId, userId, expiresAt);
     } else {
-      // BALANCE
+      // BALANCE — entrega imediata
+      const deliveryContent = (payment as any).deliveryContent ?? null;
+      const productName = payment.productName ?? productId;
       const usedCoupons = session.usedCoupons ?? [];
       await clearSession(userId, session.firstName, usedCoupons);
+
       await ctx.reply(
-        `✅ <b>Pagamento realizado com sucesso!</b>\n\n📦 Seu pedido foi confirmado.`,
-        { parse_mode: 'HTML' }
+        buildDeliveryMessage(productName, deliveryContent),
+        {
+          parse_mode: 'HTML',
+          reply_markup: afterPurchaseKeyboard(productId).reply_markup,
+        }
       );
     }
   } catch (err: unknown) {
@@ -340,16 +383,30 @@ export async function handleCheckPayment(
     const status = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'PAID' || status.status === 'APPROVED') {
-      await editOrReply(ctx,
-        `✅ <b>Pagamento confirmado!</b>\n\nSeu pedido foi processado com sucesso.`,
-        { parse_mode: 'HTML' }
-      );
+      const productId = session.selectedProductId;
+      const productName = status.productName ?? session.pendingProductName ?? '';
+      const deliveryContent = status.deliveryContent ?? null;
+
       const usedCoupons = session.usedCoupons ?? [];
       await clearSession(userId, session.firstName, usedCoupons);
+
+      await ctx.reply(
+        buildDeliveryMessage(productName, deliveryContent),
+        {
+          parse_mode: 'HTML',
+          reply_markup: afterPurchaseKeyboard(productId).reply_markup,
+        }
+      );
     } else if (status.status === 'EXPIRED' || status.status === 'CANCELLED') {
       await editOrReply(ctx,
         `❌ <b>Pagamento ${status.status === 'EXPIRED' ? 'expirado' : 'cancelado'}</b>\n\nGere um novo pedido quando quiser.`,
-        { parse_mode: 'HTML' }
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
+            [Markup.button.callback('🏠 Menu', 'show_home')],
+          ]).reply_markup,
+        }
       );
       const usedCoupons = session.usedCoupons ?? [];
       await clearSession(userId, session.firstName, usedCoupons);
@@ -386,7 +443,13 @@ export async function handleCancelPayment(
     await apiClient.cancelPayment(paymentId, String(userId));
     await editOrReply(ctx,
       `❌ <b>PIX cancelado.</b>\n\nUse /produtos para fazer um novo pedido.`,
-      { parse_mode: 'HTML' }
+      {
+        parse_mode: 'HTML',
+        reply_markup: Markup.inlineKeyboard([
+          [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
+          [Markup.button.callback('🏠 Menu', 'show_home')],
+        ]).reply_markup,
+      }
     );
     cancelPIXTimer(userId);
     const usedCoupons = session.usedCoupons ?? [];
@@ -408,11 +471,19 @@ export async function schedulePIXExpiry(
   const now = Date.now();
   const msUntilExpiry = expiresAt - now;
 
+  const expiredKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
+    [Markup.button.callback('🏠 Menu', 'show_home')],
+  ]);
+
   if (msUntilExpiry <= 0) {
     try {
       const status = await apiClient.getPaymentStatus(paymentId, String(userId));
       if (status.status !== 'PAID' && status.status !== 'APPROVED') {
-        await ctx.reply('⏰ Seu PIX expirou. Gere um novo pedido quando quiser.', { parse_mode: 'HTML' });
+        await ctx.reply(
+          '⏰ <b>Seu PIX expirou.</b>\n\nGere um novo pedido quando quiser.',
+          { parse_mode: 'HTML', reply_markup: expiredKeyboard.reply_markup }
+        );
         const session = await getSession(userId);
         await clearSession(userId, session.firstName, session.usedCoupons ?? []);
       }
@@ -424,7 +495,10 @@ export async function schedulePIXExpiry(
     try {
       const status = await apiClient.getPaymentStatus(paymentId, String(userId));
       if (status.status !== 'PAID' && status.status !== 'APPROVED') {
-        await ctx.reply('⏰ Seu PIX expirou. Gere um novo pedido quando quiser.', { parse_mode: 'HTML' });
+        await ctx.reply(
+          '⏰ <b>Seu PIX expirou.</b>\n\nGere um novo pedido quando quiser.',
+          { parse_mode: 'HTML', reply_markup: expiredKeyboard.reply_markup }
+        );
         const session = await getSession(userId);
         await clearSession(userId, session.firstName, session.usedCoupons ?? []);
       }

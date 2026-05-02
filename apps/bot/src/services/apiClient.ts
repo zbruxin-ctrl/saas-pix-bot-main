@@ -5,6 +5,7 @@
 // PERF #5: cache de saldo por usuario TTL 15s
 // PERF #6: invalidacao do cache de saldo apos deposito
 // FEATURE: getOrders(telegramId)
+// FEATURE: getReferralInfo(telegramId)
 // FIX-B17: createPayment distingue erro real de idempotencia
 // FEAT-MAINT: getBotConfig() busca maintenance_mode + maintenance_message
 //   com cache em memoria TTL 30s
@@ -82,6 +83,12 @@ export interface OrderSummary {
   productId?: string;
   amount: number | null;
   paymentMethod: PaymentMethod | null;
+}
+
+export interface ReferralInfo {
+  referralCount: number;
+  bonusEarned: number;
+  referralCode: string;
 }
 
 class ApiHttpError extends Error {
@@ -227,9 +234,9 @@ class ApiClient {
   async getPaymentStatus(
     paymentId: string,
     telegramId: string
-  ): Promise<{ status: string; paymentId: string }> {
+  ): Promise<{ status: string; paymentId: string; deliveryContent?: string; productName?: string }> {
     const { data } = await this.withRetry(() =>
-      this.client.get<ApiResponse<{ status: string; paymentId: string }>>(
+      this.client.get<ApiResponse<{ status: string; paymentId: string; deliveryContent?: string; productName?: string }>>(
         `/api/payments/${paymentId}/status?telegramId=${encodeURIComponent(telegramId)}`
       )
     );
@@ -249,11 +256,21 @@ class ApiClient {
     return data.data!;
   }
 
+  async getReferralInfo(telegramId: string): Promise<ReferralInfo> {
+    const { data } = await this.withRetry(() =>
+      this.client.get<ApiResponse<ReferralInfo>>(
+        `/api/referrals/info?telegramId=${encodeURIComponent(telegramId)}`
+      )
+    );
+    return data.data ?? { referralCount: 0, bonusEarned: 0, referralCode: telegramId };
+  }
+
   // ─── Operações lentas (timeout 25s) ───────────────────────────────────────
 
   async createPayment(params: {
     telegramId: string;
     productId: string;
+    quantity?: number;
     firstName?: string;
     username?: string;
     paymentMethod?: PaymentMethod;
@@ -263,10 +280,6 @@ class ApiClient {
     invalidateBalanceCache(params.telegramId);
 
     // AUDIT #2: Idempotency-Key determinística por userId + productId + janela de 2min.
-    // Garante que retries de timeout não criem pagamentos duplicados na gateway.
-    // Janela de 2min: mesmo usuário comprando o mesmo produto duas vezes seguidas
-    // em menos de 2 minutos ainda resultará na mesma key — comportamento aceitável
-    // pois o segundo request retornará a resposta cacheada pelo servidor.
     const window2min = Math.floor(Date.now() / 120_000);
     const idempotencyKey = `create-${params.telegramId}-${params.productId}-${window2min}`;
 
@@ -278,9 +291,7 @@ class ApiClient {
       );
       return data.data!;
     } catch (err) {
-      // AUDIT #12: fallback B17 agora filtra por productId — evita retornar pedido
-      // de produto diferente do solicitado quando dois produtos foram comprados
-      // pelo mesmo usuário na janela de 60s.
+      // AUDIT #12: fallback B17 filtra por productId
       if (
         err instanceof ApiHttpError &&
         err.statusCode === 400 &&
@@ -292,7 +303,6 @@ class ApiClient {
           const sixtySecondsAgo = Date.now() - 60_000;
           const recentByTime = orders.find(
             (o) =>
-              // AUDIT #12: filtra pelo productId solicitado (quando disponível na resposta)
               (!o.productId || o.productId === params.productId) &&
               (o.status === 'DELIVERED' || o.status === 'PROCESSING') &&
               new Date(o.createdAt).getTime() > sixtySecondsAgo
