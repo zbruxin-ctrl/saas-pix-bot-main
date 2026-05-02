@@ -1,10 +1,10 @@
 /**
  * Bot Telegram principal — registro de handlers e inicialização.
  *
- * FIX-BUILD: remove imports inexistentes (./lib/logger, ./lib/sentry).
  * FEAT: botão Indicações no menu; histórico de transações em Meu Saldo;
  *       botão Cancelar no depósito; ajuda com WhatsApp + lista de comandos;
- *       estoque ao lado dos produtos; cupom único por usuário (check local).
+ *       estoque ao lado dos produtos; cupom único por usuário (check local);
+ *       emoji 👛 carteira no botão de saldo; WhatsApp fixo na ajuda.
  */
 import { Telegraf, Markup, Context } from 'telegraf';
 import { apiClient } from './services/apiClient';
@@ -44,7 +44,7 @@ async function showHome(ctx: any) {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
-    [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
+    [Markup.button.callback('👛 Meu Saldo', 'show_balance')],
     [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
     [Markup.button.callback('👥 Indicações', 'show_referrals')],
     [Markup.button.callback('❓ Ajuda', 'show_help')],
@@ -164,7 +164,7 @@ async function showBalance(ctx: any) {
       historyText = `\n\n📋 <b>Últimas transações:</b>\n${lines.join('\n')}`;
     }
 
-    const text = `💰 <b>Seu saldo:</b> R$ ${Number(data.balance).toFixed(2)}${historyText}`;
+    const text = `👛 <b>Seu saldo:</b> R$ ${Number(data.balance).toFixed(2)}${historyText}`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('💳 Depositar', 'deposit_balance')],
       [Markup.button.callback('◀️ Voltar', 'show_home')],
@@ -324,33 +324,49 @@ bot.action('show_orders', async (ctx) => {
 
 async function showHelp(ctx: any) {
   const phone = process.env.SUPPORT_PHONE_NUMBER ?? '';
-  const whatsappLine = phone
-    ? `\n\n💬 <b>Suporte:</b> <a href="https://wa.me/${phone}">Falar no WhatsApp</a>`
-    : '';
 
   const text =
     `<b>❓ Central de Ajuda</b>\n\n` +
     `<b>Como funciona?</b>\n` +
     `1. Escolha um produto em 🛒 <b>Ver Produtos</b>\n` +
-    `2. Selecione a forma de pagamento (PIX ou Saldo)\n` +
-    `3. Pague e receba seu produto automaticamente\n\n` +
+    `2. Selecione a quantidade desejada\n` +
+    `3. Escolha a forma de pagamento (PIX ou Saldo)\n` +
+    `4. Pague e receba seu produto automaticamente\n\n` +
     `<b>📋 Comandos disponíveis:</b>\n` +
     `/start — Mostra o menu inicial\n` +
     `/produtos — Lista os produtos disponíveis\n` +
-    `/saldo — Exibe seu saldo e transações\n` +
-    `/meus_pedidos — Histórico de pedidos\n` +
+    `/saldo — Exibe seu saldo e histórico de transações\n` +
+    `/meus_pedidos — Histórico dos seus pedidos\n` +
     `/ajuda — Esta central de ajuda\n` +
-    `/suporte — Contato com o suporte\n\n` +
-    `<b>Problemas?</b>\n` +
-    `• PIX não aprovado? Aguarde até 2 minutos e verifique novamente.\n` +
-    `• Produto não entregue? Entre em contato com o suporte.` +
-    whatsappLine;
+    `/suporte — Contato direto com o suporte\n\n` +
+    `<b>❗ Dúvidas frequentes:</b>\n` +
+    `• PIX não aprovado? Aguarde até 2 min e clique em Verificar.\n` +
+    `• Produto não entregue? Fale com o suporte abaixo.`;
 
-  const keyboard = Markup.inlineKeyboard([[Markup.button.callback('◀️ Voltar', 'show_home')]]);
-  if (ctx.callbackQuery) {
-    try { await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup, link_preview_options: { is_disabled: true } }); return; } catch { /* ignora */ }
+  // Monta os botões — WhatsApp sempre aparece se o número estiver configurado
+  const buttons: ReturnType<typeof Markup.button.callback>[][] = [];
+  if (phone) {
+    buttons.push([Markup.button.url('💬 Falar no WhatsApp', `https://wa.me/${phone}`)]);
   }
-  await ctx.reply(text, { parse_mode: 'HTML', reply_markup: keyboard.reply_markup, link_preview_options: { is_disabled: true } });
+  buttons.push([Markup.button.callback('◀️ Voltar', 'show_home')]);
+
+  const keyboard = Markup.inlineKeyboard(buttons);
+
+  if (ctx.callbackQuery) {
+    try {
+      await ctx.editMessageText(text, {
+        parse_mode: 'HTML',
+        reply_markup: keyboard.reply_markup,
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    } catch { /* ignora */ }
+  }
+  await ctx.reply(text, {
+    parse_mode: 'HTML',
+    reply_markup: keyboard.reply_markup,
+    link_preview_options: { is_disabled: true },
+  });
 }
 
 bot.command('ajuda', showHelp);
@@ -537,13 +553,24 @@ bot.on('text', async (ctx) => {
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
       const couponCode = text.toUpperCase();
 
-      // Verifica se o usuário já usou este cupom antes
+      // Verifica se o usuário já usou este cupom antes (controle local por sessão/Redis)
       const alreadyUsed = await hasCouponBeenUsed(userId, couponCode);
       if (alreadyUsed) {
         await ctx.reply(
-          `❌ Você já utilizou o cupom <code>${couponCode}</code> anteriormente. Cada cupom pode ser usado apenas uma vez por conta.`,
+          `❌ Você já utilizou o cupom <code>${couponCode}</code> anteriormente.\nCada cupom pode ser usado apenas <b>uma vez</b> por conta.`,
           { parse_mode: 'HTML' }
         );
+        // Volta para a tela de pagamento
+        try {
+          const products = await apiClient.getProducts();
+          const product = products.find((p) => p.id === session.pendingProductId);
+          const walletData = await apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 }));
+          if (product) {
+            session.step = 'selecting_product';
+            await saveSession(userId, session);
+            await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
+          }
+        } catch { /* ignora */ }
         return;
       }
 
@@ -571,7 +598,17 @@ bot.on('text', async (ctx) => {
             await showPaymentMethodScreen(ctx as unknown as Context, product, Number(walletData.balance));
           }
         } else {
-          await ctx.reply(`❌ ${result.error ?? 'Cupom inválido.'}`, { parse_mode: 'HTML' });
+          // Exibe erro e volta à tela de pagamento automaticamente
+          await ctx.reply(`❌ ${result.error ?? 'Cupom inválido ou expirado.'}`, { parse_mode: 'HTML' });
+          try {
+            const walletData = await apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 }));
+            const product2 = products.find((p) => p.id === session.pendingProductId);
+            if (product2) {
+              session.step = 'selecting_product';
+              await saveSession(userId, session);
+              await showPaymentMethodScreen(ctx as unknown as Context, product2, Number(walletData.balance));
+            }
+          } catch { /* ignora */ }
         }
       } catch (err) {
         console.error('[coupon_validate] erro:', err);

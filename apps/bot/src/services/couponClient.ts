@@ -12,10 +12,16 @@ const BUSINESS_ERROR_PATTERNS = [
   'inválida',
   'não encontrado',
   'já utilizado',
+  'já foi utilizado',
   'limite',
   'mínimo',
   'produto',
   'usuário',
+  'uso máximo',
+  'cupom',
+  'desconto',
+  'código',
+  'usado',
 ];
 
 function isSafeErrorMessage(msg: string): boolean {
@@ -43,9 +49,13 @@ export async function validateCoupon(
       { code, telegramId, orderAmount, productId },
       { headers: { 'x-bot-secret': BOT_SECRET } }
     );
-    return { valid: true, data: data.data };
+    return { valid: true, data: data.data ?? data };
   } catch (err: any) {
-    const apiMessage: string = err.response?.data?.error ?? '';
+    const apiMessage: string =
+      err.response?.data?.error ??
+      err.response?.data?.message ??
+      err.response?.data?.msg ??
+      '';
     // Só exibe a mensagem da API se for um erro de negócio reconhecível;
     // caso contrário (401, 403, 500, etc.) usa mensagem genérica amigável.
     const userMessage = apiMessage && isSafeErrorMessage(apiMessage)
