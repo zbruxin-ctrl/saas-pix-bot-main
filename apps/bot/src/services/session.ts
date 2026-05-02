@@ -4,6 +4,8 @@
  *
  * FEAT: usedCoupons — lista de cupons já utilizados pelo usuário (por código).
  *       Garante que cada cupão possa ser usado apenas 1x por conta.
+ * FIX #7: clearSession preserva usedCoupons da sessão atual quando não fornecido.
+ * FIX #6: UserSession inclui referralCode (salvo no /start a partir do startPayload).
  */
 import { redis } from './redis';
 
@@ -17,6 +19,8 @@ export interface UserSession {
   depositMessageId?: number;
   mainMessageId?: number;
   firstName?: string;
+  /** Código de indicação capturado do startPayload — propagado ao createPayment */
+  referralCode?: string;
   /** Nome do produto pendente — salvo ao criar PIX para usar na mensagem de entrega */
   pendingProductName?: string;
   lastActivityAt: number;
@@ -63,12 +67,19 @@ export async function saveSession(userId: number, session: UserSession): Promise
   await redis.set(sessionKey(userId), JSON.stringify(session), ttl);
 }
 
-export async function clearSession(userId: number, keepFirstName?: string, keepUsedCoupons?: string[]): Promise<void> {
+/**
+ * Reseta a sessão para idle, preservando firstName, referralCode e usedCoupons.
+ * FIX #7: lê usedCoupons da sessão atual antes de limpar, para nunca perdê-los.
+ */
+export async function clearSession(userId: number, keepFirstName?: string): Promise<void> {
+  // Lê a sessão atual para preservar usedCoupons e referralCode
+  const current = await getSession(userId);
   await saveSession(userId, {
     step: 'idle',
-    firstName: keepFirstName,
+    firstName: keepFirstName ?? current.firstName,
+    referralCode: current.referralCode,
     lastActivityAt: Date.now(),
-    usedCoupons: keepUsedCoupons ?? [],
+    usedCoupons: current.usedCoupons ?? [],
   });
 }
 

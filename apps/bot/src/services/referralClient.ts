@@ -1,8 +1,7 @@
 // referralClient.ts — client do bot para o programa de indicação
+// FIX #3: usa env validado em vez de process.env direto
 import axios from 'axios';
-
-const API_URL = process.env.API_URL!;
-const BOT_SECRET = process.env.BOT_SECRET!;
+import { env } from '../config/env';
 
 export interface ReferralStats {
   totalReferred: number;
@@ -23,9 +22,9 @@ export async function registerReferral(
 ): Promise<{ success: boolean; reason?: string }> {
   try {
     const { data } = await axios.post(
-      `${API_URL}/api/referrals/register`,
+      `${env.API_URL}/api/referrals/register`,
       { referrerTelegramId, referredTelegramId },
-      { headers: { 'x-bot-secret': BOT_SECRET } }
+      { headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET } }
     );
     return { success: data.success, reason: data.reason };
   } catch {
@@ -34,9 +33,9 @@ export async function registerReferral(
 }
 
 export async function getReferralStats(telegramId: string): Promise<ReferralStats> {
-  const { data } = await axios.get(`${API_URL}/api/referrals/stats`, {
+  const { data } = await axios.get(`${env.API_URL}/api/referrals/stats`, {
     params: { telegramId },
-    headers: { 'x-bot-secret': BOT_SECRET },
+    headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET },
   });
   return data.data as ReferralStats;
 }

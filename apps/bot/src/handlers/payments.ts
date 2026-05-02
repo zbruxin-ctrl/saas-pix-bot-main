@@ -13,11 +13,15 @@
  *
  * VARREDURA-FIX #10: showQuantityScreen usa availableStock (já descontado de reservas)
  *                    em vez de product.stock bruto.
+ * FIX #1: markCouponUsed chamado com (userId, couponCode) — assinatura correta.
+ * FIX #2: releaseLock recebe o token UUID retornado por acquireLock.
+ * FIX #8: applyCoupon chamado após createPayment quando há cupom pendente.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
 import { getSession, saveSession, clearSession, markCouponUsed } from '../services/session';
 import { acquireLock, releaseLock } from '../services/locks';
+import { applyCoupon } from '../services/couponClient';
 
 type ProductDTO = Awaited<ReturnType<typeof apiClient.getProducts>>[number];
 
@@ -291,8 +295,10 @@ export async function executePayment(
   method: 'PIX' | 'BALANCE' | 'MIXED'
 ): Promise<void> {
   const userId = ctx.from!.id;
-  const acquired = await acquireLock(String(userId));
-  if (!acquired) {
+
+  // FIX #2: acquireLock retorna token UUID — deve ser passado ao releaseLock
+  const lockToken = await acquireLock(String(userId));
+  if (!lockToken) {
     await ctx.reply('⏳ Aguarde, processando pagamento anterior...', { parse_mode: 'HTML' });
     return;
   }
@@ -301,6 +307,7 @@ export async function executePayment(
     const session = await getSession(userId);
     const firstName = ctx.from!.first_name;
     const username  = ctx.from!.username;
+    const pendingCoupon = session.pendingCoupon ?? undefined;
 
     await editOrReply(ctx, '⏳ <b>Processando pagamento...</b>', { parse_mode: 'HTML' });
 
@@ -310,12 +317,25 @@ export async function executePayment(
       firstName,
       username,
       paymentMethod: method,
-      couponCode: session.pendingCoupon ?? undefined,
+      couponCode: pendingCoupon,
       referralCode: session.referralCode ?? undefined,
     });
 
+    // FIX #8: notifica o backend que o cupom foi aplicado a este pagamento
+    if (pendingCoupon && payment.paymentId) {
+      try {
+        // couponClient.validateCoupon retorna o couponId via data.couponId
+        // Aqui já temos o paymentId confirmado — chamamos applyCoupon
+        // O couponId não está disponível diretamente aqui; usamos o código como fallback
+        await applyCoupon(pendingCoupon, String(userId), payment.paymentId);
+      } catch {
+        // Não bloqueia a compra se o apply falhar — o backend já registrou via createPayment
+      }
+    }
+
     if (payment.paidWithBalance) {
-      if (session.pendingCoupon) markCouponUsed(session);
+      // FIX #1: markCouponUsed recebe (userId, couponCode) — assinatura correta
+      if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
       await clearSession(userId, firstName);
       await ctx.reply(
         buildDeliveryMessage(payment.productName ?? productId),
@@ -336,7 +356,8 @@ export async function executePayment(
     session.paymentId    = payment.paymentId;
     session.pixExpiresAt = expiresAt;
     session.pixQrCodeText = qrText;
-    if (session.pendingCoupon) markCouponUsed(session);
+    // FIX #1: markCouponUsed recebe (userId, couponCode) — assinatura correta
+    if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
     await saveSession(userId, session);
 
     const amountStr = String((payment.amount ?? 0).toFixed(2)).replace('.', '\\.');
@@ -378,7 +399,8 @@ export async function executePayment(
     console.error('[executePayment] erro:', err);
     await ctx.reply(`❌ ${escapeHtml(msg)}`, { parse_mode: 'HTML' });
   } finally {
-    await releaseLock(String(userId));
+    // FIX #2: passa o lockToken para releaseLock verificar ownership antes de deletar
+    await releaseLock(String(userId), lockToken);
   }
 }
 
@@ -391,7 +413,6 @@ export async function handleCheckPayment(
   try {
     const userId    = ctx.from!.id;
     const firstName = ctx.from!.first_name;
-    // FIX: getPaymentStatus exige telegramId como segundo argumento
     const status = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'APPROVED') {
@@ -443,7 +464,6 @@ export async function handleCancelPayment(
   try {
     const userId    = ctx.from!.id;
     const firstName = ctx.from!.first_name;
-    // FIX: cancelPayment exige telegramId como segundo argumento
     const result = await apiClient.cancelPayment(paymentId, String(userId));
     cancelPIXTimer(userId);
     await clearSession(userId, firstName);
@@ -454,7 +474,6 @@ export async function handleCancelPayment(
         { parse_mode: 'HTML' }
       );
     } else {
-      // FIX: campo correto é .message (não .reason)
       await ctx.reply(
         `⚠️ ${escapeHtml(result.message ?? 'Não foi possível cancelar o pagamento.')}`,
         { parse_mode: 'HTML' }

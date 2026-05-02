@@ -7,6 +7,9 @@
  *
  *          Os helpers (showHome, showProducts, etc.) aceitam Context genérico
  *          pois são chamados tanto de bot.action quanto de bot.command.
+ *
+ * FIX #6: referralCode capturado do startPayload e salvo na sessão — propagado ao createPayment.
+ * FIX #7: clearSession sem 3º parâmetro — session.ts lê usedCoupons da sessão atual automaticamente.
  */
 import { Telegraf, Markup } from 'telegraf';
 import type { Context } from 'telegraf';
@@ -85,6 +88,10 @@ bot.start(async (ctx) => {
 
     if (referralCode && referralCode !== String(userId)) {
       try { await registerReferral(referralCode, String(userId)); } catch { /**/ }
+      // FIX #6: salva referralCode na sessão para ser propagado ao createPayment
+      if (!session.referralCode) {
+        session.referralCode = referralCode;
+      }
     }
 
     if (session.step === 'awaiting_payment' && session.paymentId && session.pixExpiresAt) {
@@ -126,7 +133,6 @@ async function showProducts(ctx: Context): Promise<void> {
     }
 
     const buttons = products.map((p: ProductDTO) => {
-      // FIX: usa availableStock (campo correto retornado pela API)
       let stockLabel = '';
       if (p.availableStock != null) {
         stockLabel = p.availableStock <= 0 ? ' ❌ Esgotado' : ` (${p.availableStock} restantes)`;
@@ -308,7 +314,6 @@ async function showReferral(ctx: Context): Promise<void> {
       referralInfo = await apiClient.getReferralInfo(String(userId));
     } catch { /* ignora se endpoint não existir */ }
 
-    // FIX: usa cache em vez de chamar getMe() a cada vez
     const botUsername = await getBotUsername();
     const link        = `https://t.me/${botUsername}?start=${userId}`;
 
@@ -448,7 +453,6 @@ bot.action(/^select_product_(.+)$/, async (ctx) => {
       await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
       return;
     }
-    // FIX: usa availableStock em vez de stock
     if (product.availableStock != null && product.availableStock <= 0) {
       await ctx.reply('⚠️ Este produto está esgotado no momento.', { parse_mode: 'HTML' });
       return;
@@ -588,108 +592,133 @@ bot.on('text', async (ctx) => {
 
     // ── Cupom
     if (session.step === 'awaiting_coupon' && session.pendingProductId) {
-      const couponCode = text.toUpperCase();
+      const productId = session.pendingProductId;
+
+      // Busca produto para calcular o valor a ser enviado ao endpoint de validação
+      let orderAmount = 0;
       try {
-        const products    = await apiClient.getProducts();
-        const product     = products.find((p) => p.id === session.pendingProductId);
-        const qty         = session.pendingQty ?? 1;
-        const orderAmount = Number(product?.price ?? 0) * qty;
-
-        const result = await validateCoupon(
-          couponCode,
-          String(userId),
-          orderAmount,
-          session.pendingProductId
-        );
-
-        if (result.valid && result.data) {
-          session.pendingCoupon         = couponCode;
-          session.pendingCouponDiscount = result.data.discountAmount ?? 0;
-          session.step                  = 'selecting_product';
-          await saveSession(userId, session);
-
-          const walletData = await apiClient
-            .getBalance(String(userId))
-            .catch(() => ({ balance: 0 }));
-
-          if (product) {
-            await ctx.reply(
-              `✅ Cupom <code>${couponCode}</code> aplicado! Desconto: R$ ${(result.data.discountAmount ?? 0).toFixed(2)}`,
-              { parse_mode: 'HTML' }
-            );
-            await showPaymentMethodScreen(ctx, product, Number(walletData.balance));
-          }
-        } else {
-          await ctx.reply(`❌ ${result.error ?? 'Cupom inválido.'}`, { parse_mode: 'HTML' });
+        const products = await apiClient.getProducts();
+        const product  = products.find((p) => p.id === productId);
+        if (product) {
+          const qty = session.pendingQty ?? 1;
+          orderAmount = Number(product.price) * qty;
         }
-      } catch (err) {
-        console.error('[coupon_validate] erro:', err);
-        await ctx.reply('❌ Erro ao validar cupom. Tente novamente.', { parse_mode: 'HTML' });
+      } catch { /* usa 0 como fallback */ }
+
+      const result = await validateCoupon(text.toUpperCase(), String(userId), orderAmount, productId);
+
+      if (!result.valid || !result.data) {
+        await ctx.reply(
+          `❌ ${result.error ?? 'Cupom inválido ou expirado.'}`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: Markup.inlineKeyboard([
+              [Markup.button.callback('◀️ Voltar', `back_to_payment_${productId}`)],
+            ]).reply_markup,
+          }
+        );
+        return;
       }
+
+      session.pendingCoupon         = text.toUpperCase();
+      session.pendingCouponDiscount = result.data.discountAmount;
+      session.step                  = 'selecting_product';
+      await saveSession(userId, session);
+
+      const [products, walletData] = await Promise.all([
+        apiClient.getProducts(),
+        apiClient.getBalance(String(userId)).catch(() => ({ balance: 0 })),
+      ]);
+      const product = products.find((p) => p.id === productId);
+      if (!product) { await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' }); return; }
+      await showPaymentMethodScreen(ctx, product, Number(walletData.balance));
       return;
     }
 
     // ── Depósito
     if (session.step === 'awaiting_deposit_amount') {
-      const amount = parseFloat(text.replace(',', '.'));
-      if (isNaN(amount) || amount < 1) {
-        await ctx.reply('❌ Valor inválido. Digite um valor mínimo de R$ 1,00.', { parse_mode: 'HTML' });
-        return;
-      }
-      try {
-        const deposit = await apiClient.createDeposit(
-          String(userId),
-          amount,
-          ctx.from.first_name,
-          ctx.from.username
-        );
-        // FIX: pixQrCode não existe no tipo — usa apenas pixQrCodeText
-        const qrText    = deposit.pixQrCodeText ?? '';
-        const expiresAt = deposit.expiresAt
-          ? new Date(deposit.expiresAt).toISOString()
-          : new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      const raw   = text.replace(',', '.');
+      const value = parseFloat(raw);
 
-        session.step             = 'awaiting_payment';
-        session.depositPaymentId = deposit.paymentId;
-        session.pixExpiresAt     = expiresAt;
-        session.pixQrCodeText    = qrText;
-        await saveSession(userId, session);
-
-        const amountStr = String(amount.toFixed(2)).replace('.', '\\.');
-        await ctx.replyWithPhoto(
+      if (isNaN(value) || value < 1) {
+        await ctx.reply(
+          `❌ Valor inválido. Digite um valor numérico maior ou igual a R$ 1,00.`,
           {
-            url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}`,
-          },
-          {
-            caption: `💳 *Depósito de R\\$ ${amountStr}*\n\nEscaneie o QR ou copie o código abaixo:`,
-            parse_mode: 'MarkdownV2',
+            parse_mode: 'HTML',
             reply_markup: Markup.inlineKeyboard([
-              [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
-              [Markup.button.callback('❌ Cancelar Depósito', `cancel_payment_${deposit.paymentId}`)],
+              [Markup.button.callback('❌ Cancelar', 'cancel_deposit')],
             ]).reply_markup,
           }
         );
+        return;
+      }
+
+      session.step = 'idle';
+      await saveSession(userId, session);
+
+      await ctx.reply('⏳ <b>Gerando PIX de depósito...</b>', { parse_mode: 'HTML' });
+
+      try {
+        const deposit = await apiClient.createDeposit(
+          String(userId),
+          value,
+          ctx.from.first_name,
+          ctx.from.username
+        );
+
+        const qrText  = deposit.pixQrCodeText ?? deposit.pixCopyPaste ?? '';
+        const qrImage = deposit.pixQrCode ?? '';
+
+        if (qrImage) {
+          await ctx.replyWithPhoto(
+            { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
+            {
+              caption: `💳 *PIX gerado\!*\n\n*Valor:* R\\$ ${String(value.toFixed(2)).replace('.', '\\.')}\n\nEscaneie o QR ou copie o código abaixo:`,
+              parse_mode: 'MarkdownV2',
+              reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
+                [Markup.button.callback('❌ Cancelar', `cancel_payment_${deposit.paymentId}`)],
+              ]).reply_markup,
+            }
+          );
+        } else {
+          await ctx.reply(
+            `💳 <b>PIX de depósito gerado!</b>\n\nValor: R$ ${value.toFixed(2)}\n\nCopie o código abaixo:`,
+            {
+              parse_mode: 'HTML',
+              reply_markup: Markup.inlineKeyboard([
+                [Markup.button.callback('🔄 Verificar Depósito', `check_payment_${deposit.paymentId}`)],
+                [Markup.button.callback('❌ Cancelar', `cancel_payment_${deposit.paymentId}`)],
+              ]).reply_markup,
+            }
+          );
+        }
         await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
-        await schedulePIXExpiry(ctx, deposit.paymentId, userId, expiresAt);
       } catch (err) {
-        console.error('[deposit] erro:', err);
-        await ctx.reply('❌ Erro ao gerar PIX de depósito.', { parse_mode: 'HTML' });
+        const msg = err instanceof Error ? err.message : 'Erro ao gerar depósito';
+        await ctx.reply(`❌ ${msg}`, { parse_mode: 'HTML' });
       }
       return;
     }
   } catch (err) {
-    console.error('[on_text] erro:', err);
+    console.error('[bot.on text] erro:', err);
   }
 });
 
-// ─── Launch ───────────────────────────────────────────────────────────────────
+// ─── Inicialização ────────────────────────────────────────────────────────────
 
-bot.launch({ dropPendingUpdates: true })
-  .then(() => console.log('Bot iniciado com sucesso'))
-  .catch((err) => {
-    console.error('Erro ao iniciar bot:', err);
-    process.exit(1);
-  });
+const WEBHOOK_URL  = process.env.WEBHOOK_URL;
+const WEBHOOK_PORT = parseInt(process.env.PORT ?? '3001', 10);
 
-process.once('SIGINT',  () => bot.stop('SIGINT'));
+if (WEBHOOK_URL) {
+  bot.launch({ webhook: { domain: WEBHOOK_URL, port: WEBHOOK_PORT } })
+    .then(() => console.log(`[bot] ✅ Webhook ativo em ${WEBHOOK_URL} (porta ${WEBHOOK_PORT})`))
+    .catch((err) => { console.error('[bot] ❌ Falha ao iniciar webhook:', err); process.exit(1); });
+} else {
+  bot.launch()
+    .then(() => console.log('[bot] ✅ Polling ativo'))
+    .catch((err) => { console.error('[bot] ❌ Falha ao iniciar polling:', err); process.exit(1); });
+}
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));

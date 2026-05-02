@@ -1,8 +1,7 @@
 // couponClient.ts — client do bot para cupons
+// FIX #3: usa env validado em vez de process.env direto
 import axios from 'axios';
-
-const API_URL = process.env.API_URL!;
-const BOT_SECRET = process.env.BOT_SECRET!;
+import { env } from '../config/env';
 
 // Mensagens de erro de negócio que podem ser exibidas ao usuário diretamente
 const BUSINESS_ERROR_PATTERNS = [
@@ -45,9 +44,9 @@ export async function validateCoupon(
 ): Promise<{ valid: boolean; error?: string; data?: CouponValidationData }> {
   try {
     const { data } = await axios.post(
-      `${API_URL}/api/coupons/validate`,
+      `${env.API_URL}/api/coupons/validate`,
       { code, telegramId, orderAmount, productId },
-      { headers: { 'x-bot-secret': BOT_SECRET } }
+      { headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET } }
     );
     return { valid: true, data: data.data ?? data };
   } catch (err: any) {
@@ -56,8 +55,6 @@ export async function validateCoupon(
       err.response?.data?.message ??
       err.response?.data?.msg ??
       '';
-    // Só exibe a mensagem da API se for um erro de negócio reconhecível;
-    // caso contrário (401, 403, 500, etc.) usa mensagem genérica amigável.
     const userMessage = apiMessage && isSafeErrorMessage(apiMessage)
       ? apiMessage
       : 'Cupom inválido ou expirado.';
@@ -71,16 +68,16 @@ export async function applyCoupon(
   paymentId: string
 ): Promise<void> {
   await axios.post(
-    `${API_URL}/api/coupons/apply`,
+    `${env.API_URL}/api/coupons/apply`,
     { couponId, telegramUserId, paymentId },
-    { headers: { 'x-bot-secret': BOT_SECRET } }
+    { headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET } }
   );
 }
 
 export async function revertCoupon(paymentId: string): Promise<void> {
   await axios.post(
-    `${API_URL}/api/coupons/revert`,
+    `${env.API_URL}/api/coupons/revert`,
     { paymentId },
-    { headers: { 'x-bot-secret': BOT_SECRET } }
+    { headers: { 'x-bot-secret': env.TELEGRAM_BOT_SECRET } }
   );
 }
