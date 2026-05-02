@@ -28,6 +28,13 @@ import {
 
 type ProductDTO = Awaited<ReturnType<typeof apiClient.getProducts>>[number];
 
+type TxRecord = {
+  type: string;
+  amount: number;
+  description?: string;
+  createdAt?: string;
+};
+
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN não definido');
 
@@ -158,12 +165,7 @@ async function showBalance(ctx: Context): Promise<void> {
     const userId = ctx.from!.id;
     const data   = await apiClient.getBalance(String(userId));
 
-    const txs: Array<{
-      type: string;
-      amount: number;
-      description?: string;
-      createdAt?: string;
-    }> = (data as unknown as { transactions?: unknown[] }).transactions ?? [];
+    const txs = ((data as unknown as { transactions?: unknown[] }).transactions ?? []) as TxRecord[];
 
     let historyText = '';
     if (txs.length > 0) {

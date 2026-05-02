@@ -347,11 +347,11 @@ export async function executePayment(
 
       await ctx.reply(`<code>${escapeHtml(qrText)}</code>`, { parse_mode: 'HTML' });
 
-      session.step             = 'awaiting_payment';
-      session.paymentId        = payment.paymentId;
-      session.pixExpiresAt     = expiresAt;
-      session.pixQrCodeText    = qrText;
-      session.mainMessageId    = pixMsg.message_id;
+      session.step              = 'awaiting_payment';
+      session.paymentId         = payment.paymentId;
+      session.pixExpiresAt      = expiresAt;
+      session.pixQrCodeText     = qrText;
+      session.mainMessageId     = pixMsg.message_id;
       session.selectedProductId = productId;
       session.pendingProductName = productName;
       await saveSession(userId, session);
@@ -359,7 +359,9 @@ export async function executePayment(
       await schedulePIXExpiry(ctx, payment.paymentId, userId, expiresAt);
     } else {
       // BALANCE — entrega imediata
-      const deliveryContent = (payment as Record<string, unknown>).deliveryContent as string | null ?? null;
+      // Passamos por unknown primeiro para evitar o erro TS2352 no cast para Record<string, unknown>
+      const paymentAny     = payment as unknown as Record<string, unknown>;
+      const deliveryContent = (paymentAny.deliveryContent as string | null | undefined) ?? null;
       const productName     = payment.productName ?? productId;
       const usedCoupons     = session.usedCoupons ?? [];
       await clearSession(userId, session.firstName, usedCoupons);
@@ -402,8 +404,8 @@ export async function handleCheckPayment(
     const status = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'PAID' || status.status === 'APPROVED') {
-      const productId      = session.selectedProductId;
-      const productName    = status.productName ?? session.pendingProductName ?? '';
+      const productId       = session.selectedProductId;
+      const productName     = status.productName ?? session.pendingProductName ?? '';
       const deliveryContent = status.deliveryContent ?? null;
 
       const usedCoupons = session.usedCoupons ?? [];
@@ -452,8 +454,8 @@ export async function handleCancelPayment(
   ctx: Context,
   paymentId: string
 ): Promise<void> {
-  const userId   = ctx.from!.id;
-  const lockKey  = `cancel_lock:${userId}`;
+  const userId    = ctx.from!.id;
+  const lockKey   = `cancel_lock:${userId}`;
   const lockToken = await acquireLock(lockKey, 15);
   if (!lockToken) return;
 
@@ -488,9 +490,9 @@ export async function schedulePIXExpiry(
   userId: number,
   expiresAtISO: string
 ): Promise<void> {
-  const expiresAt      = new Date(expiresAtISO).getTime();
-  const now            = Date.now();
-  const msUntilExpiry  = expiresAt - now;
+  const expiresAt     = new Date(expiresAtISO).getTime();
+  const now           = Date.now();
+  const msUntilExpiry = expiresAt - now;
 
   const expiredKeyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Novo Pedido', 'show_products')],
