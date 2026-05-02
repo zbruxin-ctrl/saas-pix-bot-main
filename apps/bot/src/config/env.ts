@@ -23,6 +23,7 @@ const EnvSchema = z
     TELEGRAM_BOT_TOKEN: z.string().min(1),
     TELEGRAM_BOT_SECRET: z.string().optional(),
     BOT_WEBHOOK_URL: z.string().url().optional(),
+    BOT_USERNAME: z.string().optional(),
     API_URL: z.string().url().optional(),
     API_BASE_URL: z.string().url().optional(),
     API_SECRET: z.string().optional(),

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { randomUUID } from 'crypto';
 
 const store: Record<string, string> = {};
 vi.mock('../services/redis', () => ({
@@ -22,20 +23,25 @@ beforeEach(() => {
 
 describe('acquireLock', () => {
   it('adquire lock se não existir', async () => {
-    const ok = await acquireLock('pay:1');
+    const token = randomUUID();
+    const ok = await acquireLock('pay:1', token);
     expect(ok).toBe(true);
   });
 
   it('bloqueia segunda tentativa no mesmo key', async () => {
-    await acquireLock('pay:2');
-    const second = await acquireLock('pay:2');
+    const token1 = randomUUID();
+    const token2 = randomUUID();
+    await acquireLock('pay:2', token1);
+    const second = await acquireLock('pay:2', token2);
     expect(second).toBe(false);
   });
 
   it('libera lock e permite nova aquisição', async () => {
-    await acquireLock('pay:3');
-    await releaseLock('pay:3');
-    const ok = await acquireLock('pay:3');
+    const token = randomUUID();
+    await acquireLock('pay:3', token);
+    await releaseLock('pay:3', token);
+    const newToken = randomUUID();
+    const ok = await acquireLock('pay:3', newToken);
     expect(ok).toBe(true);
   });
 });
