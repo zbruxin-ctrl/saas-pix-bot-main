@@ -27,6 +27,7 @@
 //            (não existem no schema), adiciona findExpiredPaymentIds/cancelExpiredPayment,
 //            usa refundPayment em vez de cancelPayment no MP
 // FIX-BUILD2: troca env.WEBHOOK_URL → env.BOT_WEBHOOK_URL (variável correta do schema)
+// FEAT-PRICING: integra applyPricing, commitCouponUse, commitReferral e payReferralReward
 import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
@@ -38,6 +39,13 @@ import { walletService } from './walletService';
 import { logger } from '../lib/logger';
 import { env } from '../config/env';
 import { AppError } from '../middleware/errorHandler';
+import {
+  applyPricing,
+  commitCouponUse,
+  commitReferral,
+  payReferralReward,
+  CouponError,
+} from './pricingService';
 import type {
   CreatePaymentRequest,
   CreatePaymentResponse,
@@ -64,6 +72,8 @@ interface PayWithBalanceParams {
   firstName?: string;
   username?: string;
   telegramId: string;
+  couponCode?: string | null;
+  referralCode?: string | null;
 }
 
 interface PayWithPixParams {
@@ -72,6 +82,9 @@ interface PayWithPixParams {
   price: number;
   firstName?: string;
   username?: string;
+  telegramId: string;
+  couponCode?: string | null;
+  referralCode?: string | null;
 }
 
 interface PayMixedParams {
@@ -83,6 +96,8 @@ interface PayMixedParams {
   firstName?: string;
   username?: string;
   telegramId: string;
+  couponCode?: string | null;
+  referralCode?: string | null;
 }
 
 // Helper: extrai qr_code e qr_code_base64 da resposta do Mercado Pago
@@ -164,6 +179,8 @@ const balancePaymentLock = new Set<string>();
 export class PaymentService {
   async createPayment(data: CreatePaymentRequest): Promise<CreatePaymentResponse> {
     const { telegramId, productId, firstName, username, paymentMethod } = data;
+    const couponCode = (data as Record<string, unknown>).couponCode as string | undefined;
+    const referralCode = (data as Record<string, unknown>).referralCode as string | undefined;
 
     const [product, telegramUser] = await Promise.all([
       prisma.product.findUnique({ where: { id: productId, isActive: true } }),
@@ -183,7 +200,27 @@ export class PaymentService {
     }
 
     const balance = userStatus ? Number(userStatus.balance) : 0;
-    const price = Number(product.price);
+    let price = Number(product.price);
+
+    // ─── PRICING ─────────────────────────────────────────────────────────────
+    let pricingResult;
+    try {
+      pricingResult = await applyPricing({
+        productId: product.id,
+        telegramUserId: telegramUser.id,
+        telegramId,
+        basePrice: price,
+        quantity: 1,
+        couponCode: couponCode ?? null,
+        referralCode: referralCode ?? null,
+      });
+      price = pricingResult.finalAmount;
+    } catch (err) {
+      if (err instanceof CouponError) {
+        throw new AppError(err.message, 400);
+      }
+      throw err;
+    }
 
     if (paymentMethod === 'BALANCE') {
       if (balance < price) {
@@ -215,7 +252,7 @@ export class PaymentService {
           400
         );
       }
-      return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId });
+      return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId, couponCode, referralCode, pricingResult } as Parameters<typeof this._payWithBalance>[0] & { pricingResult: typeof pricingResult });
     }
 
     if (paymentMethod === 'MIXED') {
@@ -229,25 +266,25 @@ export class PaymentService {
       const pixAmount = parseFloat((price - balanceUsed).toFixed(2));
 
       if (pixAmount <= 0) {
-        return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId });
+        return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId, couponCode, referralCode, pricingResult } as Parameters<typeof this._payWithBalance>[0] & { pricingResult: typeof pricingResult });
       }
 
-      return this._payMixed({ telegramUser, product, price, balanceUsed, pixAmount, firstName, username, telegramId });
+      return this._payMixed({ telegramUser, product, price, balanceUsed, pixAmount, firstName, username, telegramId, couponCode, referralCode, pricingResult } as Parameters<typeof this._payMixed>[0] & { pricingResult: typeof pricingResult });
     }
 
     if (paymentMethod === 'PIX') {
-      return this._payWithPix({ telegramUser, product, price, firstName, username });
+      return this._payWithPix({ telegramUser, product, price, firstName, username, telegramId, couponCode, referralCode, pricingResult } as Parameters<typeof this._payWithPix>[0] & { pricingResult: typeof pricingResult });
     }
 
     if (balance >= price) {
-      return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId });
+      return this._payWithBalance({ telegramUser, product, price, firstName, username, telegramId, couponCode, referralCode, pricingResult } as Parameters<typeof this._payWithBalance>[0] & { pricingResult: typeof pricingResult });
     }
-    return this._payWithPix({ telegramUser, product, price, firstName, username });
+    return this._payWithPix({ telegramUser, product, price, firstName, username, telegramId, couponCode, referralCode, pricingResult } as Parameters<typeof this._payWithPix>[0] & { pricingResult: typeof pricingResult });
   }
 
-  private async _payWithBalance({
-    telegramUser, product, price, firstName, username, telegramId,
-  }: PayWithBalanceParams): Promise<CreatePaymentResponse> {
+  private async _payWithBalance(params: PayWithBalanceParams & { pricingResult?: Awaited<ReturnType<typeof applyPricing>> }): Promise<CreatePaymentResponse> {
+    const { telegramUser, product, price, firstName, username, telegramId, pricingResult } = params;
+
     const existingApproved = await prisma.payment.findFirst({
       where: {
         telegramUserId: telegramUser.id,
@@ -303,7 +340,15 @@ export class PaymentService {
             approvedAt: new Date(),
             paymentMethod: PaymentMethod.BALANCE,
             balanceUsed: price,
-            metadata: { firstName, username, productName: product.name, isDeposit: false },
+            metadata: {
+              firstName,
+              username,
+              productName: product.name,
+              isDeposit: false,
+              couponCode: pricingResult?.couponCode ?? null,
+              discountAmount: pricingResult?.discountAmount ?? 0,
+              originalAmount: pricingResult?.originalAmount ?? price,
+            },
           },
         });
 
@@ -329,6 +374,17 @@ export class PaymentService {
             paymentId: newPayment.id,
           },
         });
+
+        // Commit coupon use
+        if (pricingResult?.couponId) {
+          await commitCouponUse(tx, pricingResult.couponId, telegramUser.id, newPayment.id);
+        }
+
+        // Commit referral (sem recompensa ainda)
+        if (pricingResult?.referrerId) {
+          const REFERRAL_REWARD = 5.00; // R$ 5,00 por indicação
+          await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD);
+        }
 
         return { payment: newPayment, order: newOrder };
       });
@@ -374,15 +430,20 @@ export class PaymentService {
         expiresAt: new Date().toISOString(),
         productName: product.name,
         paidWithBalance: true,
+        ...(pricingResult && pricingResult.discountAmount > 0 ? {
+          originalAmount: pricingResult.originalAmount,
+          discountAmount: pricingResult.discountAmount,
+          couponCode: pricingResult.couponCode,
+        } : {}),
       };
     } finally {
       balancePaymentLock.delete(lockKey);
     }
   }
 
-  private async _payMixed({
-    telegramUser, product, price, balanceUsed, pixAmount, firstName, username, telegramId,
-  }: PayMixedParams): Promise<CreatePaymentResponse> {
+  private async _payMixed(params: PayMixedParams & { pricingResult?: Awaited<ReturnType<typeof applyPricing>> }): Promise<CreatePaymentResponse> {
+    const { telegramUser, product, price, balanceUsed, pixAmount, firstName, username, telegramId, pricingResult } = params;
+
     const existingPending = await prisma.payment.findFirst({
       where: {
         telegramUserId: telegramUser.id,
@@ -442,21 +503,42 @@ export class PaymentService {
 
       const pixExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-      const payment = await prisma.payment.create({
-        data: {
-          telegramUserId: telegramUser.id,
-          productId: product.id,
-          amount: price,
-          status: PaymentStatus.PENDING,
-          paymentMethod: PaymentMethod.MIXED,
-          balanceUsed: balanceUsed,
-          pixAmount: pixAmount,
-          mercadoPagoId: mpPayment.id?.toString(),
-          pixQrCode: qr_code_base64,
-          pixQrCodeText: qr_code,
-          pixExpiresAt,
-          metadata: { firstName, username, productName: product.name, externalReference, isDeposit: false },
-        },
+      const payment = await prisma.$transaction(async (tx) => {
+        const newPayment = await tx.payment.create({
+          data: {
+            telegramUserId: telegramUser.id,
+            productId: product.id,
+            amount: price,
+            status: PaymentStatus.PENDING,
+            paymentMethod: PaymentMethod.MIXED,
+            balanceUsed: balanceUsed,
+            pixAmount: pixAmount,
+            mercadoPagoId: mpPayment.id?.toString(),
+            pixQrCode: qr_code_base64,
+            pixQrCodeText: qr_code,
+            pixExpiresAt,
+            metadata: {
+              firstName,
+              username,
+              productName: product.name,
+              externalReference,
+              isDeposit: false,
+              couponCode: pricingResult?.couponCode ?? null,
+              discountAmount: pricingResult?.discountAmount ?? 0,
+              originalAmount: pricingResult?.originalAmount ?? price,
+            },
+          },
+        });
+
+        if (pricingResult?.couponId) {
+          await commitCouponUse(tx, pricingResult.couponId, telegramUser.id, newPayment.id);
+        }
+        if (pricingResult?.referrerId) {
+          const REFERRAL_REWARD = 5.00;
+          await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD);
+        }
+
+        return newPayment;
       });
 
       if (product.stock !== null || hasStockItems) {
@@ -474,15 +556,20 @@ export class PaymentService {
         expiresAt: pixExpiresAt.toISOString(),
         productName: product.name,
         paidWithBalance: false,
+        ...(pricingResult && pricingResult.discountAmount > 0 ? {
+          originalAmount: pricingResult.originalAmount,
+          discountAmount: pricingResult.discountAmount,
+          couponCode: pricingResult.couponCode,
+        } : {}),
       };
     } finally {
       mixedPaymentLock.delete(lockKey);
     }
   }
 
-  private async _payWithPix({
-    telegramUser, product, price, firstName, username,
-  }: PayWithPixParams): Promise<CreatePaymentResponse> {
+  private async _payWithPix(params: PayWithPixParams & { pricingResult?: Awaited<ReturnType<typeof applyPricing>> }): Promise<CreatePaymentResponse> {
+    const { telegramUser, product, price, firstName, username, pricingResult } = params;
+
     const existingPending = await prisma.payment.findFirst({
       where: {
         telegramUserId: telegramUser.id,
@@ -528,21 +615,42 @@ export class PaymentService {
 
     const pixExpiresAt = new Date(Date.now() + 30 * 60 * 1000);
 
-    const payment = await prisma.payment.create({
-      data: {
-        telegramUserId: telegramUser.id,
-        productId: product.id,
-        amount: price,
-        status: PaymentStatus.PENDING,
-        paymentMethod: PaymentMethod.PIX,
-        balanceUsed: 0,
-        pixAmount: price,
-        mercadoPagoId: mpPayment.id?.toString(),
-        pixQrCode: qr_code_base64,
-        pixQrCodeText: qr_code,
-        pixExpiresAt,
-        metadata: { firstName, username, productName: product.name, externalReference, isDeposit: false },
-      },
+    const payment = await prisma.$transaction(async (tx) => {
+      const newPayment = await tx.payment.create({
+        data: {
+          telegramUserId: telegramUser.id,
+          productId: product.id,
+          amount: price,
+          status: PaymentStatus.PENDING,
+          paymentMethod: PaymentMethod.PIX,
+          balanceUsed: 0,
+          pixAmount: price,
+          mercadoPagoId: mpPayment.id?.toString(),
+          pixQrCode: qr_code_base64,
+          pixQrCodeText: qr_code,
+          pixExpiresAt,
+          metadata: {
+            firstName,
+            username,
+            productName: product.name,
+            externalReference,
+            isDeposit: false,
+            couponCode: pricingResult?.couponCode ?? null,
+            discountAmount: pricingResult?.discountAmount ?? 0,
+            originalAmount: pricingResult?.originalAmount ?? price,
+          },
+        },
+      });
+
+      if (pricingResult?.couponId) {
+        await commitCouponUse(tx, pricingResult.couponId, telegramUser.id, newPayment.id);
+      }
+      if (pricingResult?.referrerId) {
+        const REFERRAL_REWARD = 5.00;
+        await commitReferral(tx, pricingResult.referrerId, telegramUser.id, newPayment.id, REFERRAL_REWARD);
+      }
+
+      return newPayment;
     });
 
     const hasStockItems = await this.productHasStockItems(product.id);
@@ -560,6 +668,11 @@ export class PaymentService {
       expiresAt: pixExpiresAt.toISOString(),
       productName: product.name,
       paidWithBalance: false,
+      ...(pricingResult && pricingResult.discountAmount > 0 ? {
+        originalAmount: pricingResult.originalAmount,
+        discountAmount: pricingResult.discountAmount,
+        couponCode: pricingResult.couponCode,
+      } : {}),
     };
   }
 
@@ -654,7 +767,6 @@ export class PaymentService {
     }
 
     const method = payment.paymentMethod;
-    // isDeposit está em metadata (coluna real não existe no schema)
     const isDeposit = (payment.metadata as Record<string, unknown> | null)?.isDeposit === true;
 
     logger.info(`[processApproved] Processando pagamento ${paymentId} | method=${method} | isDeposit=${isDeposit}`);
@@ -702,16 +814,16 @@ export class PaymentService {
           return;
         }
 
-        await prisma.$transaction([
-          prisma.payment.update({
+        await prisma.$transaction(async (tx) => {
+          await tx.payment.update({
             where: { id: paymentId },
             data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
-          }),
-          prisma.telegramUser.update({
+          });
+          await tx.telegramUser.update({
             where: { id: payment.telegramUserId },
             data: { balance: { decrement: balanceUsed } },
-          }),
-          prisma.walletTransaction.create({
+          });
+          await tx.walletTransaction.create({
             data: {
               telegramUserId: payment.telegramUserId,
               type: 'PURCHASE',
@@ -719,20 +831,53 @@ export class PaymentService {
               description: `Compra MIXED: ${payment.product?.name ?? 'Produto'}`,
               paymentId,
             },
-          }),
-        ]);
+          });
+
+          // Paga recompensa de referral se houver
+          await payReferralReward(tx, paymentId, async (userId, amount, description, txClient) => {
+            await txClient.telegramUser.update({
+              where: { id: userId },
+              data: { balance: { increment: amount } },
+            });
+            await txClient.walletTransaction.create({
+              data: { telegramUserId: userId, type: 'REFERRAL_REWARD', amount, description },
+            });
+          });
+        });
         invalidateUserCache(payment.telegramUser.telegramId);
       } else {
-        await prisma.payment.update({
-          where: { id: paymentId },
-          data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
+        await prisma.$transaction(async (tx) => {
+          await tx.payment.update({
+            where: { id: paymentId },
+            data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
+          });
+          await payReferralReward(tx, paymentId, async (userId, amount, description, txClient) => {
+            await txClient.telegramUser.update({
+              where: { id: userId },
+              data: { balance: { increment: amount } },
+            });
+            await txClient.walletTransaction.create({
+              data: { telegramUserId: userId, type: 'REFERRAL_REWARD', amount, description },
+            });
+          });
         });
       }
     } else {
       // PIX puro
-      await prisma.payment.update({
-        where: { id: paymentId },
-        data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.update({
+          where: { id: paymentId },
+          data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
+        });
+        await payReferralReward(tx, paymentId, async (userId, amount, description, txClient) => {
+          await txClient.telegramUser.update({
+            where: { id: userId },
+            data: { balance: { increment: amount } },
+          });
+          await txClient.walletTransaction.create({
+            data: { telegramUserId: userId, type: 'REFERRAL_REWARD', amount, description },
+          });
+        });
       });
     }
 
@@ -748,7 +893,6 @@ export class PaymentService {
       logger.warn(`[processApproved] confirmReservation falhou para ${paymentId}:`, err);
     }
 
-    // orderId via relação order (não é coluna direta em Payment)
     const orderId = payment.order?.id ?? paymentId;
 
     await deliveryService.deliver(
@@ -840,8 +984,6 @@ export class PaymentService {
       data: { status: PaymentStatus.CANCELLED, cancelledAt: new Date() },
     });
 
-    // MP não tem endpoint de cancelamento de PIX — tentamos estorno se já aprovado
-    // Para PIX pendente, apenas marcamos como cancelado no banco
     if (payment.mercadoPagoId) {
       try {
         await mercadoPagoService.refundPayment(payment.mercadoPagoId);

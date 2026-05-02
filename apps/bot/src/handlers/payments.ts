@@ -15,6 +15,7 @@
  *         pixExpiresAt é salvo na sessão para re-agendamento no /start.
  * BUG FIX: answerCbQuery chamado ANTES de qualquer operação async para evitar
  *          timeout de 30s do Telegram que silencia o bot.
+ * FEAT-PRICING: tela de cupom/referral antes de gerar PIX; exibe desconto no resumo.
  */
 import { Context, Markup } from 'telegraf';
 import { Telegraf } from 'telegraf';
@@ -90,6 +91,7 @@ export async function showPaymentMethodScreen(
     ]);
   }
 
+  buttons.push([Markup.button.callback('🏷️ Tenho um cupom', `coupon_input_${product.id}`)]);
   buttons.push([Markup.button.callback('◀️ Voltar', 'show_products')]);
 
   await editOrReply(ctx, confirmMessage, {
@@ -98,12 +100,40 @@ export async function showPaymentMethodScreen(
   });
 }
 
+// ─── Tela de input de cupom ──────────────────────────────────────────────────
+
+export async function showCouponInputScreen(
+  ctx: Context,
+  productId: string
+): Promise<void> {
+  const userId = ctx.from!.id;
+  const session = await getSession(userId);
+  session.step = 'awaiting_coupon';
+  session.pendingProductId = productId;
+  await saveSession(userId, session);
+
+  await editOrReply(
+    ctx,
+    `🏷️ <b>Digite seu cupom de desconto:</b>\n\n` +
+    `<i>Envie o código do cupom ou clique em Pular para continuar sem desconto.</i>`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: Markup.inlineKeyboard([
+        [Markup.button.callback('⏭️ Pular', `skip_coupon_${productId}`)],
+        [Markup.button.callback('◀️ Voltar', `select_product_${productId}`)],
+      ]).reply_markup,
+    }
+  );
+}
+
 // ─── Execução de pagamento ───────────────────────────────────────────────────
 
 export async function executePayment(
   ctx: Context,
   productId: string,
-  paymentMethod: 'BALANCE' | 'PIX' | 'MIXED'
+  paymentMethod: 'BALANCE' | 'PIX' | 'MIXED',
+  couponCode?: string,
+  referralCode?: string
 ): Promise<void> {
   const userId = ctx.from!.id;
   const lockKey = `pay:${userId}`;
@@ -128,21 +158,28 @@ export async function executePayment(
       firstName: ctx.from?.first_name,
       username: ctx.from?.username,
       paymentMethod,
-    });
+      ...(couponCode ? { couponCode } : {}),
+      ...(referralCode ? { referralCode } : {}),
+    } as Parameters<typeof apiClient.createPayment>[0]);
 
     const session = await getSession(userId);
     session.paymentId = payment.paymentId;
     session.step = 'awaiting_payment';
-    // FIX #1: persiste a data de expiração no Redis para re-agendamento após restart
     session.pixExpiresAt = payment.expiresAt;
+    delete session.pendingProductId;
+    delete session.pendingCoupon;
     await saveSession(userId, session);
 
     if (payment.paidWithBalance) {
+      const discountLine = (payment as Record<string, unknown>).discountAmount
+        ? `\n🏷️ <b>Desconto aplicado:</b> R$ ${escapeHtml(Number((payment as Record<string, unknown>).discountAmount).toFixed(2))} (cupom ${escapeHtml(String((payment as Record<string, unknown>).couponCode ?? ''))})\n`
+        : '';
+
       await editOrReply(
         ctx,
         `✅ <b>Compra realizada com saldo!</b>\n\n` +
           `📦 <b>Produto:</b> ${escapeHtml(payment.productName)}\n` +
-          `💰 <b>Valor debitado:</b> R$ ${escapeHtml(Number(payment.amount).toFixed(2))}\n\n` +
+          `💰 <b>Valor debitado:</b> R$ ${escapeHtml(Number(payment.amount).toFixed(2))}${discountLine}\n` +
           `Seu produto será entregue em instantes! 🚀`,
         {
           parse_mode: 'HTML',
@@ -167,12 +204,15 @@ export async function executePayment(
       ? `\n💳 *Saldo usado:* R$ ${escapeMd(Number(payment.balanceUsed).toFixed(2))}\n📱 *PIX a pagar:* R$ ${escapeMd(Number(payment.pixAmount).toFixed(2))}`
       : '';
 
+    const discountMdLine = (payment as Record<string, unknown>).discountAmount
+      ? `\n🏷️ *Desconto:* R$ ${escapeMd(Number((payment as Record<string, unknown>).discountAmount).toFixed(2))}`
+      : '';
+
     const qrBuffer = Buffer.from(payment.pixQrCode, 'base64');
-    // caption de foto usa MarkdownV2 (limitação do Telegram para mídia)
     const caption =
       `💳 *Pagamento PIX Gerado\!*\n\n` +
       `📦 *Produto:* ${escapeMd(payment.productName)}\n` +
-      `💰 *Valor total:* R$ ${escapeMd(Number(payment.amount).toFixed(2))}${mixedLine}\n` +
+      `💰 *Valor total:* R$ ${escapeMd(Number(payment.amount).toFixed(2))}${mixedLine}${discountMdLine}\n` +
       `⏰ *Válido até:* ${escapeMd(expiresStr)}\n` +
       `🪪 *ID:* \`${escapeMd(payment.paymentId)}\`\n\n` +
       `📋 *Copia e Cola:*\n\`${escapeMd(payment.pixQrCodeText)}\``;
@@ -219,6 +259,26 @@ export async function executePayment(
         ctx,
         `🛠️ <b>Manutenção em Andamento</b>\n\n${escapeHtml(errMsg)}\n\n<i>Tente novamente em alguns instantes! 😊</i>`,
         { parse_mode: 'HTML', reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🏠 Menu Inicial', 'show_home')]]).reply_markup }
+      );
+      return;
+    }
+
+    // Erro de cupom — volta para tela de método com mensagem
+    if (errStatus === 400 && (
+      errMsg.includes('Cupom') || errMsg.includes('cupom') ||
+      errMsg.includes('COUPON')
+    )) {
+      await editOrReply(
+        ctx,
+        `❌ <b>${escapeHtml(errMsg)}</b>\n\nTente outro cupom ou pague sem desconto.`,
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🏷️ Tentar outro cupom', `coupon_input_${productId}`)],
+            [Markup.button.callback('📱 Pagar sem cupom', `pay_pix_${productId}`)],
+            [Markup.button.callback('◀️ Voltar', `select_product_${productId}`)],
+          ]).reply_markup,
+        }
       );
       return;
     }
