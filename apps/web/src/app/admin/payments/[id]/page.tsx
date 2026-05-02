@@ -1,11 +1,13 @@
 // ALTERAÇÕES: exibe stockItem.content (conteúdo entregue), deliveryMedias,
 // cancelledAt, isBlocked do usuário, medias do pedido
 // + botão "Forçar Aprovação" para pagamentos PENDING com ID no MP
+// + botão "Cancelar PIX" para pagamentos PENDING
+// + exibe paymentMethod (BALANCE | PIX | MIXED) com badge colorido
 'use client';
 
 import { useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { getPayment, reprocessPayment } from '@/lib/api';
+import { getPayment, reprocessPayment, cancelPayment } from '@/lib/api';
 import StatusBadge from '@/components/admin/StatusBadge';
 import { formatCurrency, formatDate } from '@/lib/utils';
 
@@ -38,6 +40,9 @@ type Payment = {
   mercadoPagoId?: string;
   status: string;
   amount: number;
+  paymentMethod?: string | null;
+  balanceUsed?: number | null;
+  pixAmount?: number | null;
   createdAt: string;
   approvedAt?: string;
   cancelledAt?: string;
@@ -66,6 +71,21 @@ type Payment = {
   } | null;
 };
 
+function MethodBadge({ method }: { method?: string | null }) {
+  if (!method) return <span className="text-gray-400">—</span>;
+  const map: Record<string, { label: string; className: string }> = {
+    PIX:     { label: '📱 PIX',        className: 'bg-blue-50 text-blue-700 border border-blue-200' },
+    BALANCE: { label: '💰 Saldo',      className: 'bg-green-50 text-green-700 border border-green-200' },
+    MIXED:   { label: '🔀 Saldo + PIX', className: 'bg-purple-50 text-purple-700 border border-purple-200' },
+  };
+  const cfg = map[method] ?? { label: method, className: 'bg-gray-50 text-gray-600 border border-gray-200' };
+  return (
+    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${cfg.className}`}>
+      {cfg.label}
+    </span>
+  );
+}
+
 export default function PaymentDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
@@ -74,6 +94,10 @@ export default function PaymentDetailPage() {
   const [reprocessing, setReprocessing] = useState(false);
   const [reprocessResult, setReprocessResult] = useState<string | null>(null);
   const [reprocessError, setReprocessError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelResult, setCancelResult] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [confirmCancel, setConfirmCancel] = useState(false);
 
   useEffect(() => {
     getPayment(id)
@@ -91,7 +115,6 @@ export default function PaymentDetailPage() {
       const result = await reprocessPayment(payment.id);
       if (result.success) {
         setReprocessResult(result.message || 'Pagamento aprovado com sucesso!');
-        // Recarrega os dados do pagamento após 1.5s
         setTimeout(() => {
           getPayment(id).then(setPayment as any).catch(() => {});
         }, 1500);
@@ -107,6 +130,31 @@ export default function PaymentDetailPage() {
       );
     } finally {
       setReprocessing(false);
+    }
+  }
+
+  async function handleCancel() {
+    if (!payment || !confirmCancel) return;
+    setCancelling(true);
+    setCancelResult(null);
+    setCancelError(null);
+    try {
+      const result = await cancelPayment(payment.id);
+      if (result.success) {
+        setCancelResult(result.message || 'Pagamento cancelado com sucesso!');
+        setConfirmCancel(false);
+        setTimeout(() => {
+          getPayment(id).then(setPayment as any).catch(() => {});
+        }, 1000);
+      } else {
+        setCancelError(result.error || 'Erro ao cancelar pagamento.');
+      }
+    } catch (err: any) {
+      setCancelError(
+        err?.response?.data?.error || 'Erro de conexão ao tentar cancelar.'
+      );
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -130,6 +178,7 @@ export default function PaymentDetailPage() {
 
   const isPending = payment.status === 'PENDING';
   const hasMpId = !!payment.mercadoPagoId;
+  const isMixed = payment.paymentMethod === 'MIXED';
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -144,26 +193,60 @@ export default function PaymentDetailPage() {
           <h1 className="text-2xl font-bold text-gray-900">Detalhes do Pagamento</h1>
         </div>
 
-        {/* Botão de reprocessamento — só aparece em pagamentos PENDING com ID do MP */}
-        {isPending && hasMpId && (
-          <button
-            onClick={handleReprocess}
-            disabled={reprocessing}
-            className="flex items-center gap-2 rounded-lg bg-amber-500 hover:bg-amber-600 disabled:opacity-60 text-white text-sm font-medium px-4 py-2 transition-colors"
-          >
-            {reprocessing ? (
-              <>
-                <span className="animate-spin inline-block h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-                Verificando no MP...
-              </>
-            ) : (
-              '🔄 Forçar Aprovação'
+        {isPending && (
+          <div className="flex items-center gap-2 flex-wrap">
+            {hasMpId && (
+              <button
+                onClick={handleReprocess}
+                disabled={reprocessing || cancelling}
+                className="flex items-center gap-2 rounded-lg bg-amber-500 hover:bg-amber-600 disabled:opacity-60 text-white text-sm font-medium px-4 py-2 transition-colors"
+              >
+                {reprocessing ? (
+                  <>
+                    <span className="animate-spin inline-block h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                    Verificando no MP...
+                  </>
+                ) : (
+                  '🔄 Forçar Aprovação'
+                )}
+              </button>
             )}
-          </button>
+
+            {!confirmCancel ? (
+              <button
+                onClick={() => setConfirmCancel(true)}
+                disabled={reprocessing || cancelling}
+                className="flex items-center gap-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-medium px-4 py-2 transition-colors"
+              >
+                🚫 Cancelar PIX
+              </button>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-red-700 font-medium">Confirmar cancelamento?</span>
+                <button
+                  onClick={handleCancel}
+                  disabled={cancelling}
+                  className="flex items-center gap-1 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white text-sm font-medium px-3 py-2 transition-colors"
+                >
+                  {cancelling ? (
+                    <span className="animate-spin inline-block h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+                  ) : (
+                    'Sim, cancelar'
+                  )}
+                </button>
+                <button
+                  onClick={() => setConfirmCancel(false)}
+                  disabled={cancelling}
+                  className="rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm font-medium px-3 py-2 transition-colors"
+                >
+                  Não
+                </button>
+              </div>
+            )}
+          </div>
         )}
       </div>
 
-      {/* Resultado do reprocessamento */}
       {reprocessResult && (
         <div className="rounded-lg bg-green-50 border border-green-200 px-4 py-3 text-sm text-green-800 font-medium">
           ✅ {reprocessResult}
@@ -174,6 +257,16 @@ export default function PaymentDetailPage() {
           ❌ {reprocessError}
         </div>
       )}
+      {cancelResult && (
+        <div className="rounded-lg bg-green-50 border border-green-200 px-4 py-3 text-sm text-green-800 font-medium">
+          ✅ {cancelResult}
+        </div>
+      )}
+      {cancelError && (
+        <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">
+          ❌ {cancelError}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Pagamento */}
@@ -182,7 +275,14 @@ export default function PaymentDetailPage() {
           <InfoRow label="ID Interno" value={payment.id} mono />
           <InfoRow label="ID Mercado Pago" value={payment.mercadoPagoId || '—'} mono />
           <InfoRow label="Status" value={<StatusBadge status={payment.status} />} />
-          <InfoRow label="Valor" value={formatCurrency(payment.amount)} bold />
+          <InfoRow label="Método" value={<MethodBadge method={payment.paymentMethod} />} />
+          <InfoRow label="Valor Total" value={formatCurrency(payment.amount)} bold />
+          {isMixed && payment.balanceUsed != null && (
+            <InfoRow label="↳ Saldo usado" value={formatCurrency(payment.balanceUsed)} />
+          )}
+          {isMixed && payment.pixAmount != null && (
+            <InfoRow label="↳ PIX cobrado" value={formatCurrency(payment.pixAmount)} />
+          )}
           <InfoRow label="Criado em" value={formatDate(payment.createdAt)} />
           {payment.approvedAt && (
             <InfoRow label="Aprovado em" value={formatDate(payment.approvedAt)} />

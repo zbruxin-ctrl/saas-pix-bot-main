@@ -1,4 +1,7 @@
 // routes/admin/payments.ts
+// FEAT #4: preset de período (?preset=today|7d|month) no filtro de pagamentos
+// FEAT: GET /export/csv — exporta pagamentos aprovados em CSV
+// FEAT: POST /:id/cancel — cancela pagamento PENDING no MP e no banco
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { PaymentStatus, OrderStatus, Prisma } from '@prisma/client';
@@ -9,6 +12,29 @@ import { mercadoPagoService } from '../../services/mercadoPagoService';
 
 export const adminPaymentsRouter = Router();
 
+/** Converte preset de período em {gte, lte} */
+function resolvePreset(preset?: string): { gte?: Date; lte?: Date } {
+  if (!preset) return {};
+  const now = new Date();
+  switch (preset) {
+    case 'today': {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const end   = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+      return { gte: start, lte: end };
+    }
+    case '7d': {
+      const start = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      return { gte: start };
+    }
+    case 'month': {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1);
+      return { gte: start };
+    }
+    default:
+      return {};
+  }
+}
+
 const querySchema = z.object({
   page: z.string().default('1').transform(Number),
   perPage: z.string().default('20').transform(Number),
@@ -17,6 +43,7 @@ const querySchema = z.object({
   productId: z.string().optional(),
   startDate: z.string().optional(),
   endDate: z.string().optional(),
+  preset: z.enum(['today', '7d', 'month']).optional(), // FEAT #4
   search: z.string().optional(),
 });
 
@@ -26,7 +53,7 @@ adminPaymentsRouter.get(
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: Request, res: Response) => {
     const query = querySchema.parse(req.query);
-    const { page, perPage, status, orderStatus, productId, startDate, endDate, search } = query;
+    const { page, perPage, status, orderStatus, productId, startDate, endDate, preset, search } = query;
 
     const skip = (page - 1) * perPage;
     const where: Prisma.PaymentWhereInput = {};
@@ -43,11 +70,17 @@ adminPaymentsRouter.get(
       where.order = { status: orderStatus as OrderStatus };
     }
 
-    if (startDate || endDate) {
-      where.createdAt = {
-        ...(startDate ? { gte: new Date(startDate) } : {}),
-        ...(endDate ? { lte: new Date(endDate) } : {}),
-      };
+    // FEAT #4: preset tem prioridade sobre startDate/endDate manuais
+    const presetRange = resolvePreset(preset);
+    const dateRange = Object.keys(presetRange).length > 0
+      ? presetRange
+      : {
+          ...(startDate ? { gte: new Date(startDate) } : {}),
+          ...(endDate   ? { lte: new Date(endDate)   } : {}),
+        };
+
+    if (Object.keys(dateRange).length > 0) {
+      where.createdAt = dateRange;
     }
 
     if (search) {
@@ -97,6 +130,57 @@ adminPaymentsRouter.get(
         totalPages: Math.ceil(total / perPage),
       },
     });
+  }
+);
+
+// GET /api/admin/payments/export/csv
+adminPaymentsRouter.get(
+  '/export/csv',
+  requireRole('ADMIN', 'SUPERADMIN'),
+  async (req: Request, res: Response) => {
+    const { status, productId, startDate, endDate, preset } = querySchema.parse(req.query);
+
+    const where: Prisma.PaymentWhereInput = {};
+    if (status && Object.values(PaymentStatus).includes(status as PaymentStatus)) {
+      where.status = status as PaymentStatus;
+    }
+    if (productId) where.productId = productId;
+
+    const presetRange = resolvePreset(preset);
+    const dateRange = Object.keys(presetRange).length > 0
+      ? presetRange
+      : {
+          ...(startDate ? { gte: new Date(startDate) } : {}),
+          ...(endDate   ? { lte: new Date(endDate)   } : {}),
+        };
+    if (Object.keys(dateRange).length > 0) where.createdAt = dateRange;
+
+    const payments = await prisma.payment.findMany({
+      where,
+      include: {
+        product: { select: { name: true } },
+        telegramUser: { select: { firstName: true, username: true, telegramId: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 5000,
+    });
+
+    const header = 'id,produto,usuario,telegram_id,valor,status,criado_em,aprovado_em';
+    const rows = payments.map((p) => [
+      p.id,
+      p.product?.name ?? 'Depósito',
+      p.telegramUser?.firstName ?? '',
+      p.telegramUser?.telegramId ?? '',
+      Number(p.amount).toFixed(2),
+      p.status,
+      p.createdAt.toISOString(),
+      p.approvedAt?.toISOString() ?? '',
+    ].join(','));
+
+    const csv = [header, ...rows].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="pagamentos.csv"');
+    res.send('\uFEFF' + csv);
   }
 );
 
@@ -152,72 +236,93 @@ adminPaymentsRouter.get(
 );
 
 // POST /api/admin/payments/:id/reprocess
-// Consulta o MP via mercadoPagoService (token já configurado no env)
-// e força processApprovedPayment se o MP confirmar aprovação.
 adminPaymentsRouter.post(
   '/:id/reprocess',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: Request, res: Response) => {
     const paymentId = req.params.id;
 
-    const payment = await prisma.payment.findUnique({
-      where: { id: paymentId },
-    });
+    const payment = await prisma.payment.findUnique({ where: { id: paymentId } });
 
     if (!payment) {
       res.status(404).json({ success: false, error: 'Pagamento não encontrado' });
       return;
     }
 
-    // Se já aprovado no nosso banco, não reprocessa
     if (payment.status === 'APPROVED') {
       res.json({ success: true, message: 'Pagamento já está aprovado', alreadyApproved: true });
       return;
     }
 
     if (!payment.mercadoPagoId) {
-      res.status(400).json({
-        success: false,
-        error: 'Este pagamento não tem ID do Mercado Pago registrado',
-      });
+      res.status(400).json({ success: false, error: 'Este pagamento não tem ID do Mercado Pago registrado' });
       return;
     }
 
-    // Consulta o status real no Mercado Pago
     let mpDetail: Awaited<ReturnType<typeof mercadoPagoService.getPaymentById>>;
     try {
       mpDetail = await mercadoPagoService.getPaymentById(payment.mercadoPagoId);
     } catch (err: any) {
-      res.status(502).json({
-        success: false,
-        error: `Erro ao consultar Mercado Pago: ${err?.message || 'erro desconhecido'}`,
-      });
+      res.status(502).json({ success: false, error: `Erro ao consultar Mercado Pago: ${err?.message || 'erro desconhecido'}` });
       return;
     }
 
     if (mpDetail.status !== 'approved') {
-      res.json({
-        success: false,
-        mpStatus: mpDetail.status,
-        error: `O Mercado Pago retornou status "${mpDetail.status}" — pagamento ainda não aprovado no MP`,
-      });
+      res.json({ success: false, mpStatus: mpDetail.status, error: `O Mercado Pago retornou status "${mpDetail.status}"` });
       return;
     }
 
-    // MP confirmou aprovação → dispara o fluxo completo de entrega
     try {
       await paymentService.processApprovedPayment(paymentId);
     } catch (err: any) {
-      res.status(500).json({
+      res.status(500).json({ success: false, error: `Erro ao processar pagamento: ${err?.message || 'erro desconhecido'}` });
+      return;
+    }
+
+    res.json({ success: true, message: 'Pagamento reprocessado com sucesso. O bot enviará o produto ao usuário.' });
+  }
+);
+
+// POST /api/admin/payments/:id/cancel
+adminPaymentsRouter.post(
+  '/:id/cancel',
+  requireRole('ADMIN', 'SUPERADMIN'),
+  async (req: Request, res: Response) => {
+    const paymentId = req.params.id;
+
+    const payment = await prisma.payment.findUnique({ where: { id: paymentId } });
+
+    if (!payment) {
+      res.status(404).json({ success: false, error: 'Pagamento não encontrado' });
+      return;
+    }
+
+    if (payment.status !== 'PENDING') {
+      res.status(400).json({
         success: false,
-        error: `Erro ao processar pagamento: ${err?.message || 'erro desconhecido'}`,
+        error: `Não é possível cancelar um pagamento com status "${payment.status}". Apenas pagamentos PENDING podem ser cancelados.`,
       });
       return;
     }
 
-    res.json({
-      success: true,
-      message: 'Pagamento reprocessado com sucesso. O bot enviará o produto ao usuário.',
+    // Tenta cancelar no Mercado Pago se houver ID externo
+    if (payment.mercadoPagoId) {
+      try {
+        await mercadoPagoService.cancelPayment(payment.mercadoPagoId);
+      } catch (err: any) {
+        // Não bloqueia o cancelamento local se o MP falhar (pode já ter expirado)
+        console.warn(`[cancel] Falha ao cancelar no MP (${payment.mercadoPagoId}):`, err?.message);
+      }
+    }
+
+    await prisma.payment.update({
+      where: { id: paymentId },
+      data: {
+        status: 'CANCELLED',
+        cancelledAt: new Date(),
+      },
     });
+
+    res.json({ success: true, message: 'Pagamento cancelado com sucesso.' });
   }
 );

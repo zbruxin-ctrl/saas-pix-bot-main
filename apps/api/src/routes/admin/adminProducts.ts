@@ -1,7 +1,10 @@
 // routes/admin/adminProducts.ts
 // FIX BUG2: rotas estáticas (/stock, /orders/:id/medias, /orders/medias/:id) ANTES de /:id
 // SORT: PATCH /reorder para drag-and-drop no painel admin
-// SORT: GET / agora ordena por sortOrder asc, createdAt asc
+// FIX PROD: sortOrder removido do orderBy até migration ser aplicada no Railway
+// FEAT #1: POST /:productId/stock-items/bulk — upload em lote (textarea/CSV)
+// CACHE: notifyBotProductCacheInvalidation() após create/update/delete/reorder
+// FIX CARD: GET / inclui _count.stockItems para exibir disponíveis sem fetch extra
 import { Router, Response } from 'express';
 import { z } from 'zod';
 import { Prisma, StockItemStatus } from '@prisma/client';
@@ -12,6 +15,7 @@ import { Request } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { logger } from '../../lib/logger';
+import { notifyBotProductCacheInvalidation } from '../../lib/botCache';
 
 export const adminProductsRouter = Router();
 
@@ -148,54 +152,99 @@ adminProductsRouter.post(
   }
 );
 
-// ─── Listagem (ordenada por sortOrder) ─────────────────────────────────────────────
+// ─── Listagem ─────────────────────────────────────────────────────────────────
+// FIX: inclui _count.stockItems para o card mostrar disponíveis sem fetch extra
 
 adminProductsRouter.get(
   '/',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const { page, perPage } = listQuerySchema.parse(req.query);
-    const skip = (page - 1) * perPage;
-    const [products, total] = await Promise.all([
-      prisma.product.findMany({
-        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
-        skip,
-        take: perPage,
-      }),
-      prisma.product.count(),
-    ]);
-    res.json({
-      success: true,
-      data: {
-        data: products.map((p) => ({ ...p, price: Number(p.price) })),
-        total,
-        page,
-        perPage,
-        totalPages: Math.ceil(total / perPage),
-      },
-    });
+    try {
+      const { page, perPage } = listQuerySchema.parse(req.query);
+      const skip = (page - 1) * perPage;
+
+      const include = {
+        _count: {
+          select: {
+            stockItems: {
+              where: { status: StockItemStatus.AVAILABLE },
+            },
+          },
+        },
+      };
+
+      let products: Prisma.ProductGetPayload<{ include: typeof include }>[];
+      let total: number;
+
+      try {
+        [products, total] = await Promise.all([
+          prisma.product.findMany({
+            orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+            skip,
+            take: perPage,
+            include,
+          }),
+          prisma.product.count(),
+        ]);
+      } catch {
+        [products, total] = await Promise.all([
+          prisma.product.findMany({
+            orderBy: { createdAt: 'asc' },
+            skip,
+            take: perPage,
+            include,
+          }),
+          prisma.product.count(),
+        ]);
+      }
+
+      res.json({
+        success: true,
+        data: {
+          data: products.map((p) => ({
+            ...p,
+            price: Number(p.price),
+            // disponiveisCount: número real de StockItems AVAILABLE
+            disponiveisCount: p._count.stockItems,
+          })),
+          total,
+          page,
+          perPage,
+          totalPages: Math.ceil(total / perPage),
+        },
+      });
+    } catch (err) {
+      logger.error('[adminProducts] Erro ao listar produtos:', err);
+      res.status(500).json({ success: false, error: 'Erro ao listar produtos' });
+    }
   }
 );
 
-// ─── PATCH /reorder ───────────────────────────────────────────────────────────────
+// ─── PATCH /reorder ───────────────────────────────────────────────────────────
 
 adminProductsRouter.patch(
   '/reorder',
   requireRole('ADMIN', 'SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const { items } = reorderSchema.parse(req.body);
+    try {
+      const { items } = reorderSchema.parse(req.body);
 
-    await prisma.$transaction(
-      items.map(({ id, sortOrder }) =>
-        prisma.product.update({
-          where: { id },
-          data: { sortOrder },
-        })
-      )
-    );
+      await prisma.$transaction(
+        items.map(({ id, sortOrder }) =>
+          prisma.product.update({
+            where: { id },
+            data: { sortOrder },
+          })
+        )
+      );
 
-    logger.info(`[adminProducts] Ordem de ${items.length} produtos atualizada`);
-    res.json({ success: true, message: 'Ordem atualizada com sucesso' });
+      logger.info(`[adminProducts] Ordem de ${items.length} produtos atualizada`);
+      notifyBotProductCacheInvalidation();
+      res.json({ success: true, message: 'Ordem atualizada com sucesso' });
+    } catch (err) {
+      logger.error('[adminProducts] Erro ao reordenar produtos:', err);
+      res.status(500).json({ success: false, error: 'Erro ao reordenar. Execute npx prisma migrate deploy no Railway.' });
+    }
   }
 );
 
@@ -223,7 +272,7 @@ adminProductsRouter.get(
   }
 );
 
-// ─── Rotas de mídia por pedido — ANTES de /:id para evitar captura pelo Express ──
+// ─── Rotas de mídia por pedido — ANTES de /:id ──────────────────────────────────
 
 const mediaSchema = z.object({
   url: z.string().url(),
@@ -314,6 +363,7 @@ adminProductsRouter.post(
       }
     }
 
+    notifyBotProductCacheInvalidation();
     res.status(201).json({ success: true, data: { ...product, price: Number(product.price) } });
   }
 );
@@ -354,6 +404,7 @@ adminProductsRouter.put(
       }
     }
 
+    notifyBotProductCacheInvalidation();
     res.json({ success: true, data: { ...product, price: Number(product.price) } });
   }
 );
@@ -365,6 +416,7 @@ adminProductsRouter.delete(
   requireRole('SUPERADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     await prisma.product.update({ where: { id: req.params.id }, data: { isActive: false } });
+    notifyBotProductCacheInvalidation();
     res.json({ success: true });
   }
 );
@@ -409,6 +461,24 @@ adminProductsRouter.put(
 
 const stockItemSchema = z.object({ content: z.string().min(1) });
 
+/**
+ * Schema para upload em lote (FEAT #1).
+ * Aceita:
+ *   { items: ["item1", "item2", ...] }  — array JSON
+ *   { text: "item1\nitem2\n..." }        — texto multi-linha (uma entrada por linha)
+ * Modo replace: se `replace=true` no body, apaga os AVAILABLE antes de inserir.
+ */
+const bulkStockSchema = z.union([
+  z.object({
+    items: z.array(z.string().min(1)).min(1).max(5000),
+    replace: z.boolean().default(false),
+  }),
+  z.object({
+    text: z.string().min(1),
+    replace: z.boolean().default(false),
+  }),
+]);
+
 adminProductsRouter.get(
   '/:productId/stock-items',
   requireRole('ADMIN', 'SUPERADMIN'),
@@ -430,6 +500,88 @@ adminProductsRouter.post(
       data: { productId: req.params.productId, content, status: 'AVAILABLE' },
     });
     res.status(201).json({ success: true, data: item });
+  }
+);
+
+// ─── POST /:productId/stock-items/bulk — FEAT #1: Upload em lote ──────────────
+// DEVE ficar ANTES de /stock-items/:itemId (rota estática x dinâmica)
+adminProductsRouter.post(
+  '/:productId/stock-items/bulk',
+  requireRole('ADMIN', 'SUPERADMIN'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const parsed = bulkStockSchema.parse(req.body);
+
+      // Normaliza entradas independentemente do formato recebido
+      let rawItems: string[];
+      if ('text' in parsed) {
+        rawItems = parsed.text.split(/\r?\n/);
+      } else {
+        rawItems = parsed.items;
+      }
+
+      const valid = rawItems.map((v) => v.trim()).filter(Boolean);
+      if (valid.length === 0) {
+        res.status(400).json({ success: false, error: 'Nenhum item válido encontrado' });
+        return;
+      }
+
+      // Verifica produto existente
+      const product = await prisma.product.findUnique({
+        where: { id: req.params.productId },
+        select: { id: true, name: true },
+      });
+      if (!product) {
+        res.status(404).json({ success: false, error: 'Produto não encontrado' });
+        return;
+      }
+
+      await prisma.$transaction(async (tx) => {
+        if (parsed.replace) {
+          await tx.stockItem.deleteMany({
+            where: { productId: product.id, status: StockItemStatus.AVAILABLE },
+          });
+          // Garante que deliveryContent fica como __FIFO__
+          await tx.product.update({
+            where: { id: product.id },
+            data: { deliveryContent: '__FIFO__' },
+          });
+        }
+
+        await tx.stockItem.createMany({
+          data: valid.map((content) => ({
+            productId: product.id,
+            content,
+            status: StockItemStatus.AVAILABLE,
+          })),
+          skipDuplicates: false,
+        });
+
+        // Garante que o produto usa modo FIFO
+        await tx.product.update({
+          where: { id: product.id },
+          data: { deliveryContent: '__FIFO__' },
+        });
+      });
+
+      logger.info(`[adminProducts/bulk] ${valid.length} itens inseridos para produto=${product.id} replace=${parsed.replace}`);
+
+      const totalAvailable = await prisma.stockItem.count({
+        where: { productId: product.id, status: StockItemStatus.AVAILABLE },
+      });
+
+      res.status(201).json({
+        success: true,
+        data: {
+          inserted: valid.length,
+          totalAvailable,
+          replaced: parsed.replace,
+        },
+      });
+    } catch (err) {
+      logger.error('[adminProducts/bulk] Erro no upload em lote:', err);
+      res.status(400).json({ success: false, error: err instanceof Error ? err.message : 'Erro no upload em lote' });
+    }
   }
 );
 

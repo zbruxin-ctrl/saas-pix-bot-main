@@ -5,6 +5,11 @@
 //         WalletBalanceResponse, WalletAdjustRequest
 // PRODUCT: sortOrder em ProductDTO
 // PAYMENT: paidWithBalance em CreatePaymentResponse
+// PAYMENT METHOD: paymentMethod em CreatePaymentRequest (BALANCE | PIX | MIXED)
+// PRICING: couponCode, referralCode, quantity em CreatePaymentRequest
+//          CouponDTO, ReferralDTO, VolumeTierDTO adicionados
+// AUDIT #13: CreatePaymentResponse tipado com todos os campos opcionais —
+//            elimina double cast `as unknown as Record<string, unknown>` em payments.ts
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -16,9 +21,9 @@ export type PaymentStatus =
   | 'EXPIRED'
   | 'REFUNDED';
 
-export type DeliveryType = 'TEXT' | 'LINK' | 'FILE_MEDIA' | 'ACCOUNT'; // TOKEN removido
+export type DeliveryType = 'TEXT' | 'LINK' | 'FILE_MEDIA' | 'ACCOUNT';
 
-export type OrderStatus = 'PROCESSING' | 'DELIVERED' | 'FAILED' | 'CANCELLED'; // CANCELLED adicionado
+export type OrderStatus = 'PROCESSING' | 'DELIVERED' | 'FAILED' | 'CANCELLED';
 
 export type AdminRole = 'SUPERADMIN' | 'ADMIN' | 'OPERATOR';
 
@@ -38,6 +43,11 @@ export type WebhookEventStatus =
   | 'IGNORED';
 
 export type WalletTransactionType = 'DEPOSIT' | 'PURCHASE' | 'REFUND';
+
+/** Método de pagamento escolhido pelo usuário no bot */
+export type PaymentMethod = 'BALANCE' | 'PIX' | 'MIXED';
+
+export type DiscountType = 'PERCENT' | 'FIXED';
 
 // ─── DTOs base ────────────────────────────────────────────────────────────────
 
@@ -135,6 +145,10 @@ export interface PaymentDTO {
   approvedAt?: string | null;
   cancelledAt?: string | null;
   createdAt: string;
+  /** Valor original antes de descontos */
+  originalAmount?: number | null;
+  /** Valor do desconto aplicado (cupom ou volume) */
+  discountAmount?: number | null;
   product?: ProductDTO | null;
   telegramUser?: TelegramUserDTO | null;
   order?: OrderDTO | null;
@@ -142,14 +156,65 @@ export interface PaymentDTO {
   stockItem?: Pick<StockItemDTO, 'content' | 'status'> | null;
 }
 
+// ─── Coupon ──────────────────────────────────────────────────────────────────
+
+export interface CouponDTO {
+  id: string;
+  code: string;
+  discountType: DiscountType;
+  discountValue: number;
+  minOrderValue?: number | null;
+  maxUses?: number | null;
+  usedCount: number;
+  validUntil?: string | null;
+  /** JSON array de productIds restritos; null = todos os produtos */
+  productIds?: string[] | null;
+  isActive: boolean;
+  createdAt: string;
+}
+
+// ─── Referral ─────────────────────────────────────────────────────────────────
+
+export interface ReferralDTO {
+  id: string;
+  referrerId: string;
+  referredId: string;
+  rewardPaid: boolean;
+  rewardAmount: number;
+  paymentId?: string | null;
+  createdAt: string;
+}
+
+// ─── VolumeTier ──────────────────────────────────────────────────────────────
+
+export interface VolumeTierDTO {
+  id: string;
+  /** null = tier global (todos os produtos) */
+  productId?: string | null;
+  minQty: number;
+  discountPercent: number;
+  createdAt: string;
+}
+
+// ─── Pricing result ──────────────────────────────────────────────────────────
+
+/** Resultado do pricingService antes de criar o payment */
+export interface PricingResult {
+  originalAmount: number;
+  discountAmount: number;
+  finalAmount: number;
+  /** Cupom validado (se aplicado) */
+  coupon?: CouponDTO | null;
+  /** Desconto de volume aplicado (%) */
+  volumeDiscountPercent?: number;
+}
+
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
 export interface DashboardStats {
-  // Receita
   totalRevenue: number;
   revenueToday: number;
   revenueThisMonth: number;
-  // Volume
   totalApproved: number;
   totalPending: number;
   totalRejected: number;
@@ -158,7 +223,6 @@ export interface DashboardStats {
   totalRefunded: number;
   paymentsToday: number;
   paymentsThisMonth: number;
-  // Métricas operacionais
   deliveriesFailedToday: number;
   webhooksFailedToday: number;
   ordersWithFailure: number;
@@ -180,16 +244,31 @@ export interface CreatePaymentRequest {
   productId: string;
   firstName?: string;
   username?: string;
+  /** Método de pagamento escolhido pelo usuário. Padrão: comportamento legado (saldo automático se suficiente). */
+  paymentMethod?: PaymentMethod;
+  /** Código de cupom de desconto (opcional) */
+  couponCode?: string;
+  /** telegramId do usuário que indicou (referral, opcional) */
+  referralCode?: string;
+  /** Quantidade de itens (para desconto por volume). Padrão: 1 */
+  quantity?: number;
 }
 
 export interface CreatePaymentResponse {
   paymentId: string;
-  pixQrCode: string;       // base64 (vazio se paidWithBalance)
-  pixQrCodeText: string;   // copia e cola (vazio se paidWithBalance)
-  amount: number;
+  pixQrCode: string;         // base64 (vazio se paidWithBalance)
+  pixQrCodeText: string;     // copia e cola (vazio se paidWithBalance)
+  amount: number;            // valor final após descontos
+  originalAmount?: number;   // valor original antes de descontos
+  discountAmount?: number;   // valor do desconto aplicado
+  pixAmount?: number;        // valor cobrado via PIX (MIXED: amount - balanceUsed)
+  balanceUsed?: number;      // valor debitado do saldo (MIXED ou BALANCE)
   expiresAt: string;
   productName: string;
-  paidWithBalance?: boolean; // true = debitado do saldo, sem necessidade de PIX
+  paidWithBalance?: boolean; // true = 100% debitado do saldo
+  isMixed?: boolean;         // true = saldo parcial + PIX pela diferença
+  /** Nome do cupom aplicado (se houver) — AUDIT #13: campo tipado, sem double cast */
+  couponApplied?: string;
 }
 
 export interface CreateDepositRequest {
@@ -213,7 +292,7 @@ export interface WalletBalanceResponse {
 }
 
 export interface WalletAdjustRequest {
-  amount: number;        // positivo = crédito, negativo = débito
+  amount: number;
   justification: string;
 }
 

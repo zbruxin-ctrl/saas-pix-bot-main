@@ -1,6 +1,6 @@
 // routes/admin/orders.ts
-// FIX M6: GET /api/admin/orders com filtro por status, período e produto
-// Complementa o detalhe de pagamento — permite ver todos os pedidos numa listagem dedicada
+// FEAT #5: campo amountPaid explícito no retorno (R$ de cada pedido)
+// FIX M6: filtro por status, período e produto
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { OrderStatus, Prisma } from '@prisma/client';
@@ -29,18 +29,13 @@ adminOrdersRouter.get('/', async (req: Request, res: Response) => {
   if (status && Object.values(OrderStatus).includes(status as OrderStatus)) {
     where.status = status as OrderStatus;
   }
-
-  if (productId) {
-    where.productId = productId;
-  }
-
+  if (productId) where.productId = productId;
   if (startDate || endDate) {
     where.createdAt = {
       ...(startDate ? { gte: new Date(startDate) } : {}),
-      ...(endDate ? { lte: new Date(endDate) } : {}),
+      ...(endDate   ? { lte: new Date(endDate)   } : {}),
     };
   }
-
   if (search) {
     where.OR = [
       { id: { contains: search, mode: 'insensitive' } },
@@ -62,7 +57,7 @@ adminOrdersRouter.get('/', async (req: Request, res: Response) => {
       include: {
         product: { select: { name: true, price: true } },
         telegramUser: { select: { username: true, firstName: true, telegramId: true } },
-        payment: { select: { amount: true, mercadoPagoId: true } },
+        payment: { select: { amount: true, mercadoPagoId: true, status: true } },
       },
       orderBy: { createdAt: 'desc' },
       skip,
@@ -76,6 +71,8 @@ adminOrdersRouter.get('/', async (req: Request, res: Response) => {
     data: {
       data: orders.map((o) => ({
         ...o,
+        // FEAT #5: amountPaid como campo de nível superior
+        amountPaid: o.payment ? Number(o.payment.amount) : null,
         payment: o.payment
           ? { ...o.payment, amount: Number(o.payment.amount) }
           : null,
@@ -113,6 +110,7 @@ adminOrdersRouter.get('/:id', async (req: Request, res: Response) => {
     success: true,
     data: {
       ...order,
+      amountPaid: order.payment ? Number(order.payment.amount) : null,
       payment: order.payment
         ? { ...order.payment, amount: Number(order.payment.amount) }
         : null,

@@ -6,10 +6,14 @@ import { useState } from 'react';
 import clsx from 'clsx';
 
 const navItems = [
-  { href: '/admin',          label: 'Dashboard',   icon: '📊', exact: true  },
-  { href: '/admin/payments', label: 'Pagamentos',  icon: '💳', exact: false },
-  { href: '/admin/products', label: 'Produtos',    icon: '📦', exact: false },
-  { href: '/admin/users',    label: 'Usuários',    icon: '👥', exact: false },
+  { href: '/admin',            label: 'Dashboard',      icon: '📊', exact: true  },
+  { href: '/admin/payments',   label: 'Pagamentos',     icon: '💳', exact: false },
+  { href: '/admin/products',   label: 'Produtos',       icon: '📦', exact: false },
+  { href: '/admin/users',      label: 'Usuários',       icon: '👥', exact: false },
+  { href: '/admin/referrals',  label: 'Indicações',     icon: '🎁', exact: false },
+  { href: '/admin/coupons',    label: 'Cupons',         icon: '🏷️', exact: false },
+  { href: '/admin/broadcast',  label: 'Broadcast',      icon: '📢', exact: false },
+  { href: '/admin/settings',   label: 'Configurações',  icon: '⚙️', exact: false },
 ];
 
 export default function Sidebar() {

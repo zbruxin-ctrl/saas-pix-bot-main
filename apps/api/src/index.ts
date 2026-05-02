@@ -15,16 +15,18 @@ import { authRouter } from './routes/auth';
 import { paymentsRouter } from './routes/payments';
 import { webhooksRouter } from './routes/webhooks';
 import adminRouter from './routes/admin';
+import { telegramRouter } from './routes/telegram';
+import { pricingRouter } from './routes/pricing';
+import { couponsRouter } from './routes/coupons';
+import { referralsRouter } from './routes/referrals';
 import { startExpireJob, stopExpireJob } from './jobs/expirePayments';
 
+// build: 2026-04-29
 const app = express();
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false }));
 
-// CORS: allowlist explícita + todos os subdominios *.vercel.app (deploys dinâmicos)
-// Para adicionar domínios próprios, configure ALLOWED_ORIGINS no Railway:
-//   ALLOWED_ORIGINS=https://meudominio.com,https://outro.com
 const extraOrigins = (process.env.ALLOWED_ORIGINS ?? '')
   .split(',')
   .map((s) => s.trim())
@@ -40,9 +42,8 @@ const allowedOrigins = [
 ].filter(Boolean) as string[];
 
 function isOriginAllowed(origin: string | undefined): boolean {
-  if (!origin) return true; // requests sem Origin (curl, Railway health checks)
-  // Permite qualquer subdomínio do Vercel (deploys de preview e produção)
-  if (/^https:\/\/[a-z0-9-]+-[a-z0-9-]+-[a-z0-9]+-projects\.vercel\.app$/.test(origin)) return true;
+  if (!origin) return true;
+  if (/^\/https:\/\/[a-z0-9-]+-[a-z0-9-]+-[a-z0-9]+-projects\.vercel\.app$/.test(origin)) return true;
   if (/^https:\/\/[a-zA-Z0-9-]+\.vercel\.app$/.test(origin)) return true;
   return allowedOrigins.includes(origin);
 }
@@ -62,6 +63,11 @@ app.use(compression());
 app.use(cookieParser(env.COOKIE_SECRET));
 app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } }));
 app.use('/api/webhooks', express.raw({ type: 'application/json', limit: '1mb' }));
+
+// Rota do webhook do Telegram precisa de JSON parseado
+app.use('/telegram-webhook', express.json({ limit: '1mb' }));
+app.use('/telegram-webhook', telegramRouter);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -91,10 +97,26 @@ app.post('/setup-admin', async (req, res) => {
   res.json({ success: true, message: `Admin ${admin.email} pronto. Remova SETUP_SECRET do Railway agora.` });
 });
 
+// --- Rota interna: bot notifica que subiu e está pronto ---
+// Não há lógica de estado aqui — apenas health-check de conectividade bot→API.
+// O handler de updates do Telegram roda dentro do processo do bot (via webhook HTTP direto).
+app.post('/internal/register-bot', (req, res) => {
+  const secret = req.headers['x-bot-secret'];
+  if (env.TELEGRAM_BOT_SECRET && secret !== env.TELEGRAM_BOT_SECRET) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+  logger.info('[internal] Bot registrado e online.');
+  res.json({ ok: true });
+});
+
 app.use('/api/auth', authRouter);
 app.use('/api/payments', paymentsRouter);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/pricing', pricingRouter);
+app.use('/api/coupons', couponsRouter);
+app.use('/api/referrals', referralsRouter);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 

@@ -1,14 +1,21 @@
 // schema.prisma
+// OPT #4: @@index([telegramUserId, status, pixExpiresAt]) adicionado ao model Payment
+// OPT #9: metadata → colunas reais (paymentMethod, balanceUsed, pixAmount) em Payment
+// FEAT #9: model AuditLog adicionado
+// FEAT #2/#3: model AdminSetting adicionado
+// FEAT: Coupon, CouponUse, Referral, VolumeTier adicionados
+// FIX-BUILD: REFERRAL_REWARD adicionado ao WalletTransactionType
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
-// ─── Admin ──────────────────────────────────────────────────────────────────
+// ─── Admin ────────────────────────────────────────────────────────────────────────────
 model AdminUser {
   id           String     @id @default(cuid())
   email        String     @unique
@@ -20,6 +27,8 @@ model AdminUser {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
+  auditLogs    AuditLog[]
+
   @@map("admin_users")
 }
 
@@ -29,7 +38,36 @@ enum AdminRole {
   OPERATOR
 }
 
-// ─── Telegram ─────────────────────────────────────────────────────────────────
+// ─── AuditLog ────────────────────────────────────────────────────────────────────
+model AuditLog {
+  id         String    @id @default(cuid())
+  adminId    String
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   String?   @db.Text
+  ip         String?
+  createdAt  DateTime  @default(now())
+
+  admin AdminUser @relation(fields: [adminId], references: [id])
+
+  @@index([adminId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ─── AdminSetting ───────────────────────────────────────────────────────────────
+model AdminSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+
+  @@map("admin_settings")
+}
+
+// ─── Telegram ──────────────────────────────────────────────────────────────────────
 model TelegramUser {
   id           String       @id @default(cuid())
   telegramId   String       @unique
@@ -46,11 +84,14 @@ model TelegramUser {
   orders              Order[]
   stockReservations   StockReservation[]
   walletTransactions  WalletTransaction[]
+  couponUses          CouponUse[]
+  referralsGiven      Referral[]         @relation("ReferrerRelation")
+  referralReceived    Referral?          @relation("ReferredRelation")
 
   @@map("telegram_users")
 }
 
-// ─── Produto ──────────────────────────────────────────────────────────────────
+// ─── Produto ──────────────────────────────────────────────────────────────────────
 model Product {
   id              String       @id @default(cuid())
   name            String
@@ -69,6 +110,7 @@ model Product {
   orders            Order[]
   stockReservations StockReservation[]
   stockItems        StockItem[]
+  volumeTiers       VolumeTier[]
 
   @@map("products")
 }
@@ -80,7 +122,7 @@ enum DeliveryType {
   ACCOUNT
 }
 
-// ─── StockItem ─────────────────────────────────────────────────────────────────
+// ─── StockItem ─────────────────────────────────────────────────────────────────────
 model StockItem {
   id          String          @id @default(cuid())
   productId   String
@@ -112,7 +154,7 @@ enum StockItemStatus {
   RELEASED
 }
 
-// ─── StockReservation ─────────────────────────────────────────────────────────
+// ─── StockReservation ─────────────────────────────────────────────────────────────
 model StockReservation {
   id             String                 @id @default(cuid())
   productId      String
@@ -142,7 +184,7 @@ enum StockReservationStatus {
   RELEASED
 }
 
-// ─── WalletTransaction ─────────────────────────────────────────────────────────
+// ─── WalletTransaction ──────────────────────────────────────────────────────────────
 model WalletTransaction {
   id             String                @id @default(cuid())
   telegramUserId String
@@ -163,37 +205,56 @@ enum WalletTransactionType {
   DEPOSIT
   PURCHASE
   REFUND
+  REFERRAL_REWARD
 }
 
-// ─── Payment ──────────────────────────────────────────────────────────────────
+// ─── Payment ───────────────────────────────────────────────────────────────────────────
 model Payment {
-  id             String        @id @default(cuid())
+  id             String         @id @default(cuid())
   telegramUserId String
   productId      String?
-  mercadoPagoId  String?       @unique
-  amount         Decimal       @db.Decimal(10, 2)
-  status         PaymentStatus @default(PENDING)
-  pixQrCode      String?       @db.Text
-  pixQrCodeText  String?       @db.Text
+  mercadoPagoId  String?        @unique
+  amount         Decimal        @db.Decimal(10, 2)
+  status         PaymentStatus  @default(PENDING)
+  pixQrCode      String?        @db.Text
+  pixQrCodeText  String?        @db.Text
   pixExpiresAt   DateTime?
   approvedAt     DateTime?
   cancelledAt    DateTime?
   expiredAt      DateTime?
+  paymentMethod  PaymentMethod?
+  balanceUsed    Decimal?       @db.Decimal(10, 2)
+  pixAmount      Decimal?       @db.Decimal(10, 2)
+  // Pricing fields
+  couponId       String?
+  discountAmount Decimal?       @db.Decimal(10, 2)
+  originalAmount Decimal?       @db.Decimal(10, 2)
   metadata       Json?
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
 
   telegramUser     TelegramUser      @relation(fields: [telegramUserId], references: [id])
   product          Product?          @relation(fields: [productId], references: [id])
+  coupon           Coupon?           @relation(fields: [couponId], references: [id])
   order            Order?
   stockReservation StockReservation?
   stockItem        StockItem?
   webhookEvents    WebhookEvent[]
+  couponUse        CouponUse?
+  referral         Referral?
 
   @@index([telegramUserId])
   @@index([status])
   @@index([mercadoPagoId])
+  @@index([telegramUserId, status, pixExpiresAt])
+  @@index([paymentMethod, status])
   @@map("payments")
+}
+
+enum PaymentMethod {
+  PIX
+  BALANCE
+  MIXED
 }
 
 enum PaymentStatus {
@@ -205,7 +266,7 @@ enum PaymentStatus {
   REFUNDED
 }
 
-// ─── Order ────────────────────────────────────────────────────────────────────
+// ─── Order ────────────────────────────────────────────────────────────────────────────
 model Order {
   id             String      @id @default(cuid())
   paymentId      String      @unique
@@ -235,7 +296,7 @@ enum OrderStatus {
   FAILED
 }
 
-// ─── DeliveryLog ─────────────────────────────────────────────────────────────
+// ─── DeliveryLog ───────────────────────────────────────────────────────────────────
 model DeliveryLog {
   id        String   @id @default(cuid())
   orderId   String
@@ -252,7 +313,7 @@ model DeliveryLog {
   @@map("delivery_logs")
 }
 
-// ─── DeliveryMedia ───────────────────────────────────────────────────────────
+// ─── DeliveryMedia ─────────────────────────────────────────────────────────────────
 model DeliveryMedia {
   id        String   @id @default(cuid())
   orderId   String
@@ -268,7 +329,7 @@ model DeliveryMedia {
   @@map("delivery_medias")
 }
 
-// ─── WebhookEvent ────────────────────────────────────────────────────────────
+// ─── WebhookEvent ───────────────────────────────────────────────────────────────────
 model WebhookEvent {
   id          String             @id @default(cuid())
   provider    String
@@ -297,4 +358,86 @@ enum WebhookEventStatus {
   PROCESSED
   IGNORED
   FAILED
+}
+
+// ─── Coupon ────────────────────────────────────────────────────────────────────────
+model Coupon {
+  id             String       @id @default(cuid())
+  code           String       @unique
+  discountType   DiscountType
+  discountValue  Decimal      @db.Decimal(10, 2)
+  minOrderValue  Decimal?     @db.Decimal(10, 2)
+  maxUses        Int?
+  usedCount      Int          @default(0)
+  validUntil     DateTime?
+  // JSON array de productIds; null = válido para todos os produtos
+  productIds     String?      @db.Text
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  couponUses CouponUse[]
+  payments   Payment[]
+
+  @@index([code])
+  @@index([isActive])
+  @@map("coupons")
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+// ─── CouponUse ─────────────────────────────────────────────────────────────────────
+model CouponUse {
+  id             String   @id @default(cuid())
+  couponId       String
+  telegramUserId String
+  paymentId      String   @unique
+  createdAt      DateTime @default(now())
+
+  coupon       Coupon       @relation(fields: [couponId], references: [id])
+  telegramUser TelegramUser @relation(fields: [telegramUserId], references: [id])
+  payment      Payment      @relation(fields: [paymentId], references: [id])
+
+  // Um usuário só pode usar o mesmo cupom uma vez
+  @@unique([couponId, telegramUserId])
+  @@index([telegramUserId])
+  @@map("coupon_uses")
+}
+
+// ─── Referral ──────────────────────────────────────────────────────────────────────
+model Referral {
+  id           String   @id @default(cuid())
+  referrerId   String
+  referredId   String   @unique  // cada usuário só pode ter sido indicado 1 vez
+  paymentId    String?  @unique  // 1º pedido pago que ativou a recompensa
+  rewardPaid   Boolean  @default(false)
+  rewardAmount Decimal  @default(0) @db.Decimal(10, 2)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  referrer TelegramUser  @relation("ReferrerRelation", fields: [referrerId], references: [id])
+  referred TelegramUser  @relation("ReferredRelation", fields: [referredId], references: [id])
+  payment  Payment?      @relation(fields: [paymentId], references: [id])
+
+  @@index([referrerId])
+  @@map("referrals")
+}
+
+// ─── VolumeTier ────────────────────────────────────────────────────────────────────
+model VolumeTier {
+  id              String   @id @default(cuid())
+  // null = aplica a todos os produtos (tier global)
+  productId       String?
+  minQty          Int
+  discountPercent Decimal  @db.Decimal(5, 2)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  product Product? @relation(fields: [productId], references: [id])
+
+  @@index([productId, minQty])
+  @@map("volume_tiers")
 }

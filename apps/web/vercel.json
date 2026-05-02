@@ -1,0 +1,6 @@
+{
+  "installCommand": "cd ../.. && NODE_ENV=development npm install",
+  "buildCommand": "cd ../.. && npm run build -w packages/shared && cd apps/web && ../../node_modules/.bin/next build",
+  "outputDirectory": ".next",
+  "framework": "nextjs"
+}

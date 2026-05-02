@@ -1,10 +1,17 @@
 FROM node:20-alpine
 RUN apk add --no-cache openssl
 WORKDIR /app
+
+# cache-bust: 2026-05-02T15:58
 COPY . .
+
 RUN npm install
 RUN npm run build -w packages/shared
 RUN npx prisma generate --schema=./prisma/schema.prisma
-RUN npm run build -w apps/api
+RUN cd apps/api && npx tsc
+RUN test -f apps/api/dist/index.js || (echo 'ERRO: apps/api/dist/index.js nao gerado' && exit 1)
+RUN cd apps/bot && npx tsc
+RUN test -f apps/bot/dist/index.js || (echo 'ERRO: apps/bot/dist/index.js nao gerado' && exit 1)
+
+ENV NODE_PATH=/app/node_modules
 EXPOSE 3001
-CMD npx prisma migrate deploy --schema=./prisma/schema.prisma && node apps/api/dist/index.js

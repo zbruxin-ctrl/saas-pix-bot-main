@@ -1,8 +1,10 @@
 // ALTERAÇÕES: removido hack `payments: undefined`, uso de select+destructuring,
 // adicionado isBlocked no retorno da listagem
+// NOVO: PATCH /:id/block-toggle — bloquear/desbloquear usuário (SUPERADMIN)
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../../lib/prisma';
+import { requireRole } from '../../middleware/auth';
 
 export const adminUsersRouter = Router();
 
@@ -102,3 +104,76 @@ adminUsersRouter.get('/:id', async (req: Request, res: Response) => {
     },
   });
 });
+
+// PATCH /api/admin/users/:id/block-toggle — SUPERADMIN only
+adminUsersRouter.patch(
+  '/:id/block-toggle',
+  requireRole('SUPERADMIN'),
+  async (req: Request, res: Response) => {
+    const user = await prisma.telegramUser.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, isBlocked: true, firstName: true },
+    });
+
+    if (!user) {
+      res.status(404).json({ success: false, error: 'Usuário não encontrado' });
+      return;
+    }
+
+    const updated = await prisma.telegramUser.update({
+      where: { id: req.params.id },
+      data: { isBlocked: !user.isBlocked },
+      select: { id: true, isBlocked: true },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        id: updated.id,
+        isBlocked: updated.isBlocked,
+        message: updated.isBlocked
+          ? `Usuário ${user.firstName ?? req.params.id} bloqueado.`
+          : `Usuário ${user.firstName ?? req.params.id} desbloqueado.`,
+      },
+    });
+  }
+);
+
+// GET /api/admin/users/export/csv — SUPERADMIN only
+adminUsersRouter.get(
+  '/export/csv',
+  requireRole('SUPERADMIN'),
+  async (_req: Request, res: Response) => {
+    const users = await prisma.telegramUser.findMany({
+      select: {
+        telegramId: true,
+        firstName: true,
+        username: true,
+        isBlocked: true,
+        createdAt: true,
+        payments: { where: { status: 'APPROVED' }, select: { amount: true } },
+        _count: { select: { orders: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const header = 'telegram_id,nome,username,total_gasto,pedidos,bloqueado,cadastrado_em';
+    const rows = users.map((u) => {
+      const totalSpent = u.payments.reduce((s, p) => s + Number(p.amount), 0);
+      return [
+        u.telegramId,
+        u.firstName ?? '',
+        u.username ? `@${u.username}` : '',
+        totalSpent.toFixed(2),
+        u._count.orders,
+        u.isBlocked ? 'sim' : 'não',
+        u.createdAt.toISOString(),
+      ].join(',');
+    });
+
+    const csv = [header, ...rows].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="usuarios.csv"');
+    res.send('\uFEFF' + csv); // BOM para Excel abrir corretamente
+  }
+);

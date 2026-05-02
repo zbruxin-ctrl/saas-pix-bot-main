@@ -3,6 +3,9 @@
 // FIX B7: idempotencyKey usa apenas externalReference SEM Date.now()
 //   → retries do mesmo pagamento retornam resposta cacheada do MP
 //   → evita criar dois PIX distintos para o mesmo pedido
+// FIX B8: buildPayerEmail remove hífens do UUID
+//   → MP rejeita hífens no local-part do email (erro 4050)
+//   → "telegram.{uuid-com-hifens}@..." → "payer{uuidsemhifens}@bot.com.br"
 
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { env } from '../config/env';
@@ -61,8 +64,12 @@ function isPublicUrl(url: string): boolean {
   }
 }
 
+// FIX B8: MP (erro 4050) rejeita hifens no local-part do email.
+// UUID tem formato xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx — removemos os hifens
+// antes de montar o email, garantindo apenas caracteres alfanuméricos + ponto.
 function buildPayerEmail(externalReference: string): string {
-  return `telegram.${externalReference}@pagador.com.br`;
+  const sanitized = externalReference.replace(/-/g, '').toLowerCase();
+  return `payer.${sanitized}@bot.com.br`;
 }
 
 function extractMpError(error: unknown): string {
@@ -110,9 +117,6 @@ class MercadoPagoService {
   }
 
   async createPixPayment(data: PixPaymentData): Promise<MercadoPagoPixResponse> {
-    // FIX B7: chave de idempotência baseada APENAS no externalReference (paymentId UUID).
-    // Assim retries do mesmo pagamento retornam a resposta cacheada do MP
-    // em vez de criar um segundo PIX para o mesmo pedido.
     const idempotencyKey = `pix_${data.externalReference}`;
 
     const requestBody: Record<string, unknown> = {
@@ -174,6 +178,17 @@ class MercadoPagoService {
       paymentDetail.status_detail === 'accredited' &&
       Math.abs(paymentDetail.transaction_amount - expectedAmount) < 0.01;
     return { isApproved, paymentDetail };
+  }
+
+  async cancelPayment(mercadoPagoId: string): Promise<void> {
+    try {
+      await this.client.put(`/v1/payments/${mercadoPagoId}`, { status: 'cancelled' });
+      logger.info(`Pagamento cancelado no MP: ${mercadoPagoId}`);
+    } catch (error) {
+      const mpError = extractMpError(error);
+      logger.warn(`Falha ao cancelar pagamento ${mercadoPagoId} no MP: ${mpError}`);
+      throw new Error(`Não foi possível cancelar o pagamento no Mercado Pago: ${mpError}`);
+    }
   }
 
   async refundPayment(mercadoPagoId: string): Promise<void> {
