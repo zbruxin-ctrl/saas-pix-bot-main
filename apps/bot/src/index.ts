@@ -193,7 +193,6 @@ bot.action(/^skip_coupon_(.+)$/, async (ctx) => {
     delete session.pendingCouponDiscount;
     session.step = 'selecting_product';
     await saveSession(ctx.from!.id, session);
-    // Volta para tela de método de pagamento sem cupom
     const products = await apiClient.getProducts();
     const product = products.find((p) => p.id === productId);
     if (!product) {
@@ -215,3 +214,175 @@ bot.action(/^remove_coupon_(.+)$/, async (ctx) => {
     const session = await getSession(userId);
     delete session.pendingCoupon;
     delete session.pendingCouponDiscount;
+    session.step = 'selecting_product';
+    await saveSession(userId, session);
+    const products = await apiClient.getProducts();
+    const product = products.find((p) => p.id === productId);
+    if (!product) {
+      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+      return;
+    }
+    await showPaymentMethodScreen(ctx, product);
+  } catch (err) {
+    captureError(err, { handler: 'remove_coupon' });
+  }
+});
+
+// ─── Actions de produto ───────────────────────────────────────────────────────
+bot.action(/^select_product_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('⏳ Carregando...').catch(() => {});
+  try {
+    const productId = ctx.match[1];
+    const userId = ctx.from!.id;
+    const products = await apiClient.getProducts();
+    const product = products.find((p: ProductDTO) => p.id === productId);
+    if (!product) {
+      await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+      return;
+    }
+    const session = await getSession(userId);
+    session.step = 'selecting_product';
+    session.pendingProductId = productId;
+    await saveSession(userId, session);
+    await showPaymentMethodScreen(ctx, product);
+  } catch (err) {
+    captureError(err, { handler: 'select_product' });
+  }
+});
+
+bot.action(/^pay_pix_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('⏳ Gerando PIX...').catch(() => {});
+  try {
+    await executePayment(ctx, ctx.match[1], 'PIX');
+  } catch (err) {
+    captureError(err, { handler: 'pay_pix' });
+  }
+});
+
+bot.action(/^pay_balance_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('⏳ Processando...').catch(() => {});
+  try {
+    await executePayment(ctx, ctx.match[1], 'BALANCE');
+  } catch (err) {
+    captureError(err, { handler: 'pay_balance' });
+  }
+});
+
+bot.action(/^pay_mixed_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery('⏳ Processando...').catch(() => {});
+  try {
+    await executePayment(ctx, ctx.match[1], 'MIXED');
+  } catch (err) {
+    captureError(err, { handler: 'pay_mixed' });
+  }
+});
+
+bot.action(/^check_payment_(.+)$/, async (ctx) => {
+  try {
+    await handleCheckPayment(ctx, ctx.match[1]);
+  } catch (err) {
+    captureError(err, { handler: 'check_payment' });
+  }
+});
+
+bot.action(/^cancel_payment_(.+)$/, async (ctx) => {
+  try {
+    await handleCancelPayment(ctx, ctx.match[1]);
+  } catch (err) {
+    captureError(err, { handler: 'cancel_payment' });
+  }
+});
+
+// ─── Mensagens de texto ───────────────────────────────────────────────────────
+bot.on(message('text'), async (ctx) => {
+  try {
+    const userId = ctx.from!.id;
+    const session = await getSession(userId).catch(emptySession);
+
+    if (session.step === 'awaiting_deposit_amount') {
+      await handleDepositAmount(ctx);
+      return;
+    }
+
+    if (session.step === 'awaiting_coupon') {
+      const productId = session.pendingProductId;
+      if (!productId) {
+        await ctx.reply('❌ Sessão inválida. Use /start para recomeçar.', { parse_mode: 'HTML' });
+        return;
+      }
+
+      const couponCode = ctx.message.text.trim().toUpperCase();
+
+      try {
+        const result = await apiClient.validateCoupon(couponCode, String(userId));
+
+        if (!result.valid || !result.data) {
+          await ctx.reply(
+            `❌ <b>Cupom inválido:</b> ${result.message ?? 'Cupom não encontrado ou expirado.'}`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        const discountAmount = Number(result.data.discountAmount ?? 0);
+        session.pendingCoupon = couponCode;
+        session.pendingCouponDiscount = discountAmount;
+        session.step = 'selecting_product';
+        await saveSession(userId, session);
+
+        const products = await apiClient.getProducts();
+        const product = products.find((p: ProductDTO) => p.id === productId);
+        if (!product) {
+          await ctx.reply('❌ Produto não encontrado.', { parse_mode: 'HTML' });
+          return;
+        }
+
+        await ctx.reply(
+          `✅ <b>Cupom aplicado!</b> Desconto de R$ ${discountAmount.toFixed(2)}`,
+          { parse_mode: 'HTML' }
+        );
+        await showPaymentMethodScreen(ctx, product);
+      } catch (err) {
+        captureError(err, { handler: 'awaiting_coupon' });
+        await ctx.reply('❌ Erro ao validar cupom. Tente novamente.', { parse_mode: 'HTML' });
+      }
+      return;
+    }
+  } catch (err) {
+    captureError(err, { handler: 'on_text' });
+    console.error('[on:text] Erro inesperado:', err);
+  }
+});
+
+// ─── Webhook / Polling ────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+
+if (env.WEBHOOK_URL) {
+  const webhookPath = `/webhook/${env.TELEGRAM_BOT_TOKEN}`;
+  app.use(bot.webhookCallback(webhookPath));
+
+  const port = Number(process.env.PORT ?? 3000);
+  app.listen(port, async () => {
+    const webhookUrl = `${env.WEBHOOK_URL}${webhookPath}`;
+    await bot.telegram.setWebhook(webhookUrl);
+    console.info(`[bot] Webhook registrado: ${webhookUrl}`);
+    console.info(`[bot] Servidor ouvindo na porta ${port}`);
+  });
+
+  // Health check
+  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+  // Invalidação de cache via webhook interno
+  app.post('/internal/invalidate-cache', (req, res) => {
+    const { type } = req.body ?? {};
+    if (type === 'products') invalidateProductCache();
+    if (type === 'bot-config') invalidateBotConfigCache();
+    res.json({ ok: true });
+  });
+} else {
+  bot.launch().then(() => console.info('[bot] Bot iniciado em modo polling'));
+}
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
