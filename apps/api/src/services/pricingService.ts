@@ -4,6 +4,7 @@
 //   applyPricing, commitCouponUse, commitReferral, payReferralReward, CouponError
 // FIX-TYPES: callbacks de payReferralReward com tipos explícitos (L837/854/872)
 // FIX-BUILD: corrige campos Referral (referredId @unique, rewardPaid em vez de rewarded)
+// FIX-ZERO-COUPON: bloqueia cupom que resulte em valor zero ou negativo
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 
@@ -183,6 +184,13 @@ export async function applyPricing(params: ApplyPricingParams): Promise<ApplyPri
     }
 
     afterCoupon = parseFloat((afterTier - couponDiscountAmount).toFixed(2));
+
+    // FIX-ZERO-COUPON: bloqueia cupom que cubra 100% do valor — não é possível
+    // gerar PIX de R$ 0,00. Cupons de desconto total não são suportados.
+    if (afterCoupon <= 0) {
+      throw new CouponError('Este cupom não pode cobrir 100% do valor do pedido.');
+    }
+
     couponId = coupon.id;
     couponCode_out = coupon.code;
   }
@@ -200,7 +208,7 @@ export async function applyPricing(params: ApplyPricingParams): Promise<ApplyPri
     }
   }
 
-  const finalAmount = Math.max(0.01, afterCoupon); // mínimo R$ 0,01
+  const finalAmount = parseFloat(afterCoupon.toFixed(2));
   const discountAmount = parseFloat((originalAmount - finalAmount).toFixed(2));
 
   return {
