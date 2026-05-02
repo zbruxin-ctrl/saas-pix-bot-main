@@ -14,6 +14,7 @@
  * FIX ITEM-11: saveSession desnecessário removido de select_product.
  * FEAT-SUPPORT: showHelp busca supportPhone via apiClient.getBotConfig() (painel admin).
  * FIX-WELCOME: showHome busca welcomeMessage via apiClient.getBotConfig() (painel admin).
+ * FIX-MD2HTML: welcomeMessage convertida de Markdown para HTML antes de exibir.
  */
 import { Telegraf, Markup } from 'telegraf';
 import type { Context } from 'telegraf';
@@ -53,6 +54,26 @@ async function getBotUsername(): Promise<string> {
   return cachedBotUsername;
 }
 
+// ─── Markdown → HTML helper ───────────────────────────────────────────────────
+// Converte subset básico de Markdown (negrito, itálico, código, links) para HTML.
+// Necessário pois o painel admin salva a mensagem com Markdown mas o bot usa parse_mode HTML.
+function mdToHtml(text: string): string {
+  return text
+    // Escapa caracteres HTML antes de inserir tags (evita double-encode)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    // **negrito** → <b>negrito</b>
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    // *itálico* ou _itálico_ → <i>itálico</i>
+    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<i>$1</i>')
+    .replace(/_(.*?)_/g, '<i>$1</i>')
+    // `código` → <code>código</code>
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // [texto](url) → <a href="url">texto</a>
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+}
+
 // ─── showHome ─────────────────────────────────────────────────────────────────
 
 const DEFAULT_WELCOME =
@@ -60,15 +81,16 @@ const DEFAULT_WELCOME =
   '💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo pré-carregado</b>.';
 
 async function showHome(ctx: Context): Promise<void> {
-  // FIX-WELCOME: lê welcomeMessage do banco via getBotConfig(); cai no padrão se vazio
   const config = await apiClient.getBotConfig().catch(() => ({ welcomeMessage: '' }));
-  const welcomeMsg = config.welcomeMessage?.trim() || DEFAULT_WELCOME;
+  // Converte Markdown → HTML caso o admin tenha digitado com formatação Markdown
+  const rawMsg = config.welcomeMessage?.trim();
+  const welcomeMsg = rawMsg ? mdToHtml(rawMsg) : DEFAULT_WELCOME;
 
   const firstName = ctx.from?.first_name ?? 'visitante';
   const text =
     `👋 Olá, <b>${firstName}</b>! Bem-vindo!\n\n` +
     `${welcomeMsg}\n\n` +
-    `Para ver nossos produtos, clique no botão abaixo:`;
+    `Escolha uma opção no <b>menu</b> para começar:\n\nPara ver nossos produtos, clique no botão abaixo:`;
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
