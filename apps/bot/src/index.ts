@@ -60,7 +60,7 @@ const DEFAULT_WELCOME =
   '💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo pré-carregado</b>.';
 
 async function showHome(ctx: Context): Promise<void> {
-  // FIX-WELCOME: lê welcome_message do painel admin; cai no padrão se vazio
+  // FIX-WELCOME: lê welcomeMessage do banco via getBotConfig(); cai no padrão se vazio
   const config = await apiClient.getBotConfig().catch(() => ({ welcomeMessage: '' }));
   const welcomeMsg = config.welcomeMessage?.trim() || DEFAULT_WELCOME;
 
