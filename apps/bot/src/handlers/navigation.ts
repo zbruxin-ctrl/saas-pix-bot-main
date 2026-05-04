@@ -6,6 +6,8 @@
  *   duplicação de editMessageText + sendMessage + atualização manual de mainMessageId.
  * FIX-ESCAPEHTML-NUMERIC: escapeHtml() removido de valores numéricos/datas
  *   gerados por toLocaleDateString/toFixed em showOrders.
+ * FIX-WELCOME-PANEL: showHome agora usa welcomeMessage do painel (getBotConfig)
+ *   em vez de texto hardcoded. Fallback para texto padrão se vier vazio.
  */
 import { Context, Markup } from 'telegraf';
 import { escapeHtml } from '../utils/escape';
@@ -15,27 +17,52 @@ import { apiClient } from '../services/apiClient';
 import { env } from '../config/env';
 import type { OrderSummary } from '../services/apiClient';
 
+/** Converte Markdown simples (**b**, *i*, _i_, `code`) para HTML do Telegram */
+function mdToHtml(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/\*(.+?)\*/g,   '<i>$1</i>')
+    .replace(/_(.+?)_/g,     '<i>$1</i>')
+    .replace(/`(.+?)`/g,     '<code>$1</code>')
+    .replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+}
+
 // ─── Home ──────────────────────────────────────────────────────────────────────────────────────────
 
 export async function showHome(ctx: Context): Promise<void> {
-  const userId = ctx.from!.id;
-  const session = await getSession(userId);
+  const userId    = ctx.from!.id;
+  const session   = await getSession(userId);
   const firstName = escapeHtml(ctx.from?.first_name || session.firstName || 'visitante');
 
-  const text =
-    `👋 Olá, <b>${firstName}</b>! Bem-vindo!\n\n` +
-    `🛒 Aqui você pode adquirir nossos produtos de forma rápida e segura.\n\n` +
-    `💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo</b> pré-carregado.\n\n` +
-    `Para ver nossos produtos, clique no botão abaixo:`;
+  // Busca configuração do painel (welcomeMessage + estado de manutenção)
+  const config = await apiClient.getBotConfig(String(userId)).catch(() => null);
+  const rawWelcome = config?.welcomeMessage?.trim() ?? '';
+
+  let text: string;
+
+  if (rawWelcome) {
+    // Substitui {nome} / {name} pelo primeiro nome do usuário e converte MD→HTML
+    const personalized = rawWelcome
+      .replace(/\{nome\}/gi, firstName)
+      .replace(/\{name\}/gi, firstName);
+    text = mdToHtml(personalized);
+  } else {
+    // Fallback: texto padrão caso o painel não tenha mensagem configurada
+    text =
+      `👋 Olá, <b>${firstName}</b>! Bem-vindo!\n\n` +
+      `🛒 Aqui você pode adquirir nossos produtos de forma rápida e segura.\n\n` +
+      `💳 Aceitamos pagamento via <b>PIX</b> (confirmação instantânea) ou via <b>saldo</b> pré-carregado.\n\n` +
+      `Para ver nossos produtos, clique no botão abaixo:`;
+  }
 
   await editOrReply(ctx, text, {
     parse_mode: 'HTML',
     reply_markup: Markup.inlineKeyboard([
-      [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
-      [Markup.button.callback('💰 Meu Saldo', 'show_balance')],
-      [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+      [Markup.button.callback('🛒 Ver Produtos',    'show_products')],
+      [Markup.button.callback('💰 Meu Saldo',       'show_balance')],
+      [Markup.button.callback('📦 Meus Pedidos',    'show_orders')],
       [Markup.button.callback('🎁 Indique e Ganhe', 'show_referral')],
-      [Markup.button.callback('❓ Ajuda', 'show_help')],
+      [Markup.button.callback('❓ Ajuda',           'show_help')],
     ]).reply_markup,
   });
 }
@@ -43,9 +70,9 @@ export async function showHome(ctx: Context): Promise<void> {
 // ─── Produtos ────────────────────────────────────────────────────────────────────────────────────
 
 export async function showProducts(ctx: Context): Promise<void> {
-  const userId = ctx.from!.id;
+  const userId  = ctx.from!.id;
   const session = await getSession(userId);
-  session.step = 'idle';
+  session.step  = 'idle';
   await saveSession(userId, session);
 
   try {
@@ -60,7 +87,7 @@ export async function showProducts(ctx: Context): Promise<void> {
     }
 
     const buttons = products.map((p) => {
-      const esgotado = p.stock != null && p.stock <= 0;
+      const esgotado   = p.stock != null && p.stock <= 0;
       const stockLabel = esgotado
         ? ' [ESGOTADO]'
         : p.stock != null
@@ -81,7 +108,7 @@ export async function showProducts(ctx: Context): Promise<void> {
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Tentar Novamente', 'show_products')],
-        [Markup.button.callback('◀️ Voltar', 'show_home')],
+        [Markup.button.callback('◀️ Voltar',           'show_home')],
       ]).reply_markup,
     });
   }
@@ -102,7 +129,7 @@ export async function showOrders(ctx: Context): Promise<void> {
           parse_mode: 'HTML',
           reply_markup: Markup.inlineKeyboard([
             [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
-            [Markup.button.callback('◀️ Voltar', 'show_home')],
+            [Markup.button.callback('◀️ Voltar',       'show_home')],
           ]).reply_markup,
         }
       );
@@ -110,28 +137,24 @@ export async function showOrders(ctx: Context): Promise<void> {
     }
 
     const statusEmoji: Record<string, string> = {
-      DELIVERED: '✅',
-      PENDING: '⏳',
-      FAILED: '❌',
+      DELIVERED:  '✅',
+      PENDING:    '⏳',
+      FAILED:     '❌',
       PROCESSING: '🔄',
-      CANCELLED: '🚫',
+      CANCELLED:  '🚫',
     };
 
-    // FIX-ESCAPEHTML-NUMERIC: date e valor são gerados por toLocaleDateString/toFixed
-    // — nunca contêm caracteres especiais HTML, escapeHtml() desnecessário.
     const lines = orders.slice(0, 10).map((o: OrderSummary) => {
-      const emoji = statusEmoji[o.status] ?? '📦';
-      const date = new Date(o.createdAt).toLocaleDateString('pt-BR', {
-        day: '2-digit',
-        month: '2-digit',
-        year: '2-digit',
+      const emoji  = statusEmoji[o.status] ?? '📦';
+      const date   = new Date(o.createdAt).toLocaleDateString('pt-BR', {
+        day: '2-digit', month: '2-digit', year: '2-digit',
         timeZone: 'America/Sao_Paulo',
       });
-      const valor = o.amount != null ? ` · R$ ${Number(o.amount).toFixed(2)}` : '';
+      const valor  = o.amount != null ? ` · R$ ${Number(o.amount).toFixed(2)}` : '';
       const metodo =
         o.paymentMethod === 'BALANCE' ? ' · 💰 Saldo'
         : o.paymentMethod === 'MIXED' ? ' · 🔀 Misto'
-        : o.paymentMethod === 'PIX' ? ' · 📱 PIX'
+        : o.paymentMethod === 'PIX'   ? ' · 📱 PIX'
         : '';
       return `${emoji} <b>${escapeHtml(o.productName)}</b> — ${date}${valor}${metodo}`;
     });
@@ -150,7 +173,7 @@ export async function showOrders(ctx: Context): Promise<void> {
       parse_mode: 'HTML',
       reply_markup: Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Tentar Novamente', 'show_orders')],
-        [Markup.button.callback('◀️ Voltar', 'show_home')],
+        [Markup.button.callback('◀️ Voltar',           'show_home')],
       ]).reply_markup,
     });
   }
@@ -188,8 +211,6 @@ export async function showHelp(ctx: Context): Promise<void> {
       ]
     : [[Markup.button.callback('◀️ Voltar', 'show_home')]];
 
-  // FIX-SHOWHELP-EDITORRELY: usa editOrReply em vez de reimplementar
-  // editMessageText + sendMessage + atualização manual de mainMessageId.
   await editOrReply(ctx, text, {
     parse_mode: 'HTML',
     reply_markup: Markup.inlineKeyboard(buttons).reply_markup,
@@ -206,16 +227,16 @@ export async function showBlockedMessage(ctx: Context): Promise<void> {
   const buttons = env.SUPPORT_PHONE
     ? [
         [Markup.button.url('📞 Falar com Suporte', supportUrl)],
-        [Markup.button.callback('💰 Ver Saldo', 'show_balance')],
-        [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+        [Markup.button.callback('💰 Ver Saldo',       'show_balance')],
+        [Markup.button.callback('📦 Meus Pedidos',    'show_orders')],
         [Markup.button.callback('🎁 Indique e Ganhe', 'show_referral')],
-        [Markup.button.callback('❓ Ajuda', 'show_help')],
+        [Markup.button.callback('❓ Ajuda',           'show_help')],
       ]
     : [
-        [Markup.button.callback('💰 Ver Saldo', 'show_balance')],
-        [Markup.button.callback('📦 Meus Pedidos', 'show_orders')],
+        [Markup.button.callback('💰 Ver Saldo',       'show_balance')],
+        [Markup.button.callback('📦 Meus Pedidos',    'show_orders')],
         [Markup.button.callback('🎁 Indique e Ganhe', 'show_referral')],
-        [Markup.button.callback('❓ Ajuda', 'show_help')],
+        [Markup.button.callback('❓ Ajuda',           'show_help')],
       ];
 
   await editOrReply(

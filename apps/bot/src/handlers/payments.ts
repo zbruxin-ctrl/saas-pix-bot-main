@@ -11,12 +11,15 @@
  * FEAT-MULTILINE: deliveryContent preserva quebras de linha (\n) no HTML.
  * FIX-BALANCE-DELIVERY: pagamento por saldo agora passa deliveryContent e
  *                        confirmationMessage retornados pela API para buildDeliveryMessage.
+ * FIX-PIX-TIMER: schedulePIXExpiry agora persiste a expiração no Redis via
+ *                persistPixExpiry() para sobreviver a redeploys.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
 import { getSession, saveSession, clearSession, markCouponUsed } from '../services/session';
-import { acquireLock, releaseLock } from '../services/locks';
+import { acquireLock, releaseLock, cancelPIXTimer, registerPIXTimer } from '../services/locks';
 import { applyCoupon } from '../services/couponClient';
+import { persistPixExpiry, clearPixExpiry } from '../services/pixExpiry';
 
 type ProductDTO = Awaited<ReturnType<typeof apiClient.getProducts>>[number];
 
@@ -34,6 +37,15 @@ function escapeMarkdownV2(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, '\\$&');
 }
 
+/** Extrai um campo string opcional de qualquer objeto, sem erros de tipo. */
+function strField(obj: unknown, key: string): string | null {
+  if (obj && typeof obj === 'object' && key in (obj as object)) {
+    const val = (obj as Record<string, unknown>)[key];
+    return typeof val === 'string' ? val : null;
+  }
+  return null;
+}
+
 /**
  * Substitui placeholders {chave} pelos valores de um objeto JSON.
  * Seguro para HTML: escapa os valores antes de inserir.
@@ -45,36 +57,18 @@ function applyJsonVars(template: string, vars: Record<string, string>): string {
   });
 }
 
-/**
- * Tenta parsear o conteúdo entregue como JSON de conta.
- * Retorna o objeto se for JSON válido com chaves string, ou null caso contrário.
- */
 function parseAccountJson(content: string): Record<string, string> | null {
   try {
     const obj = JSON.parse(content.trim());
     if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
       const result: Record<string, string> = {};
-      for (const [k, v] of Object.entries(obj)) {
-        result[k] = String(v);
-      }
+      for (const [k, v] of Object.entries(obj)) result[k] = String(v);
       return result;
     }
   } catch {}
   return null;
 }
 
-/** Extrai um campo string opcional de qualquer objeto, sem erros de tipo. */
-function strField(obj: unknown, key: string): string | null {
-  if (obj && typeof obj === 'object' && key in (obj as object)) {
-    const val = (obj as Record<string, unknown>)[key];
-    return typeof val === 'string' ? val : null;
-  }
-  return null;
-}
-
-/**
- * Tenta editar a mensagem atual (se vier de callback) ou envia nova mensagem.
- */
 async function editOrReply(
   ctx: Context,
   text: string,
@@ -95,63 +89,27 @@ export function initPaymentHandlers(): void {
   // placeholder — handlers registrados no index.ts
 }
 
-// ─── PIX timers ──────────────────────────────────────────────────────────────
+// ─── Helpers de entrega ───────────────────────────────────────────────────────
 
-const pixTimers = new Map<number, ReturnType<typeof setTimeout>>();
-
-function registerPIXTimer(userId: number, t: ReturnType<typeof setTimeout>): void {
-  cancelPIXTimer(userId);
-  pixTimers.set(userId, t);
-}
-
-export function cancelPIXTimer(userId: number): void {
-  const existing = pixTimers.get(userId);
-  if (existing !== undefined) {
-    clearTimeout(existing);
-    pixTimers.delete(userId);
-  }
-}
-
-// ─── Helpers de entrega ──────────────────────────────────────────────────────
-
-/**
- * Monta a mensagem de entrega enviada ao usuário após pagamento aprovado.
- *
- * Se deliveryContent for um JSON de conta (ACCOUNT), substitui os placeholders
- * {chave} tanto no bloco de conteúdo quanto na confirmationMessage.
- *
- * Quebras de linha no deliveryContent são preservadas via <br> ou \n no <pre>.
- */
 function buildDeliveryMessage(
   productName: string,
   deliveryContent?: string | null,
   confirmationMessage?: string | null
 ): string {
   const header = `✅ <b>Pagamento confirmado!</b>\n\n📦 <b>${escapeHtml(productName)}</b>\n`;
-
-  // Tenta interpretar o conteúdo como JSON de conta (modo ACCOUNT)
   const accountVars = deliveryContent ? parseAccountJson(deliveryContent.trim()) : null;
 
-  // Se temos uma confirmationMessage personalizada, ela tem prioridade
   if (confirmationMessage && confirmationMessage.trim()) {
     let msg = confirmationMessage.trim();
-
-    // Substitui placeholders JSON se for ACCOUNT
     if (accountVars) {
       msg = applyJsonVars(msg, accountVars);
     } else {
-      // Escapa HTML na mensagem normal
       msg = escapeHtml(msg);
     }
-
-    // Converte \n em quebras para HTML
     const msgHtml = msg.replace(/\n/g, '\n');
-
-    // Bloco de conteúdo bruto (opcional, abaixo da msg personalizada)
     let contentBlock = '';
     if (deliveryContent && deliveryContent.trim()) {
       if (accountVars) {
-        // Exibe os campos do JSON linha a linha
         const lines = Object.entries(accountVars)
           .map(([k, v]) => `<b>${escapeHtml(k)}:</b> <code>${escapeHtml(v)}</code>`)
           .join('\n');
@@ -160,14 +118,11 @@ function buildDeliveryMessage(
         contentBlock = `\n\n📄 <b>Conteúdo:</b>\n<pre>${escapeHtml(deliveryContent.trim())}</pre>`;
       }
     }
-
     return header + `\n${msgHtml}` + contentBlock + '\n\n<i>Guarde essa mensagem em local seguro.</i>';
   }
 
-  // Sem confirmationMessage — usa layout padrão
   if (deliveryContent && deliveryContent.trim().length > 0) {
     if (accountVars) {
-      // Modo ACCOUNT: exibe campos linha a linha
       const lines = Object.entries(accountVars)
         .map(([k, v]) => `<b>${escapeHtml(k)}:</b> <code>${escapeHtml(v)}</code>`)
         .join('\n');
@@ -177,8 +132,6 @@ function buildDeliveryMessage(
         `<i>Guarde essa mensagem em local seguro.</i>`
       );
     }
-
-    // TEXT / LINK — preserva quebras de linha
     return (
       header +
       `\n🎁 <b>Seu produto:</b>\n` +
@@ -209,16 +162,16 @@ export async function showQuantityScreen(
   ctx: Context,
   product: ProductDTO
 ): Promise<void> {
-  const userId = ctx.from!.id;
+  const userId  = ctx.from!.id;
   const session = await getSession(userId);
-  session.step = 'awaiting_quantity';
+  session.step             = 'awaiting_quantity';
   session.pendingProductId = product.id;
-  session.pendingQty = undefined;
+  session.pendingQty       = undefined;
   await saveSession(userId, session);
 
   const effectiveStock = product.availableStock ?? product.stock;
   const maxStock = effectiveStock != null ? effectiveStock : Infinity;
-  const maxQty = Math.min(maxStock, 10);
+  const maxQty   = Math.min(maxStock, 10);
 
   if (maxQty <= 0) {
     await editOrReply(
@@ -234,8 +187,7 @@ export async function showQuantityScreen(
     return;
   }
 
-  const descLine = product.description
-    ? `\n📝 <i>${escapeHtml(product.description)}</i>` : '';
+  const descLine  = product.description ? `\n📝 <i>${escapeHtml(product.description)}</i>` : '';
   const stockLine = effectiveStock != null && effectiveStock <= 5
     ? `\n⚠️ <b>Apenas ${effectiveStock} em estoque!</b>` : '';
 
@@ -244,10 +196,7 @@ export async function showQuantityScreen(
   for (let i = 1; i <= maxQty; i++) {
     const unitTotal = (Number(product.price) * i).toFixed(2);
     row.push(Markup.button.callback(`${i}x — R$ ${unitTotal}`, `set_qty_${product.id}_${i}`));
-    if (row.length === 3 || i === maxQty) {
-      qtyRows.push([...row]);
-      row = [];
-    }
+    if (row.length === 3 || i === maxQty) { qtyRows.push([...row]); row = []; }
   }
   qtyRows.push([Markup.button.callback('◀️ Voltar', 'show_products')]);
 
@@ -263,79 +212,59 @@ export async function showQuantityScreen(
   );
 }
 
-// ─── Tela de método de pagamento ─────────────────────────────────────────────
+// ─── Tela de método de pagamento ──────────────────────────────────────────────
 
 export async function showPaymentMethodScreen(
   ctx: Context,
   product: ProductDTO,
   balance: number
 ): Promise<void> {
-  const userId = ctx.from!.id;
+  const userId  = ctx.from!.id;
   const session = await getSession(userId);
-  const rawPrice = Number(product.price);
+  const rawPrice      = Number(product.price);
   const couponDiscount = session.pendingCouponDiscount ?? 0;
-  const qty = session.pendingQty ?? 1;
-  const unitPrice = Math.max(0, rawPrice - couponDiscount);
-  const price = unitPrice * qty;
+  const qty            = session.pendingQty ?? 1;
+  const unitPrice      = Math.max(0, rawPrice - couponDiscount);
+  const price          = unitPrice * qty;
 
-  const descLine = product.description
-    ? `\n📝 <i>${escapeHtml(product.description)}</i>\n` : '';
-
+  const descLine  = product.description ? `\n📝 <i>${escapeHtml(product.description)}</i>\n` : '';
   const effectiveStock = product.availableStock ?? product.stock;
   const stockLine = (() => {
     if (effectiveStock == null) return '';
-    if (effectiveStock <= 0) return `\n⚠️ <b>Esgotado!</b>`;
-    if (effectiveStock <= 5) return `\n⚠️ <b>Apenas ${effectiveStock} em estoque!</b>`;
+    if (effectiveStock <= 0)   return `\n⚠️ <b>Esgotado!</b>`;
+    if (effectiveStock <= 5)   return `\n⚠️ <b>Apenas ${effectiveStock} em estoque!</b>`;
     return '';
   })();
-
   const couponLine = session.pendingCoupon
     ? `\n🏷️ <b>Cupom:</b> <code>${escapeHtml(session.pendingCoupon)}</code> (-R$ ${couponDiscount.toFixed(2)})` : '';
-
-  const qtyLine = qty > 1
-    ? `\n🔢 <b>Quantidade:</b> ${qty}x` : '';
+  const qtyLine = qty > 1 ? `\n🔢 <b>Quantidade:</b> ${qty}x` : '';
 
   const canPayBalance = balance >= price;
   const canPayMixed   = balance > 0 && balance < price;
 
   const buttons: ReturnType<typeof Markup.button.callback>[][] = [];
-
-  buttons.push([
-    Markup.button.callback(
-      `💳 PIX — R$ ${price.toFixed(2)}`,
-      `pay_pix_${product.id}`
-    ),
-  ]);
+  buttons.push([Markup.button.callback(`💳 PIX — R$ ${price.toFixed(2)}`, `pay_pix_${product.id}`)]);
 
   if (canPayBalance) {
-    buttons.push([
-      Markup.button.callback(
-        `💰 Saldo (R$ ${balance.toFixed(2)}) — Pagar R$ ${price.toFixed(2)}`,
-        `pay_balance_${product.id}`
-      ),
-    ]);
+    buttons.push([Markup.button.callback(
+      `💰 Saldo (R$ ${balance.toFixed(2)}) — Pagar R$ ${price.toFixed(2)}`,
+      `pay_balance_${product.id}`
+    )]);
   }
 
   if (canPayMixed) {
     const pixPart = (price - balance).toFixed(2);
-    buttons.push([
-      Markup.button.callback(
-        `🔀 Misto — Saldo R$ ${balance.toFixed(2)} + PIX R$ ${pixPart}`,
-        `pay_mixed_${product.id}`
-      ),
-    ]);
+    buttons.push([Markup.button.callback(
+      `🔀 Misto — Saldo R$ ${balance.toFixed(2)} + PIX R$ ${pixPart}`,
+      `pay_mixed_${product.id}`
+    )]);
   }
 
   if (!session.pendingCoupon) {
-    buttons.push([
-      Markup.button.callback('🏷️ Usar Cupom', `coupon_input_${product.id}`),
-    ]);
+    buttons.push([Markup.button.callback('🏷️ Usar Cupom', `coupon_input_${product.id}`)]);
   } else {
-    buttons.push([
-      Markup.button.callback('❌ Remover Cupom', `remove_coupon_${product.id}`),
-    ]);
+    buttons.push([Markup.button.callback('❌ Remover Cupom', `remove_coupon_${product.id}`)]);
   }
-
   buttons.push([Markup.button.callback('◀️ Voltar', `select_product_${product.id}`)]);
 
   await editOrReply(
@@ -356,9 +285,9 @@ export async function showCouponInputScreen(
   ctx: Context,
   productId: string
 ): Promise<void> {
-  const userId = ctx.from!.id;
+  const userId  = ctx.from!.id;
   const session = await getSession(userId);
-  session.step = 'awaiting_coupon';
+  session.step             = 'awaiting_coupon';
   session.pendingProductId = productId;
   await saveSession(userId, session);
 
@@ -390,9 +319,9 @@ export async function executePayment(
   }
 
   try {
-    const session = await getSession(userId);
-    const firstName = ctx.from!.first_name;
-    const username  = ctx.from!.username;
+    const session       = await getSession(userId);
+    const firstName     = ctx.from!.first_name;
+    const username      = ctx.from!.username;
     const pendingCoupon = session.pendingCoupon ?? undefined;
 
     await editOrReply(ctx, '⏳ <b>Processando pagamento...</b>', { parse_mode: 'HTML' });
@@ -408,32 +337,22 @@ export async function executePayment(
     });
 
     if (pendingCoupon && payment.paymentId) {
-      try {
-        await applyCoupon(pendingCoupon, String(userId), payment.paymentId);
-      } catch {
-        // não bloqueia a compra
-      }
+      try { await applyCoupon(pendingCoupon, String(userId), payment.paymentId); } catch { /* não bloqueia */ }
     }
 
     if (payment.paidWithBalance) {
       if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
       await clearSession(userId, firstName);
-
-      // Cast seguro via unknown para extrair campos extras da resposta da API
       const deliveryContent     = strField(payment, 'deliveryContent');
       const confirmationMessage = strField(payment, 'confirmationMessage');
-
       await ctx.reply(
         buildDeliveryMessage(payment.productName ?? productId, deliveryContent, confirmationMessage),
-        {
-          parse_mode: 'HTML',
-          reply_markup: afterPurchaseKeyboard(productId).reply_markup,
-        }
+        { parse_mode: 'HTML', reply_markup: afterPurchaseKeyboard(productId).reply_markup }
       );
       return;
     }
 
-    // PIX ou MIXED — aguarda confirmação
+    // PIX ou MIXED
     const expiresAt = payment.expiresAt ?? new Date(Date.now() + 30 * 60 * 1000).toISOString();
     const qrText    = payment.pixQrCodeText ?? '';
     const qrImage   = payment.pixQrCode ?? '';
@@ -497,27 +416,19 @@ export async function handleCheckPayment(
   try {
     const userId    = ctx.from!.id;
     const firstName = ctx.from!.first_name;
-    const status = await apiClient.getPaymentStatus(paymentId, String(userId));
+    const status    = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'APPROVED') {
       cancelPIXTimer(userId);
+      await clearPixExpiry(userId);
       await clearSession(userId, firstName);
-
       const confirmationMessage = strField(status, 'confirmationMessage');
       const deliveryContent     = strField(status, 'deliveryContent')
                                     ?? (status.deliveryContent as string | undefined)
                                     ?? null;
-
       await ctx.reply(
-        buildDeliveryMessage(
-          status.productName ?? 'seu produto',
-          deliveryContent,
-          confirmationMessage
-        ),
-        {
-          parse_mode: 'HTML',
-          reply_markup: afterPurchaseKeyboard().reply_markup,
-        }
+        buildDeliveryMessage(status.productName ?? 'seu produto', deliveryContent, confirmationMessage),
+        { parse_mode: 'HTML', reply_markup: afterPurchaseKeyboard().reply_markup }
       );
       return;
     }
@@ -555,20 +466,14 @@ export async function handleCancelPayment(
   try {
     const userId    = ctx.from!.id;
     const firstName = ctx.from!.first_name;
-    const result = await apiClient.cancelPayment(paymentId, String(userId));
+    const result    = await apiClient.cancelPayment(paymentId, String(userId));
     cancelPIXTimer(userId);
+    await clearPixExpiry(userId);
     await clearSession(userId, firstName);
-
     if (result.cancelled) {
-      await ctx.reply(
-        `✅ PIX cancelado com sucesso. Use /produtos para fazer um novo pedido.`,
-        { parse_mode: 'HTML' }
-      );
+      await ctx.reply(`✅ PIX cancelado com sucesso. Use /produtos para fazer um novo pedido.`, { parse_mode: 'HTML' });
     } else {
-      await ctx.reply(
-        `⚠️ ${escapeHtml(result.message ?? 'Não foi possível cancelar o pagamento.')}`,
-        { parse_mode: 'HTML' }
-      );
+      await ctx.reply(`⚠️ ${escapeHtml(result.message ?? 'Não foi possível cancelar o pagamento.')}`, { parse_mode: 'HTML' });
     }
   } catch (err) {
     console.error('[handleCancelPayment] erro:', err);
@@ -587,12 +492,16 @@ export async function schedulePIXExpiry(
   const ms = new Date(expiresAt).getTime() - Date.now();
   if (ms <= 0) return;
 
+  // FIX-PIX-TIMER: persiste no Redis para sobreviver a redeploys
+  await persistPixExpiry(userId, paymentId, expiresAt);
+
   const timer = setTimeout(async () => {
     try {
       const session = await getSession(userId);
       if (session.paymentId !== paymentId) return;
       const firstName = session.firstName ?? '';
       cancelPIXTimer(userId);
+      await clearPixExpiry(userId);
       await clearSession(userId, firstName);
       await ctx.reply(
         `⏰ <b>PIX expirado!</b>\n\nSeu PIX expirou. Use /produtos para gerar um novo pedido.`,
