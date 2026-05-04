@@ -9,6 +9,8 @@
  *                    do JSON do item ACCOUNT entregue. A confirmationMessage do
  *                    produto também recebe os mesmos placeholders.
  * FEAT-MULTILINE: deliveryContent preserva quebras de linha (\n) no HTML.
+ * FIX-BALANCE-DELIVERY: pagamento por saldo agora passa deliveryContent e
+ *                        confirmationMessage retornados pela API para buildDeliveryMessage.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -408,11 +410,13 @@ export async function executePayment(
       if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
       await clearSession(userId, firstName);
 
-      // Busca a confirmationMessage do produto (se disponível via payment)
-      const confirmMsg = (payment as Record<string, unknown>).confirmationMessage as string | undefined;
+      // Extrai deliveryContent e confirmationMessage do retorno da API
+      const paymentData        = payment as Record<string, unknown>;
+      const deliveryContent    = (paymentData.deliveryContent    as string | undefined) ?? null;
+      const confirmationMessage = (paymentData.confirmationMessage as string | undefined) ?? null;
 
       await ctx.reply(
-        buildDeliveryMessage(payment.productName ?? productId, null, confirmMsg),
+        buildDeliveryMessage(payment.productName ?? productId, deliveryContent, confirmationMessage),
         {
           parse_mode: 'HTML',
           reply_markup: afterPurchaseKeyboard(productId).reply_markup,
@@ -491,14 +495,17 @@ export async function handleCheckPayment(
       cancelPIXTimer(userId);
       await clearSession(userId, firstName);
 
-      // Tenta pegar confirmationMessage do status (se a API retornar)
-      const confirmMsg = (status as Record<string, unknown>).confirmationMessage as string | undefined;
+      const statusData         = status as Record<string, unknown>;
+      const confirmationMessage = (statusData.confirmationMessage as string | undefined) ?? null;
+      const deliveryContent    = (statusData.deliveryContent    as string | undefined)
+                                  ?? (status.deliveryContent as string | undefined)
+                                  ?? null;
 
       await ctx.reply(
         buildDeliveryMessage(
           status.productName ?? 'seu produto',
-          status.deliveryContent,
-          confirmMsg
+          deliveryContent,
+          confirmationMessage
         ),
         {
           parse_mode: 'HTML',
