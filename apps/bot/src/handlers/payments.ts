@@ -5,17 +5,10 @@
  * PADRÃO: parse_mode HTML em mensagens de texto.
  *         parse_mode MarkdownV2 APENAS em captions de replyWithPhoto.
  *
- * TIPAGEM: todas as funções exportadas recebem Context (telegraf) —
- *          BotContext é apenas alias para Context; NarrowedContext nos handlers
- *          de ação é feito pelo Telegraf automaticamente ao registrar bot.action.
- *          Aqui aceitamos Context genérico pois as funções são chamadas tanto
- *          de bot.action quanto de bot.command.
- *
- * VARREDURA-FIX #10: showQuantityScreen usa availableStock (já descontado de reservas)
- *                    em vez de product.stock bruto.
- * FIX #1: markCouponUsed chamado com (userId, couponCode) — assinatura correta.
- * FIX #2: releaseLock recebe o token UUID retornado por acquireLock.
- * FIX #8: applyCoupon chamado após createPayment quando há cupom pendente.
+ * FEAT-ACCOUNT-VARS: buildDeliveryMessage agora substitui {chave} pelos valores
+ *                    do JSON do item ACCOUNT entregue. A confirmationMessage do
+ *                    produto também recebe os mesmos placeholders.
+ * FEAT-MULTILINE: deliveryContent preserva quebras de linha (\n) no HTML.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -40,9 +33,36 @@ function escapeMarkdownV2(text: string): string {
 }
 
 /**
+ * Substitui placeholders {chave} pelos valores de um objeto JSON.
+ * Seguro para HTML: escapa os valores antes de inserir.
+ */
+function applyJsonVars(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{([^}]+)\}/g, (match, key: string) => {
+    const val = vars[key];
+    return val !== undefined ? escapeHtml(String(val)) : match;
+  });
+}
+
+/**
+ * Tenta parsear o conteúdo entregue como JSON de conta.
+ * Retorna o objeto se for JSON válido com chaves string, ou null caso contrário.
+ */
+function parseAccountJson(content: string): Record<string, string> | null {
+  try {
+    const obj = JSON.parse(content.trim());
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      const result: Record<string, string> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        result[k] = String(v);
+      }
+      return result;
+    }
+  } catch {}
+  return null;
+}
+
+/**
  * Tenta editar a mensagem atual (se vier de callback) ou envia nova mensagem.
- * Silencia o erro "message is not modified" do Telegram (400 com essa descrição)
- * e qualquer outro erro de edição — nesse caso cai no reply normal.
  */
 async function editOrReply(
   ctx: Context,
@@ -83,13 +103,71 @@ export function cancelPIXTimer(userId: number): void {
 
 // ─── Helpers de entrega ──────────────────────────────────────────────────────
 
+/**
+ * Monta a mensagem de entrega enviada ao usuário após pagamento aprovado.
+ *
+ * Se deliveryContent for um JSON de conta (ACCOUNT), substitui os placeholders
+ * {chave} tanto no bloco de conteúdo quanto na confirmationMessage.
+ *
+ * Quebras de linha no deliveryContent são preservadas via <br> ou \n no <pre>.
+ */
 function buildDeliveryMessage(
   productName: string,
-  deliveryContent?: string | null
+  deliveryContent?: string | null,
+  confirmationMessage?: string | null
 ): string {
   const header = `✅ <b>Pagamento confirmado!</b>\n\n📦 <b>${escapeHtml(productName)}</b>\n`;
 
+  // Tenta interpretar o conteúdo como JSON de conta (modo ACCOUNT)
+  const accountVars = deliveryContent ? parseAccountJson(deliveryContent.trim()) : null;
+
+  // Se temos uma confirmationMessage personalizada, ela tem prioridade
+  if (confirmationMessage && confirmationMessage.trim()) {
+    let msg = confirmationMessage.trim();
+
+    // Substitui placeholders JSON se for ACCOUNT
+    if (accountVars) {
+      msg = applyJsonVars(msg, accountVars);
+    } else {
+      // Escapa HTML na mensagem normal
+      msg = escapeHtml(msg);
+    }
+
+    // Converte \n em quebras para HTML
+    const msgHtml = msg.replace(/\n/g, '\n');
+
+    // Bloco de conteúdo bruto (opcional, abaixo da msg personalizada)
+    let contentBlock = '';
+    if (deliveryContent && deliveryContent.trim()) {
+      if (accountVars) {
+        // Exibe os campos do JSON linha a linha
+        const lines = Object.entries(accountVars)
+          .map(([k, v]) => `<b>${escapeHtml(k)}:</b> <code>${escapeHtml(v)}</code>`)
+          .join('\n');
+        contentBlock = `\n\n🔑 <b>Dados da conta:</b>\n${lines}`;
+      } else {
+        contentBlock = `\n\n📄 <b>Conteúdo:</b>\n<pre>${escapeHtml(deliveryContent.trim())}</pre>`;
+      }
+    }
+
+    return header + `\n${msgHtml}` + contentBlock + '\n\n<i>Guarde essa mensagem em local seguro.</i>';
+  }
+
+  // Sem confirmationMessage — usa layout padrão
   if (deliveryContent && deliveryContent.trim().length > 0) {
+    if (accountVars) {
+      // Modo ACCOUNT: exibe campos linha a linha
+      const lines = Object.entries(accountVars)
+        .map(([k, v]) => `<b>${escapeHtml(k)}:</b> <code>${escapeHtml(v)}</code>`)
+        .join('\n');
+      return (
+        header +
+        `\n🔑 <b>Dados da conta:</b>\n${lines}\n\n` +
+        `<i>Guarde essa mensagem em local seguro.</i>`
+      );
+    }
+
+    // TEXT / LINK — preserva quebras de linha
     return (
       header +
       `\n🎁 <b>Seu produto:</b>\n` +
@@ -127,8 +205,6 @@ export async function showQuantityScreen(
   session.pendingQty = undefined;
   await saveSession(userId, session);
 
-  // VARREDURA-FIX #10: usa availableStock (já descontado de reservas pendentes)
-  // em vez de product.stock bruto que não reflete reservas em aberto.
   const effectiveStock = product.availableStock ?? product.stock;
   const maxStock = effectiveStock != null ? effectiveStock : Infinity;
   const maxQty = Math.min(maxStock, 10);
@@ -296,7 +372,6 @@ export async function executePayment(
 ): Promise<void> {
   const userId = ctx.from!.id;
 
-  // FIX #2: acquireLock retorna token UUID — deve ser passado ao releaseLock
   const lockToken = await acquireLock(String(userId));
   if (!lockToken) {
     await ctx.reply('⏳ Aguarde, processando pagamento anterior...', { parse_mode: 'HTML' });
@@ -321,24 +396,23 @@ export async function executePayment(
       referralCode: session.referralCode ?? undefined,
     });
 
-    // FIX #8: notifica o backend que o cupom foi aplicado a este pagamento
     if (pendingCoupon && payment.paymentId) {
       try {
-        // couponClient.validateCoupon retorna o couponId via data.couponId
-        // Aqui já temos o paymentId confirmado — chamamos applyCoupon
-        // O couponId não está disponível diretamente aqui; usamos o código como fallback
         await applyCoupon(pendingCoupon, String(userId), payment.paymentId);
       } catch {
-        // Não bloqueia a compra se o apply falhar — o backend já registrou via createPayment
+        // não bloqueia a compra
       }
     }
 
     if (payment.paidWithBalance) {
-      // FIX #1: markCouponUsed recebe (userId, couponCode) — assinatura correta
       if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
       await clearSession(userId, firstName);
+
+      // Busca a confirmationMessage do produto (se disponível via payment)
+      const confirmMsg = (payment as Record<string, unknown>).confirmationMessage as string | undefined;
+
       await ctx.reply(
-        buildDeliveryMessage(payment.productName ?? productId),
+        buildDeliveryMessage(payment.productName ?? productId, null, confirmMsg),
         {
           parse_mode: 'HTML',
           reply_markup: afterPurchaseKeyboard(productId).reply_markup,
@@ -356,7 +430,6 @@ export async function executePayment(
     session.paymentId    = payment.paymentId;
     session.pixExpiresAt = expiresAt;
     session.pixQrCodeText = qrText;
-    // FIX #1: markCouponUsed recebe (userId, couponCode) — assinatura correta
     if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
     await saveSession(userId, session);
 
@@ -399,7 +472,6 @@ export async function executePayment(
     console.error('[executePayment] erro:', err);
     await ctx.reply(`❌ ${escapeHtml(msg)}`, { parse_mode: 'HTML' });
   } finally {
-    // FIX #2: passa o lockToken para releaseLock verificar ownership antes de deletar
     await releaseLock(String(userId), lockToken);
   }
 }
@@ -418,10 +490,15 @@ export async function handleCheckPayment(
     if (status.status === 'APPROVED') {
       cancelPIXTimer(userId);
       await clearSession(userId, firstName);
+
+      // Tenta pegar confirmationMessage do status (se a API retornar)
+      const confirmMsg = (status as Record<string, unknown>).confirmationMessage as string | undefined;
+
       await ctx.reply(
         buildDeliveryMessage(
           status.productName ?? 'seu produto',
-          status.deliveryContent
+          status.deliveryContent,
+          confirmMsg
         ),
         {
           parse_mode: 'HTML',

@@ -84,6 +84,17 @@ function newMedia(): ProductMedia {
   return { url: '', mediaType: 'IMAGE', caption: '' };
 }
 
+/** Extrai as chaves de um JSON válido para mostrar os placeholders disponíveis */
+function getJsonKeys(value: string): string[] {
+  try {
+    const obj = JSON.parse(value.trim());
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      return Object.keys(obj);
+    }
+  } catch {}
+  return [];
+}
+
 function validate(form: typeof EMPTY_FORM, items: DeliveryItem[], isEdit: boolean): string | null {
   if (!form.name.trim()) return 'O nome do produto é obrigatório.';
   if (!form.description.trim()) return 'A descrição é obrigatória.';
@@ -209,9 +220,6 @@ function SortableCard({
   onDelete,
 }: SortableCardProps) {
   const isFifo = FIFO_TYPES.includes(p.deliveryType);
-  // Para FIFO: usa disponiveisCount (vem da API via _count.stockItems AVAILABLE)
-  // Para numérico: usa p.stock
-  // Nunca mostra os dois ao mesmo tempo
   const fifoCount = isFifo ? (p.disponiveisCount ?? 0) : null;
   const numericStock = !isFifo && p.stock != null ? p.stock : null;
 
@@ -381,6 +389,69 @@ function BulkImportModal({ deliveryType, onImport, onClose }: BulkImportModalPro
   );
 }
 
+// ─── Item editor para tipo ACCOUNT (textarea JSON com preview de chaves) ───────
+
+interface AccountItemRowProps {
+  item: DeliveryItem;
+  onUpdate: (id: string, value: string) => void;
+  onRemove: (id: string) => void;
+}
+
+function AccountItemRow({ item, onUpdate, onRemove }: AccountItemRowProps) {
+  let jsonError = '';
+  let keys: string[] = [];
+  if (item.value.trim()) {
+    try {
+      const parsed = JSON.parse(item.value.trim());
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        keys = Object.keys(parsed);
+      } else {
+        jsonError = 'Deve ser um objeto JSON (chave: valor)';
+      }
+    } catch {
+      jsonError = 'JSON inválido';
+    }
+  }
+
+  return (
+    <div className="border border-gray-200 rounded-xl p-3 space-y-2 bg-gray-50">
+      <div className="flex gap-2 items-start">
+        <textarea
+          className={`input flex-1 text-sm font-mono resize-y min-h-[64px] ${
+            jsonError && item.value.trim() ? 'border-red-400 focus:ring-red-400' : ''
+          }`}
+          value={item.value}
+          onChange={(e) => onUpdate(item.id, e.target.value)}
+          placeholder={'{\n  "email": "conta@exemplo.com",\n  "senha": "minhasenha"\n}'}
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          onClick={() => onRemove(item.id)}
+          className="shrink-0 text-gray-300 hover:text-red-500 text-lg leading-none px-1 pt-1 transition-colors"
+          title="Remover item"
+        >
+          ×
+        </button>
+      </div>
+      {item.value.trim() && (
+        <div className="text-xs">
+          {jsonError ? (
+            <span className="text-red-500">⚠️ {jsonError}</span>
+          ) : (
+            <span className="text-green-600">
+              ✓ Chaves disponíveis:{' '}
+              {keys.map((k) => (
+                <code key={k} className="bg-green-100 text-green-700 px-1 rounded mr-1">{'{'+k+'}'}</code>
+              ))}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Componente principal ─────────────────────────────────────────────────────
 
 export default function ProductsClient() {
@@ -397,7 +468,6 @@ export default function ProductsClient() {
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all');
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [showBulkModal, setShowBulkModal] = useState(false);
-  // loadingItems: true enquanto busca stockItems ao abrir edição
   const [loadingItems, setLoadingItems] = useState(false);
 
   // ── Drag-and-drop state ──────────────────────────────────────────────────────
@@ -408,6 +478,22 @@ export default function ProductsClient() {
   const usesItemList = FIFO_TYPES.includes(form.deliveryType);
 
   const [allProducts, setAllProducts] = useState<Product[]>([]);
+
+  // Extrai as chaves únicas de todos os itens ACCOUNT preenchidos e válidos
+  const accountKeys = useMemo(() => {
+    if (form.deliveryType !== 'ACCOUNT') return [];
+    const keySets = new Set<string>();
+    for (const item of items) {
+      if (!item.value.trim()) continue;
+      try {
+        const parsed = JSON.parse(item.value.trim());
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          Object.keys(parsed).forEach((k) => keySets.add(k));
+        }
+      } catch {}
+    }
+    return Array.from(keySets);
+  }, [items, form.deliveryType]);
 
   const loadProducts = useCallback(() => {
     setLoading(true);
@@ -492,7 +578,6 @@ export default function ProductsClient() {
       description: p.description,
       price: String(p.price),
       deliveryType: p.deliveryType,
-      // Não expõe __FIFO__ no campo — o conteúdo real vem dos stockItems
       deliveryContent: p.deliveryContent === '__FIFO__' ? '' : (p.deliveryContent ?? ''),
       confirmationMessage: (meta.confirmationMessage as string) ?? '',
       isActive: p.isActive,
@@ -503,9 +588,8 @@ export default function ProductsClient() {
     setShowModal(true);
 
     if (FIFO_TYPES.includes(p.deliveryType)) {
-      // Sempre busca os stockItems frescos da API ao abrir edição
       setLoadingItems(true);
-      setItems([newItem()]); // placeholder enquanto carrega
+      setItems([newItem()]);
       getStockItems(p.id)
         .then((si) => setItems(stockItemsToDeliveryItems(si)))
         .catch(() => {
@@ -559,11 +643,6 @@ export default function ProductsClient() {
       const filledItems = items.filter((i) => i.value.trim());
       const deliveryContent = isFifo ? itemsToContent(items) : form.deliveryContent;
 
-      // stock:
-      // - FIFO + criação: passa filledItems.length para refletir o que foi enviado
-      // - FIFO + edição sem novos itens: não sobrescreve (backend mantém pelo syncFifoItems)
-      // - Numérico: usa o campo do form
-      // - FILE_MEDIA/outros: null = ilimitado
       let stockValue: number | null;
       if (isFifo) {
         stockValue = filledItems.length > 0 ? filledItems.length : null;
@@ -764,8 +843,8 @@ export default function ProductsClient() {
                 </select>
               </div>
 
-              {/* Itens FIFO (TEXT / LINK / ACCOUNT) */}
-              {usesItemList && (
+              {/* Itens FIFO (TEXT / LINK) — input simples por linha */}
+              {usesItemList && form.deliveryType !== 'ACCOUNT' && (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <label className="block text-sm font-medium text-gray-700">
@@ -778,7 +857,6 @@ export default function ProductsClient() {
                       type="button"
                       onClick={() => setShowBulkModal(true)}
                       className="flex items-center gap-1 text-xs font-medium text-purple-600 hover:text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-2.5 py-1 rounded-lg transition-colors"
-                      title="Importar vários itens de uma vez via texto"
                     >
                       📋 Importar em lote
                     </button>
@@ -792,16 +870,15 @@ export default function ProductsClient() {
                     <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
                       {items.map((item) => (
                         <div key={item.id} className="flex gap-2 items-center">
-                          <input
-                            className="input flex-1 text-sm font-mono"
+                          <textarea
+                            className="input flex-1 text-sm font-mono resize-none"
+                            rows={2}
                             value={item.value}
                             onChange={(e) => updateItemValue(item.id, e.target.value)}
                             placeholder={
-                              form.deliveryType === 'ACCOUNT'
-                                ? '{"email":"x@x.com","senha":"123"}'
-                                : form.deliveryType === 'LINK'
+                              form.deliveryType === 'LINK'
                                 ? 'https://...'
-                                : 'Conteúdo do item'
+                                : 'Conteúdo do item (suporta múltiplas linhas)'
                             }
                           />
                           <button
@@ -823,6 +900,65 @@ export default function ProductsClient() {
                     className="text-sm text-blue-600 hover:text-blue-700 font-medium"
                   >
                     + Adicionar item
+                  </button>
+                </div>
+              )}
+
+              {/* Itens ACCOUNT — textarea JSON com validação e preview de chaves */}
+              {usesItemList && form.deliveryType === 'ACCOUNT' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-sm font-medium text-gray-700">
+                      Contas (JSON)
+                      <span className="ml-2 text-xs text-gray-400 font-normal">
+                        ({items.filter((i) => i.value.trim()).length} preenchida{items.filter((i) => i.value.trim()).length !== 1 ? 's' : ''})
+                      </span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowBulkModal(true)}
+                      className="flex items-center gap-1 text-xs font-medium text-purple-600 hover:text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-2.5 py-1 rounded-lg transition-colors"
+                    >
+                      📋 Importar em lote
+                    </button>
+                  </div>
+
+                  {/* Dica sobre placeholders */}
+                  {accountKeys.length > 0 && (
+                    <div className="bg-blue-50 border border-blue-200 rounded-xl px-3 py-2 text-xs text-blue-700">
+                      <strong>💡 Placeholders disponíveis na mensagem de confirmação:</strong>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {accountKeys.map((k) => (
+                          <code key={k} className="bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded">{'{'+k+'}'}</code>
+                        ))}
+                      </div>
+                      <p className="mt-1 text-blue-500">Ex: &ldquo;Seu e-mail: <strong>{'{email}'}</strong>&rdquo;</p>
+                    </div>
+                  )}
+
+                  {loadingItems ? (
+                    <div className="flex items-center gap-2 text-sm text-gray-400 py-3">
+                      <span className="animate-spin">⏳</span> Carregando itens de estoque...
+                    </div>
+                  ) : (
+                    <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+                      {items.map((item) => (
+                        <AccountItemRow
+                          key={item.id}
+                          item={item}
+                          onUpdate={updateItemValue}
+                          onRemove={removeItem}
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={addItem}
+                    className="text-sm text-blue-600 hover:text-blue-700 font-medium"
+                  >
+                    + Adicionar conta
                   </button>
                 </div>
               )}
@@ -853,13 +989,24 @@ export default function ProductsClient() {
 
               {/* Mensagem de confirmação */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Mensagem de confirmação (opcional)</label>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Mensagem de confirmação (opcional)
+                </label>
+                {form.deliveryType === 'ACCOUNT' && accountKeys.length > 0 && (
+                  <p className="text-xs text-gray-500 mb-1">
+                    Use {accountKeys.map((k) => <code key={k} className="bg-gray-100 px-1 rounded mx-0.5">{'{'+k+'}'}</code>)} para inserir os dados da conta entregue.
+                  </p>
+                )}
                 <textarea
                   className="input"
-                  rows={2}
+                  rows={4}
                   value={form.confirmationMessage}
                   onChange={(e) => setForm({ ...form, confirmationMessage: e.target.value })}
-                  placeholder="Mensagem enviada ao usuário após a compra (deixe vazio para usar o padrão)"
+                  placeholder={
+                    form.deliveryType === 'ACCOUNT'
+                      ? 'Sua conta:\nE-mail: {email}\nSenha: {senha}\n\nGuarde em local seguro!'
+                      : 'Mensagem enviada ao usuário após a compra (deixe vazio para usar o padrão)'
+                  }
                 />
               </div>
 
