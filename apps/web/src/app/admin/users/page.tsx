@@ -24,24 +24,19 @@ interface UsersResult {
   totalPages: number;
 }
 
-// Retorna o melhor identificador legível para o usuário.
-// Prioridade: nome → número de telefone formatado (WhatsApp) → ID bruto
-function getUserLabel(u: User): { name: string; sub: string | null; isPhone: boolean } {
+// Retorna label de exibição do usuário.
+// Se tem firstName, usa ele. Caso contrário mostra o telegramId
+// com badge "WhatsApp" (verde) para indicar que veio do WhatsApp.
+function getUserLabel(u: User): {
+  name: string;
+  sub: string | null;
+  badge: 'whatsapp' | null;
+} {
   if (u.firstName) {
-    return { name: u.firstName, sub: u.username ? `@${u.username}` : null, isPhone: false };
+    return { name: u.firstName, sub: u.username ? `@${u.username}` : null, badge: null };
   }
-  // telegramId com 11-13 dígitos provavelmente é telefone WhatsApp
-  const isPhone = /^\d{10,13}$/.test(u.telegramId);
-  if (isPhone) {
-    // Formata: 5532991240070 → +55 32 99124-0070
-    const d = u.telegramId;
-    let formatted = u.telegramId;
-    if (d.length === 13) formatted = `+${d.slice(0,2)} ${d.slice(2,4)} ${d.slice(4,9)}-${d.slice(9)}`;
-    else if (d.length === 12) formatted = `+${d.slice(0,2)} ${d.slice(2,4)} ${d.slice(4,8)}-${d.slice(8)}`;
-    else if (d.length === 11) formatted = `+${d.slice(0,2)} ${d.slice(2,7)}-${d.slice(7)}`;
-    return { name: formatted, sub: 'WhatsApp', isPhone: true };
-  }
-  return { name: u.telegramId, sub: u.username ? `@${u.username}` : null, isPhone: false };
+  // Sem firstName = veio do WhatsApp (IDs de Telegram sempre têm nome)
+  return { name: u.telegramId, sub: null, badge: 'whatsapp' };
 }
 
 export default function UsersPage() {
@@ -147,13 +142,20 @@ export default function UsersPage() {
                 return (
                   <tr key={u.id} className="border-b border-gray-50 hover:bg-gray-50">
                     <td className="px-4 py-3">
-                      <div className={`font-medium ${label.isPhone ? 'text-blue-700' : 'text-gray-900'}`}>
-                        {label.name}
+                      <div className="flex items-center gap-2">
+                        <span className={`font-medium ${
+                          label.badge === 'whatsapp' ? 'text-gray-500 font-mono text-xs' : 'text-gray-900'
+                        }`}>
+                          {label.name}
+                        </span>
+                        {label.badge === 'whatsapp' && (
+                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 font-medium whitespace-nowrap">
+                            WhatsApp
+                          </span>
+                        )}
                       </div>
                       {label.sub && (
-                        <div className={`text-xs ${label.isPhone ? 'text-blue-400' : 'text-gray-400'}`}>
-                          {label.sub}
-                        </div>
+                        <div className="text-gray-400 text-xs">{label.sub}</div>
                       )}
                     </td>
                     <td className="px-4 py-3 font-mono text-xs text-gray-600">{u.telegramId}</td>
