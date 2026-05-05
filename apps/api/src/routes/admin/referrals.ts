@@ -1,9 +1,6 @@
 // routes/admin/referrals.ts
-// FIX-REFERRAL-STATS: summary agora distingue 3 estados:
-//   - registered  = entrou pelo link mas ainda não comprou    (rewardPaid:false, paymentId:null)
-//   - pending     = usou o link na compra, recompensa a pagar (rewardPaid:false, paymentId:not null)
-//   - converted   = recompensa já paga                        (rewardPaid:true)
 import { Router, Response } from 'express';
+import { z } from 'zod';
 import { prisma } from '../../lib/prisma';
 import { requireRole, AuthenticatedRequest } from '../../middleware/auth';
 
@@ -28,14 +25,86 @@ adminReferralsRouter.get('/summary', async (_req: AuthenticatedRequest, res: Res
     success: true,
     data: {
       total,
-      // Indicados que ainda não fizeram a primeira compra
       registered,
-      // Indicados que compraram mas recompensa ainda não foi processada
       pendingPayment,
-      // Indicados convertidos com recompensa paga
       converted,
       totalPaidAmount:    Number(paidSum._sum.rewardAmount   ?? 0),
       totalPendingAmount: Number(pendingSum._sum.rewardAmount ?? 0),
+    },
+  });
+});
+
+// POST /api/admin/referrals/backfill
+// Cria manualmente um vínculo de indicação perdido (para registros anteriores ao fix do upsert).
+// Body: { referrerTelegramId: string, referredTelegramId: string }
+const backfillSchema = z.object({
+  referrerTelegramId: z.string().min(1),
+  referredTelegramId: z.string().min(1),
+});
+
+adminReferralsRouter.post('/backfill', async (req: AuthenticatedRequest, res: Response) => {
+  const parsed = backfillSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ success: false, error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { referrerTelegramId, referredTelegramId } = parsed.data;
+
+  if (referrerTelegramId === referredTelegramId) {
+    res.status(400).json({ success: false, error: 'Auto-indicação não permitida.' });
+    return;
+  }
+
+  // Garante que o indicador existe (upsert — mesmo comportamento do fix)
+  const [referrer, referred] = await Promise.all([
+    prisma.telegramUser.upsert({
+      where:  { telegramId: referrerTelegramId },
+      update: {},
+      create: { telegramId: referrerTelegramId },
+      select: { id: true },
+    }),
+    prisma.telegramUser.findUnique({
+      where:  { telegramId: referredTelegramId },
+      select: { id: true },
+    }),
+  ]);
+
+  if (!referred) {
+    res.status(404).json({ success: false, error: 'Usuário indicado não encontrado no banco.' });
+    return;
+  }
+
+  // Verifica se já existe um referral para o indicado
+  const existing = await prisma.referral.findUnique({ where: { referredId: referred.id } });
+  if (existing) {
+    res.status(409).json({
+      success: false,
+      error: 'Este usuário já possui um vínculo de indicação.',
+      existing: {
+        id:         existing.id,
+        rewardPaid: existing.rewardPaid,
+        createdAt:  existing.createdAt,
+      },
+    });
+    return;
+  }
+
+  const referral = await prisma.referral.create({
+    data: { referrerId: referrer.id, referredId: referred.id },
+    include: {
+      referrer: { select: { telegramId: true, firstName: true } },
+      referred: { select: { telegramId: true, firstName: true } },
+    },
+  });
+
+  res.json({
+    success: true,
+    message: 'Vínculo de indicação criado com sucesso.',
+    data: {
+      id:       referral.id,
+      referrer: referral.referrer,
+      referred: referral.referred,
     },
   });
 });
@@ -46,7 +115,6 @@ adminReferralsRouter.get('/', async (req: AuthenticatedRequest, res: Response) =
   const skip  = (page - 1) * limit;
   const search = req.query.search as string | undefined;
 
-  // filtro por estado: all | registered | pending | converted
   const stateFilter = req.query.state as string | undefined;
   const stateWhere: Record<string, unknown> =
     stateFilter === 'converted'  ? { rewardPaid: true } :
@@ -87,10 +155,6 @@ adminReferralsRouter.get('/', async (req: AuthenticatedRequest, res: Response) =
     referrer:   r.referrer,
     referred:   r.referred,
     createdAt:  r.createdAt,
-    // Estado do referral:
-    //   registered = sem paymentId (indicado ainda não comprou)
-    //   pending    = paymentId existe mas rewardPaid=false
-    //   converted  = rewardPaid=true
     state:      r.rewardPaid ? 'converted' : r.paymentId ? 'pending' : 'registered',
     rewardPaid: Number(r.rewardAmount ?? 0),
     payment:    r.payment ?? null,
