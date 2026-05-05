@@ -254,6 +254,14 @@ export async function toggleBlockUser(id: string): Promise<{ isBlocked: boolean;
   return res.data.data;
 }
 
+export async function updateUserFirstName(
+  id: string,
+  firstName: string
+): Promise<{ id: string; telegramId: string; firstName: string; message: string }> {
+  const res = await api.patch(`/admin/users/${id}/firstName`, { firstName });
+  return res.data.data;
+}
+
 // ─── Wallet ───────────────────────────────────────────────────────────────────────
 
 export async function getWalletBalance(userId: string) {
