@@ -1,6 +1,8 @@
 // paymentService.ts — suporte a qty > 1
 // FIX-QTY: include order → orders; acessa payment.orders[0]; payment.product via include explícito
 // FEAT-QTY2: entrega agrupada via deliverAllAsOne (1 mensagem com todos os itens)
+// FIX-QTY3: confirmApproval distingue "reservar+criar orders" (BALANCE) de "só criar orders" (PIX/MIXED)
+//           para não re-reservar StockItems que já foram reservados em _payWithPix
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -30,6 +32,7 @@ async function revertCoupon(paymentId: string): Promise<void> {
   }
 }
 
+/** Reserva N StockItems E cria N orders. Usado em pagamentos BALANCE (aprovação imediata). */
 async function reserveAndCreateOrders(
   telegramUserId: string,
   product: ProductSnap,
@@ -39,6 +42,20 @@ async function reserveAndCreateOrders(
   for (let i = 0; i < qty; i++) {
     await stockService.reserveStock(product.id, telegramUserId, paymentId);
   }
+  return createOrdersOnly(telegramUserId, product, qty, paymentId);
+}
+
+/**
+ * Cria N orders SEM reservar StockItems.
+ * Usado em confirmApproval de pagamentos PIX/MIXED, onde os StockItems
+ * já foram reservados no momento da criação do PIX (_payWithPix / _payWithMixed).
+ */
+async function createOrdersOnly(
+  telegramUserId: string,
+  product: ProductSnap,
+  qty: number,
+  paymentId: string
+): Promise<string[]> {
   const orderIds: string[] = [];
   for (let i = 0; i < qty; i++) {
     const order = await prisma.order.create({
@@ -128,6 +145,7 @@ export const paymentService = {
 
       paymentId = result.payment.id;
 
+      // BALANCE: reserva + cria orders juntos (aprovação imediata)
       const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
       const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
       const productFull = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
@@ -227,6 +245,7 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
+      // PIX: reserva os StockItems agora (orders serão criados em confirmApproval)
       for (let i = 0; i < qty; i++) {
         await stockService.reserveStock(product.id, telegramUserId, paymentId);
       }
@@ -319,6 +338,7 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
+      // MIXED: reserva os StockItems agora (orders serão criados em confirmApproval)
       for (let i = 0; i < qty; i++) {
         await stockService.reserveStock(product.id, telegramUserId, paymentId);
       }
@@ -519,7 +539,9 @@ export const paymentService = {
       let existingOrders = payment.orders;
 
       if (existingOrders.length === 0) {
-        const orderIds = await reserveAndCreateOrders(telegramUser.id, product, qty, paymentId);
+        // PIX/MIXED: StockItems já foram reservados em _payWithPix/_payWithMixed.
+        // Aqui só criamos os orders, SEM re-reservar.
+        const orderIds = await createOrdersOnly(telegramUser.id, product, qty, paymentId);
         existingOrders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
       } else {
         await prisma.order.updateMany({
