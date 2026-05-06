@@ -5,7 +5,7 @@
  * PADRÃO: parse_mode HTML em mensagens de texto.
  *         parse_mode MarkdownV2 APENAS em captions de replyWithPhoto.
  *
- * FIX-QTY-BOT: qty (session.pendingQty) agora é passado no createPayment.
+ * FIX-QTY-BOT: quantity (session.pendingQty) agora é passado no createPayment.
  * FIX-DELIVERY-BOT: bot não monta mais mensagem de entrega para BALANCE/PIX.
  *   A API (deliveryService) já entregou o conteúdo direto ao usuário.
  *   O bot apenas exibe confirmação simples sem repetir o conteúdo.
@@ -231,15 +231,15 @@ export async function executePayment(
     const firstName     = ctx.from!.first_name;
     const username      = ctx.from!.username;
     const pendingCoupon = session.pendingCoupon ?? undefined;
-    // FIX-QTY-BOT: lê qty da sessão (selecionado na tela de quantidade)
-    const qty           = session.pendingQty ?? 1;
+    // FIX-QTY-BOT: lê qty da sessão e envia como `quantity` (nome do campo no tipo)
+    const quantity      = session.pendingQty ?? 1;
 
     await editOrReply(ctx, '⏳ <b>Processando pagamento...</b>', { parse_mode: 'HTML' });
 
     const payment = await apiClient.createPayment({
       telegramId: String(userId),
       productId,
-      qty,          // ← FIX: qty agora é enviado à API
+      quantity,     // ← FIX: quantity agora é enviado à API
       firstName,
       username,
       paymentMethod: method,
@@ -257,7 +257,7 @@ export async function executePayment(
       if (pendingCoupon) await markCouponUsed(userId, pendingCoupon);
       await clearSession(userId, firstName);
       const productName = payment.productName ?? productId;
-      const qtyLabel    = qty > 1 ? ` (${qty}x)` : '';
+      const qtyLabel    = quantity > 1 ? ` (${quantity}x)` : '';
       await ctx.reply(
         `✅ <b>Compra realizada com sucesso!</b>\n\n` +
         `📦 <b>${escapeHtml(productName)}${qtyLabel}</b>\n\n` +
@@ -407,7 +407,6 @@ export async function schedulePIXExpiry(
   const ms = new Date(expiresAt).getTime() - Date.now();
   if (ms <= 0) return;
 
-  // FIX-PIX-TIMER: persiste no Redis para sobreviver a redeploys
   await persistPixExpiry(userId, paymentId, expiresAt);
 
   const timer = setTimeout(async () => {
