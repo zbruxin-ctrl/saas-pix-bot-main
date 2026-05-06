@@ -2,6 +2,7 @@
 // FEAT #4: preset de período (?preset=today|7d|month) no filtro de pagamentos
 // FEAT: GET /export/csv — exporta pagamentos aprovados em CSV
 // FEAT: POST /:id/cancel — cancela pagamento PENDING no MP e no banco
+// FIX-QTY: order → orders (1 payment → N orders); stockItem via findFirst
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { PaymentStatus, OrderStatus, Prisma } from '@prisma/client';
@@ -12,7 +13,6 @@ import { mercadoPagoService } from '../../services/mercadoPagoService';
 
 export const adminPaymentsRouter = Router();
 
-/** Converte preset de período em {gte, lte} */
 function resolvePreset(preset?: string): { gte?: Date; lte?: Date } {
   if (!preset) return {};
   const now = new Date();
@@ -43,7 +43,7 @@ const querySchema = z.object({
   productId: z.string().optional(),
   startDate: z.string().optional(),
   endDate: z.string().optional(),
-  preset: z.enum(['today', '7d', 'month']).optional(), // FEAT #4
+  preset: z.enum(['today', '7d', 'month']).optional(),
   search: z.string().optional(),
 });
 
@@ -66,11 +66,11 @@ adminPaymentsRouter.get(
       where.productId = productId;
     }
 
+    // FIX-QTY: order → orders (some)
     if (orderStatus && Object.values(OrderStatus).includes(orderStatus as OrderStatus)) {
-      where.order = { status: orderStatus as OrderStatus };
+      where.orders = { some: { status: orderStatus as OrderStatus } };
     }
 
-    // FEAT #4: preset tem prioridade sobre startDate/endDate manuais
     const presetRange = resolvePreset(preset);
     const dateRange = Object.keys(presetRange).length > 0
       ? presetRange
@@ -105,7 +105,8 @@ adminPaymentsRouter.get(
         include: {
           product: { select: { name: true, price: true } },
           telegramUser: { select: { username: true, firstName: true, telegramId: true } },
-          order: { select: { status: true, deliveredAt: true } },
+          // FIX-QTY: orders (array) — pega o primeiro para exibir status no listing
+          orders: { select: { status: true, deliveredAt: true }, take: 1 },
         },
         orderBy: { createdAt: 'desc' },
         skip,
@@ -120,6 +121,8 @@ adminPaymentsRouter.get(
         data: payments.map((p) => ({
           ...p,
           amount: Number(p.amount),
+          // compatibilidade com frontend que lê p.order
+          order: p.orders?.[0] ?? null,
           product: p.product
             ? { ...p.product, price: Number(p.product.price) }
             : null,
@@ -196,7 +199,8 @@ adminPaymentsRouter.get(
       include: {
         product: true,
         telegramUser: true,
-        order: {
+        // FIX-QTY: orders (array)
+        orders: {
           include: {
             deliveryLogs: { orderBy: { createdAt: 'asc' } },
             deliveryMedias: { orderBy: { sortOrder: 'asc' } },
@@ -211,9 +215,10 @@ adminPaymentsRouter.get(
       return;
     }
 
+    // FIX-QTY: findFirst pois paymentId não é mais unique em stock_items
     let stockItem: { content: string; status: string } | null = null;
     try {
-      stockItem = await prisma.stockItem.findUnique({
+      stockItem = await prisma.stockItem.findFirst({
         where: { paymentId },
         select: { content: true, status: true },
       });
@@ -226,6 +231,8 @@ adminPaymentsRouter.get(
       data: {
         ...payment,
         amount: Number(payment.amount),
+        // compatibilidade com frontend que lê payment.order
+        order: payment.orders?.[0] ?? null,
         product: payment.product
           ? { ...payment.product, price: Number(payment.product.price) }
           : null,
@@ -305,12 +312,10 @@ adminPaymentsRouter.post(
       return;
     }
 
-    // Tenta cancelar no Mercado Pago se houver ID externo
     if (payment.mercadoPagoId) {
       try {
         await mercadoPagoService.cancelPayment(payment.mercadoPagoId);
       } catch (err: any) {
-        // Não bloqueia o cancelamento local se o MP falhar (pode já ter expirado)
         console.warn(`[cancel] Falha ao cancelar no MP (${payment.mercadoPagoId}):`, err?.message);
       }
     }

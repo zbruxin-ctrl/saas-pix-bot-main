@@ -1,7 +1,5 @@
 // paymentService.ts — suporte a qty > 1
-// - reserveStock chamado qty vezes em sequência
-// - cria qty Orders (um por unidade)
-// - deliverAll(paymentId) chama deliveryService.deliver para cada Order
+// FIX-QTY: include order → orders; acessa payment.orders[0]; payment.product via include explícito
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -31,19 +29,15 @@ async function revertCoupon(paymentId: string): Promise<void> {
   }
 }
 
-/** Reserva N unidades em sequência e retorna os orderIds criados */
 async function reserveAndCreateOrders(
   telegramUserId: string,
   product: ProductSnap,
   qty: number,
   paymentId: string
 ): Promise<string[]> {
-  // Reserva N StockItems
   for (let i = 0; i < qty; i++) {
     await stockService.reserveStock(product.id, telegramUserId, paymentId);
   }
-
-  // Cria N Orders
   const orderIds: string[] = [];
   for (let i = 0; i < qty; i++) {
     const order = await prisma.order.create({
@@ -59,10 +53,9 @@ async function reserveAndCreateOrders(
   return orderIds;
 }
 
-/** Entrega todos os orders de um pagamento */
 async function deliverAll(
   orderIds: string[],
-  telegramUser: { id: string; telegramId: string; firstName: string | null; lastName: string | null; username: string | null; languageCode: string | null; isBlocked: boolean; balance: import('@prisma/client').Prisma.Decimal; createdAt: Date; updatedAt: Date },
+  telegramUser: import('@prisma/client').TelegramUser,
   product: import('@prisma/client').Product
 ): Promise<void> {
   for (const orderId of orderIds) {
@@ -86,7 +79,6 @@ export const paymentService = {
     deliveryContent: string | null;
   }> {
     const { telegramUserId, product, qty, amount, couponId, referralCode } = opts;
-
     let paymentId: string | undefined;
 
     try {
@@ -98,24 +90,22 @@ export const paymentService = {
         if (!user || Number(user.balance) < amount) {
           throw new AppError('Saldo insuficiente.', 400);
         }
-
         const payment = await tx.payment.create({
           data: {
             telegramUserId,
             productId: product.id,
             amount,
+            qty,
             status: PaymentStatus.APPROVED,
             paymentMethod: 'BALANCE',
             couponId: couponId ?? null,
             approvedAt: new Date(),
           },
         });
-
         await tx.telegramUser.update({
           where: { id: telegramUserId },
           data: { balance: { decrement: amount } },
         });
-
         await tx.walletTransaction.create({
           data: {
             telegramUserId,
@@ -125,21 +115,16 @@ export const paymentService = {
             paymentId: payment.id,
           },
         });
-
         return { payment };
       });
 
       paymentId = result.payment.id;
 
-      // Reserva N itens e cria N orders
       const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
-
-      // Entrega
       const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
       const productFull = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
       await deliverAll(orderIds, telegramUser, productFull);
 
-      // Bônus de indicação
       if (referralCode) {
         try {
           const referrer = await prisma.telegramUser.findFirst({
@@ -175,11 +160,8 @@ export const paymentService = {
           logger.warn('[_payWithBalance] Falha ao pagar bônus de indicação:', err);
         }
       }
-
     } catch (err) {
-      if (paymentId) {
-        await stockService.releaseReservation(paymentId).catch(() => {});
-      }
+      if (paymentId) await stockService.releaseReservation(paymentId).catch(() => {});
       throw err;
     }
 
@@ -208,7 +190,6 @@ export const paymentService = {
     productName: string;
   }> {
     const { telegramUserId, product, qty, amount, couponId, firstName, username } = opts;
-
     let paymentId: string | undefined;
     try {
       const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
@@ -221,7 +202,6 @@ export const paymentService = {
       });
 
       const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-
       const payment = await prisma.payment.create({
         data: {
           telegramUserId,
@@ -239,8 +219,6 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-
-      // Reserva N itens
       for (let i = 0; i < qty; i++) {
         await stockService.reserveStock(product.id, telegramUserId, paymentId);
       }
@@ -254,9 +232,7 @@ export const paymentService = {
         productName: qty > 1 ? `${product.name} x${qty}` : product.name,
       };
     } catch (err) {
-      if (paymentId) {
-        await stockService.releaseReservation(paymentId).catch(() => {});
-      }
+      if (paymentId) await stockService.releaseReservation(paymentId).catch(() => {});
       throw err;
     }
   },
@@ -282,7 +258,6 @@ export const paymentService = {
     productName: string;
   }> {
     const { telegramUserId, product, qty, totalAmount, balanceAmount, pixAmount, couponId, firstName, username } = opts;
-
     let paymentId: string | undefined;
     try {
       await prisma.$transaction(async (tx) => {
@@ -317,7 +292,6 @@ export const paymentService = {
       });
 
       const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-
       const payment = await prisma.payment.create({
         data: {
           telegramUserId,
@@ -337,7 +311,6 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-
       for (let i = 0; i < qty; i++) {
         await stockService.reserveStock(product.id, telegramUserId, paymentId);
       }
@@ -359,9 +332,7 @@ export const paymentService = {
           data: { balance: { increment: balanceAmount } },
         });
       } catch {}
-      if (paymentId) {
-        await stockService.releaseReservation(paymentId).catch(() => {});
-      }
+      if (paymentId) await stockService.releaseReservation(paymentId).catch(() => {});
       throw err;
     }
   },
@@ -464,7 +435,6 @@ export const paymentService = {
     });
 
     const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-
     const payment = await prisma.payment.create({
       data: {
         telegramUserId: user.id,
@@ -489,9 +459,10 @@ export const paymentService = {
   },
 
   async confirmApproval(paymentId: string): Promise<void> {
+    // FIX-QTY: include orders (array) e product explicitamente
     const payment = await prisma.payment.findUnique({
       where: { id: paymentId },
-      include: { telegramUser: true, product: true, order: true },
+      include: { telegramUser: true, product: true, orders: true },
     });
 
     if (!payment) {
@@ -531,7 +502,7 @@ export const paymentService = {
 
     const product = payment.product;
     const telegramUser = payment.telegramUser;
-    const qty = (payment as any).qty ?? 1;
+    const qty: number = (payment as any).qty ?? 1;
 
     try {
       await prisma.payment.update({
@@ -539,13 +510,10 @@ export const paymentService = {
         data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
       });
 
-      // Busca ou cria os Orders (qty unidades)
-      let existingOrders = await prisma.order.findMany({
-        where: { paymentId },
-      });
+      // FIX-QTY: payment.orders (array)
+      let existingOrders = payment.orders;
 
       if (existingOrders.length === 0) {
-        // Reserva N itens e cria N orders
         const orderIds = await reserveAndCreateOrders(telegramUser.id, product, qty, paymentId);
         existingOrders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
       } else {
