@@ -3,6 +3,8 @@
 // FEAT-QTY2: entrega agrupada via deliverAllAsOne (1 mensagem com todos os itens)
 // FIX-QTY3: confirmApproval distingue "reservar+criar orders" (BALANCE) de "só criar orders" (PIX/MIXED)
 //           para não re-reservar StockItems que já foram reservados em _payWithPix
+// FIX-QTY6: confirmApproval NÃO chama releaseReservation em caso de sucesso;
+//           releaseReservation só é chamado quando entrega falha ou em expiração
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -187,6 +189,7 @@ export const paymentService = {
         }
       }
     } catch (err) {
+      // Em caso de erro, libera reservas criadas até aqui
       if (paymentId) await stockService.releaseReservation(paymentId).catch(() => {});
       throw err;
     }
@@ -530,6 +533,7 @@ export const paymentService = {
     const telegramUser = payment.telegramUser;
     const qty: number = (payment as any).qty ?? 1;
 
+    let deliverySucceeded = false;
     try {
       await prisma.payment.update({
         where: { id: paymentId },
@@ -552,10 +556,14 @@ export const paymentService = {
 
       const orderIds = existingOrders.map((o) => o.id);
       await deliverOrders(paymentId, orderIds, telegramUser, product);
+      deliverySucceeded = true;
 
       statusCache.delete(paymentId);
-    } finally {
+    } catch (err) {
+      // FIX-QTY6: só libera reservas se a entrega falhou
+      logger.error(`[confirmApproval] Erro na entrega do pagamento ${paymentId}:`, err);
       await stockService.releaseReservation(paymentId).catch(() => {});
+      throw err;
     }
   },
 

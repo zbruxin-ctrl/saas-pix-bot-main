@@ -4,6 +4,10 @@
 // OPT #10: timeout de 30s em deliver via Promise.race
 // FEAT-QTY: _deliverInternal busca todos os StockItems do pagamento e entrega N conteúdos
 //           numa única mensagem agrupada (ex: 10 licenças numa msg só)
+// FIX-QTY4: _deliverInternal busca o próximo StockItem sem orderId (não repete o mesmo item)
+// FIX-QTY5: deliverAllAsOne usa array mutável para fallback de conteúdo
+// FIX-QTY6: confirmApproval não chama releaseReservation em caso de sucesso (evita liberar
+//           itens já entregues); release só ocorre em finally de erro ou expiração
 import { DeliveryType, TelegramUser, Product } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { telegramService } from './telegramService';
@@ -57,18 +61,17 @@ function buildMultiItemMessage(product: Product, contents: string[], deliveryTyp
   const custom = meta?.confirmationMessage as string | undefined;
 
   const header =
-    `✅ *Pagamento confirmado!*\n` +
-    `📦 *${product.name}* — ${contents.length} unidade(s)\n\n` +
-    `🎁 *Seu produto:*`;
+    `✅ *Compra realizada com sucesso!*\n` +
+    `📦 *${product.name}* (${contents.length}x)\n\n` +
+    `*O conteúdo foi enviado na mensagem acima. Guarde em local seguro.*`;
 
   const items = contents
     .map((c, i) => `\n${contents.length > 1 ? `*${i + 1}.* ` : ''}\`${c}\``)
     .join('');
 
-  const footer = `\n\n_Guarde essa mensagem em local seguro._`;
+  const footer = `\n\n⚠️ _Os links são de uso único e não realizamos trocas. Utilize dentro do prazo._`;
 
   if (custom && custom.trim()) {
-    // Para template customizado, aplica no conteúdo concatenado
     const joined = contents.join('\n');
     return custom
       .replace(/\{\{produto\}\}/g, product.name)
@@ -172,9 +175,18 @@ class DeliveryService {
 
     logger.info(`Iniciando entrega do pedido ${orderId}`);
 
-    // Busca o conteúdo do StockItem específico para este order/payment
-    // Busca o próximo item disponível vinculado ao paymentId que ainda não tem orderId
-    const itemContent = await stockService.getReservedItemContent(order.paymentId!);
+    // FIX-QTY4: busca o próximo StockItem vinculado ao paymentId que ainda NÃO tem orderId
+    // Isso garante que cada order recebe um item diferente em compras qty > 1
+    const nextItem = await prisma.stockItem.findFirst({
+      where: {
+        paymentId: order.paymentId!,
+        orderId: null,
+        status: { in: ['RESERVED', 'CONFIRMED'] },
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { content: true },
+    });
+    const itemContent = nextItem?.content ?? null;
 
     let attempt = 0;
     let lastError: string | null = null;
@@ -317,12 +329,12 @@ class DeliveryService {
     product: Product,
     orderIds: string[]
   ): Promise<void> {
-    const contents = await stockService.getReservedItemsContent(paymentId);
+    let contents = await stockService.getReservedItemsContent(paymentId);
 
+    // FIX-QTY5: usa array mutável corretamente para fallback
     if (contents.length === 0) {
-      // Produto ilimitado ou sem StockItem — usa conteúdo do produto
       const fallback = product.deliveryContent ?? '';
-      contents.push(...Array(orderIds.length).fill(fallback));
+      contents = Array(orderIds.length).fill(fallback) as string[];
     }
 
     const message = buildMultiItemMessage(product, contents, product.deliveryType);

@@ -7,6 +7,8 @@
 // FIX-QTY2: findUnique({paymentId}) → findFirst({where:{paymentId}}) pois paymentId não é mais unique
 // FIX-QTY3: getReservedItemsContent e getReservedItemContent incluem DELIVERED para não perder
 //           conteúdo quando releaseReservation corre antes da entrega terminar
+// FIX-QTY4: confirmReservation confirma TODOS os StockItems do pagamento (não só o primeiro)
+// FIX-QTY5: releaseReservation libera também itens CONFIRMED (não só RESERVED)
 import { StockItemStatus, StockReservationStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
@@ -121,22 +123,24 @@ export class StockService {
     }
   }
 
+  // FIX-QTY4: confirma TODOS os StockItems do pagamento (não só o primeiro)
   async confirmReservation(paymentId: string): Promise<void> {
-    const item = await prisma.stockItem.findFirst({ where: { paymentId } });
-    if (item) {
-      if (item.status !== StockItemStatus.RESERVED) {
-        logger.warn(
-          `[StockService] StockItem já está com status ${item.status} | item=${item.id} | pagamento=${paymentId}`
-        );
-        return;
-      }
-      await prisma.stockItem.update({
-        where: { id: item.id },
+    const items = await prisma.stockItem.findMany({
+      where: { paymentId, status: StockItemStatus.RESERVED },
+    });
+
+    if (items.length > 0) {
+      await prisma.stockItem.updateMany({
+        where: { paymentId, status: StockItemStatus.RESERVED },
         data: { status: StockItemStatus.CONFIRMED, confirmedAt: new Date() },
       });
+      logger.info(
+        `[StockService] ${items.length} StockItem(s) confirmados | pagamento=${paymentId}`
+      );
       return;
     }
 
+    // Path legado: StockReservation
     await prisma.$transaction(async (tx) => {
       const reservation = await tx.stockReservation.findUnique({
         where: { paymentId },
@@ -157,16 +161,23 @@ export class StockService {
     });
   }
 
+  // FIX-QTY5: libera itens RESERVED e CONFIRMED (não só RESERVED)
   async releaseReservation(paymentId: string, reason?: string): Promise<void> {
     const resolvedReason = reason ?? 'não especificado';
 
     const items = await prisma.stockItem.findMany({
-      where: { paymentId, status: StockItemStatus.RESERVED },
+      where: {
+        paymentId,
+        status: { in: [StockItemStatus.RESERVED, StockItemStatus.CONFIRMED] },
+      },
     });
 
     if (items.length > 0) {
       await prisma.stockItem.updateMany({
-        where: { paymentId, status: StockItemStatus.RESERVED },
+        where: {
+          paymentId,
+          status: { in: [StockItemStatus.RESERVED, StockItemStatus.CONFIRMED] },
+        },
         data: {
           status: StockItemStatus.AVAILABLE,
           paymentId: null,
