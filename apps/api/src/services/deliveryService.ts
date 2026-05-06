@@ -8,6 +8,8 @@
 // FIX-QTY5: deliverAllAsOne usa array mutável para fallback de conteúdo
 // FIX-QTY6: confirmApproval não chama releaseReservation em caso de sucesso (evita liberar
 //           itens já entregues); release só ocorre em finally de erro ou expiração
+// PERF-QTY8: deliverAllAsOne paraleliza order.update + deliveryLog.create + markDelivered
+//            via Promise.all — seguro pois markDelivered agora usa $transaction atômica
 import { DeliveryType, TelegramUser, Product } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { telegramService } from './telegramService';
@@ -176,7 +178,6 @@ class DeliveryService {
     logger.info(`Iniciando entrega do pedido ${orderId}`);
 
     // FIX-QTY4: busca o próximo StockItem vinculado ao paymentId que ainda NÃO tem orderId
-    // Isso garante que cada order recebe um item diferente em compras qty > 1
     const nextItem = await prisma.stockItem.findFirst({
       where: {
         paymentId: order.paymentId!,
@@ -321,7 +322,9 @@ class DeliveryService {
 
   /**
    * Entrega todos os conteúdos de um pagamento numa única mensagem agrupada.
-   * Usado quando qty > 1 para não enviar N mensagens separadas.
+   * PERF-QTY8: após enviar a mensagem, paraleliza o registro de cada order
+   * (order.update + deliveryLog.create + markDelivered) via Promise.all.
+   * Seguro pois markDelivered agora usa $transaction atômica no stockService.
    */
   async deliverAllAsOne(
     paymentId: string,
@@ -338,30 +341,34 @@ class DeliveryService {
     }
 
     const message = buildMultiItemMessage(product, contents, product.deliveryType);
-
     const productMedias = getProductMedias(product);
+
+    // Envia a mensagem PRIMEIRO (sequencial — única msg ao Telegram)
     await sendMessageWithMedias(telegramUser.telegramId, message, productMedias);
 
-    // Marca todos os orders como entregues
-    for (let i = 0; i < orderIds.length; i++) {
-      await prisma.$transaction([
-        prisma.order.update({
-          where: { id: orderIds[i] },
-          data: { status: 'DELIVERED', deliveredAt: new Date() },
-        }),
-        prisma.deliveryLog.create({
-          data: {
-            orderId: orderIds[i],
-            attempt: 1,
-            status: 'SUCCESS',
-            message: `Entrega agrupada (${orderIds.length} unidades)`,
-          },
-        }),
-      ]);
-      if (contents[i]) {
-        await stockService.markDelivered(paymentId, orderIds[i]);
-      }
-    }
+    // PERF-QTY8: paraleliza o registro de entrega de cada order
+    // markDelivered é atômico ($transaction), então é seguro em paralelo
+    await Promise.all(
+      orderIds.map(async (orderId, i) => {
+        await prisma.$transaction([
+          prisma.order.update({
+            where: { id: orderId },
+            data: { status: 'DELIVERED', deliveredAt: new Date() },
+          }),
+          prisma.deliveryLog.create({
+            data: {
+              orderId,
+              attempt: 1,
+              status: 'SUCCESS',
+              message: `Entrega agrupada (${orderIds.length} unidades)`,
+            },
+          }),
+        ]);
+        if (contents[i]) {
+          await stockService.markDelivered(paymentId, orderId);
+        }
+      })
+    );
   }
 }
 

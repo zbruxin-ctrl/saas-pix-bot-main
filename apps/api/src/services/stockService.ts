@@ -9,6 +9,8 @@
 //           conteúdo quando releaseReservation corre antes da entrega terminar
 // FIX-QTY4: confirmReservation confirma TODOS os StockItems do pagamento (não só o primeiro)
 // FIX-QTY5: releaseReservation libera também itens CONFIRMED (não só RESERVED)
+// PERF-QTY8: markDelivered usa $transaction atômica (findFirst + update numa tx)
+//            para ser seguro em chamadas paralelas (Promise.all em deliverAllAsOne)
 import { StockItemStatus, StockReservationStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
@@ -202,22 +204,30 @@ export class StockService {
     );
   }
 
+  /**
+   * PERF-QTY8: markDelivered usa $transaction atômica.
+   * findFirst + update numa única tx garante que chamadas paralelas
+   * (Promise.all em deliverAllAsOne) nunca peguem o mesmo StockItem.
+   */
   async markDelivered(paymentId: string, orderId: string): Promise<void> {
-    const item = await prisma.stockItem.findFirst({
-      where: {
-        paymentId,
-        orderId: null,
-        status: { in: [StockItemStatus.RESERVED, StockItemStatus.CONFIRMED] },
-      },
+    await prisma.$transaction(async (tx) => {
+      const item = await tx.stockItem.findFirst({
+        where: {
+          paymentId,
+          orderId: null,
+          status: { in: [StockItemStatus.RESERVED, StockItemStatus.CONFIRMED] },
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+      if (!item) return;
+      await tx.stockItem.update({
+        where: { id: item.id },
+        data: { status: StockItemStatus.DELIVERED, orderId, deliveredAt: new Date() },
+      });
+      logger.info(
+        `[StockService] StockItem entregue | item=${item.id} | pagamento=${paymentId} | pedido=${orderId}`
+      );
     });
-    if (!item) return;
-    await prisma.stockItem.update({
-      where: { id: item.id },
-      data: { status: StockItemStatus.DELIVERED, orderId, deliveredAt: new Date() },
-    });
-    logger.info(
-      `[StockService] StockItem entregue | item=${item.id} | pagamento=${paymentId} | pedido=${orderId}`
-    );
   }
 
   async getReservedItemContent(paymentId: string): Promise<string | null> {
