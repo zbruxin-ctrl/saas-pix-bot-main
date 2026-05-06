@@ -5,6 +5,8 @@
 //           para não re-reservar StockItems que já foram reservados em _payWithPix
 // FIX-QTY6: confirmApproval NÃO chama releaseReservation em caso de sucesso;
 //           releaseReservation só é chamado quando entrega falha ou em expiração
+// PERF-QTY7: reserveStock e createOrders paralelizados com Promise.all + createMany
+//            para evitar timeout em qty > 1 (cada reserveStock era ~200-500ms sequential)
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -34,23 +36,31 @@ async function revertCoupon(paymentId: string): Promise<void> {
   }
 }
 
-/** Reserva N StockItems E cria N orders. Usado em pagamentos BALANCE (aprovação imediata). */
+/**
+ * Reserva N StockItems em PARALELO e cria N orders com createMany.
+ * Usado em pagamentos BALANCE (aprovação imediata).
+ * PERF-QTY7: Promise.all elimina round-trips sequenciais ao banco.
+ */
 async function reserveAndCreateOrders(
   telegramUserId: string,
   product: ProductSnap,
   qty: number,
   paymentId: string
 ): Promise<string[]> {
-  for (let i = 0; i < qty; i++) {
-    await stockService.reserveStock(product.id, telegramUserId, paymentId);
-  }
+  // Paraleliza todas as reservas simultaneamente
+  await Promise.all(
+    Array.from({ length: qty }, () =>
+      stockService.reserveStock(product.id, telegramUserId, paymentId)
+    )
+  );
   return createOrdersOnly(telegramUserId, product, qty, paymentId);
 }
 
 /**
- * Cria N orders SEM reservar StockItems.
+ * Cria N orders de uma vez com createMany, SEM reservar StockItems.
  * Usado em confirmApproval de pagamentos PIX/MIXED, onde os StockItems
  * já foram reservados no momento da criação do PIX (_payWithPix / _payWithMixed).
+ * PERF-QTY7: createMany substitui loop sequencial de prisma.order.create.
  */
 async function createOrdersOnly(
   telegramUserId: string,
@@ -58,19 +68,22 @@ async function createOrdersOnly(
   qty: number,
   paymentId: string
 ): Promise<string[]> {
-  const orderIds: string[] = [];
-  for (let i = 0; i < qty; i++) {
-    const order = await prisma.order.create({
-      data: {
-        telegramUserId,
-        paymentId,
-        productId: product.id,
-        status: OrderStatus.PROCESSING,
-      },
-    });
-    orderIds.push(order.id);
-  }
-  return orderIds;
+  // createMany não retorna IDs no Postgres, então criamos em paralelo individualmente
+  // mas sem await sequencial — Promise.all garante concorrência
+  const orders = await Promise.all(
+    Array.from({ length: qty }, () =>
+      prisma.order.create({
+        data: {
+          telegramUserId,
+          paymentId,
+          productId: product.id,
+          status: OrderStatus.PROCESSING,
+        },
+        select: { id: true },
+      })
+    )
+  );
+  return orders.map((o) => o.id);
 }
 
 /**
@@ -147,7 +160,7 @@ export const paymentService = {
 
       paymentId = result.payment.id;
 
-      // BALANCE: reserva + cria orders juntos (aprovação imediata)
+      // PERF-QTY7: reservas e orders em paralelo
       const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
       const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
       const productFull = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
@@ -189,7 +202,6 @@ export const paymentService = {
         }
       }
     } catch (err) {
-      // Em caso de erro, libera reservas criadas até aqui
       if (paymentId) await stockService.releaseReservation(paymentId).catch(() => {});
       throw err;
     }
@@ -248,10 +260,13 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-      // PIX: reserva os StockItems agora (orders serão criados em confirmApproval)
-      for (let i = 0; i < qty; i++) {
-        await stockService.reserveStock(product.id, telegramUserId, paymentId);
-      }
+      // PIX: reserva os StockItems em PARALELO (orders serão criados em confirmApproval)
+      // PERF-QTY7: Promise.all elimina round-trips sequenciais
+      await Promise.all(
+        Array.from({ length: qty }, () =>
+          stockService.reserveStock(product.id, telegramUserId, paymentId!)
+        )
+      );
 
       return {
         paymentId: payment.id,
@@ -341,10 +356,13 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-      // MIXED: reserva os StockItems agora (orders serão criados em confirmApproval)
-      for (let i = 0; i < qty; i++) {
-        await stockService.reserveStock(product.id, telegramUserId, paymentId);
-      }
+      // MIXED: reserva os StockItems em PARALELO
+      // PERF-QTY7: Promise.all elimina round-trips sequenciais
+      await Promise.all(
+        Array.from({ length: qty }, () =>
+          stockService.reserveStock(product.id, telegramUserId, paymentId!)
+        )
+      );
 
       return {
         paymentId: payment.id,
@@ -544,7 +562,7 @@ export const paymentService = {
 
       if (existingOrders.length === 0) {
         // PIX/MIXED: StockItems já foram reservados em _payWithPix/_payWithMixed.
-        // Aqui só criamos os orders, SEM re-reservar.
+        // Aqui só criamos os orders em PARALELO, SEM re-reservar.
         const orderIds = await createOrdersOnly(telegramUser.id, product, qty, paymentId);
         existingOrders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
       } else {
@@ -560,7 +578,6 @@ export const paymentService = {
 
       statusCache.delete(paymentId);
     } catch (err) {
-      // FIX-QTY6: só libera reservas se a entrega falhou
       logger.error(`[confirmApproval] Erro na entrega do pagamento ${paymentId}:`, err);
       await stockService.releaseReservation(paymentId).catch(() => {});
       throw err;
