@@ -1,5 +1,6 @@
 // paymentService.ts — suporte a qty > 1
 // FIX-QTY: include order → orders; acessa payment.orders[0]; payment.product via include explícito
+// FEAT-QTY2: entrega agrupada via deliverAllAsOne (1 mensagem com todos os itens)
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -53,13 +54,20 @@ async function reserveAndCreateOrders(
   return orderIds;
 }
 
-async function deliverAll(
+/**
+ * qty = 1 → deliver() normal (1 mensagem simples)
+ * qty > 1 → deliverAllAsOne() (1 mensagem com todos os itens listados)
+ */
+async function deliverOrders(
+  paymentId: string,
   orderIds: string[],
   telegramUser: import('@prisma/client').TelegramUser,
   product: import('@prisma/client').Product
 ): Promise<void> {
-  for (const orderId of orderIds) {
-    await deliveryService.deliver(orderId, telegramUser, product);
+  if (orderIds.length === 1) {
+    await deliveryService.deliver(orderIds[0], telegramUser, product);
+  } else {
+    await deliveryService.deliverAllAsOne(paymentId, telegramUser, product, orderIds);
   }
 }
 
@@ -123,7 +131,7 @@ export const paymentService = {
       const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
       const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
       const productFull = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
-      await deliverAll(orderIds, telegramUser, productFull);
+      await deliverOrders(paymentId, orderIds, telegramUser, productFull);
 
       if (referralCode) {
         try {
@@ -459,7 +467,6 @@ export const paymentService = {
   },
 
   async confirmApproval(paymentId: string): Promise<void> {
-    // FIX-QTY: include orders (array) e product explicitamente
     const payment = await prisma.payment.findUnique({
       where: { id: paymentId },
       include: { telegramUser: true, product: true, orders: true },
@@ -475,7 +482,6 @@ export const paymentService = {
       return;
     }
 
-    // Depósito (sem produto)
     if (!payment.product || !payment.productId) {
       await prisma.$transaction(async (tx) => {
         await tx.payment.update({
@@ -510,7 +516,6 @@ export const paymentService = {
         data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
       });
 
-      // FIX-QTY: payment.orders (array)
       let existingOrders = payment.orders;
 
       if (existingOrders.length === 0) {
@@ -524,7 +529,7 @@ export const paymentService = {
       }
 
       const orderIds = existingOrders.map((o) => o.id);
-      await deliverAll(orderIds, telegramUser, product);
+      await deliverOrders(paymentId, orderIds, telegramUser, product);
 
       statusCache.delete(paymentId);
     } finally {
