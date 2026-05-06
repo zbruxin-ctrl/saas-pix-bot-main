@@ -45,8 +45,8 @@
 // VARREDURA2-FIX #6: processApprovedPayment: guard order null → loga erro crítico e retorna
 // VARREDURA2-FIX #7: cancelExpiredPayment + getPaymentStatus: cancela PIX no Mercado Pago ao expirar
 // VARREDURA2-FIX #8: _payMixed: verifica estoque disponível ANTES de criar PIX no MP
-// FIX-BALANCE-DELIVERY-CONTENT: _payWithBalance retorna deliveryContent e confirmationMessage
-//                                para que o bot exiba o conteúdo do produto corretamente
+// FIX-BALANCE-DELIVERY-CONTENT: _payWithBalance retorna deliveryContent (confirmationMessage removido —
+//                                campo não existe no schema Prisma)
 import { randomUUID } from 'crypto';
 import { PaymentStatus, PaymentMethod, StockItemStatus, OrderStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
@@ -469,11 +469,10 @@ export class PaymentService {
         logger.error(`[Wallet] Erro na entrega do order ${order.id}:`, err);
       });
 
-      // FIX-BALANCE-DELIVERY-CONTENT: busca deliveryContent e confirmationMessage do produto
-      // para incluir na resposta e permitir que o bot exiba o conteúdo corretamente.
+      // FIX-BALANCE-DELIVERY-CONTENT: busca apenas deliveryContent (confirmationMessage não existe no schema)
       const productFull = await prisma.product.findUnique({
         where: { id: product.id },
-        select: { deliveryContent: true, confirmationMessage: true },
+        select: { deliveryContent: true },
       });
 
       return {
@@ -486,7 +485,6 @@ export class PaymentService {
         productName: product.name,
         paidWithBalance: true,
         deliveryContent: productFull?.deliveryContent ?? null,
-        confirmationMessage: productFull?.confirmationMessage ?? null,
         ...(pricingResult && pricingResult.discountAmount > 0 ? {
           originalAmount: pricingResult.originalAmount,
           discountAmount: pricingResult.discountAmount,
