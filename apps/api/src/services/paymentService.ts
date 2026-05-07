@@ -5,10 +5,10 @@
 //           para não re-reservar StockItems que já foram reservados em _payWithPix
 // FIX-QTY6: confirmApproval NÃO chama releaseReservation em caso de sucesso;
 //           releaseReservation só é chamado quando entrega falha ou em expiração
-// PERF-QTY7: reserveStock e createOrders paralelizados com Promise.all + createMany
-//            para evitar timeout em qty > 1 (cada reserveStock era ~200-500ms sequential)
-// FIX-POOL1: reserveStock de volta a sequencial para não esgotar pool de conexões do Neon
-//            (Promise.all com qty=6 abria 6 transações simultâneas → "Unable to start a transaction")
+// FIX-POOL1: reserveStock sequencial para não esgotar pool de conexões do Neon
+// FIX-TIMEOUT1: _payWithBalance responde ao bot IMEDIATAMENTE após debitar saldo
+//               e processa reservas+entrega em background (setImmediate)
+//               para não estourar o timeout de 25s do bot em qty > 1
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -69,9 +69,8 @@ async function reserveAndCreateOrders(
 }
 
 /**
- * Cria N orders de uma vez com Promise.all, SEM reservar StockItems.
- * Usado em confirmApproval de pagamentos PIX/MIXED, onde os StockItems
- * já foram reservados no momento da criação do PIX (_payWithPix / _payWithMixed).
+ * Cria N orders, SEM reservar StockItems.
+ * Usado em confirmApproval de pagamentos PIX/MIXED.
  */
 async function createOrdersOnly(
   telegramUserId: string,
@@ -96,8 +95,8 @@ async function createOrdersOnly(
 }
 
 /**
- * qty = 1 → deliver() normal (1 mensagem simples)
- * qty > 1 → deliverAllAsOne() (1 mensagem com todos os itens listados)
+ * qty = 1 → deliver() normal
+ * qty > 1 → deliverAllAsOne()
  */
 async function deliverOrders(
   paymentId: string,
@@ -128,53 +127,68 @@ export const paymentService = {
     deliveryContent: string | null;
   }> {
     const { telegramUserId, product, qty, amount, couponId, referralCode } = opts;
-    let paymentId: string | undefined;
 
-    try {
-      const result = await prisma.$transaction(async (tx) => {
-        const user = await tx.telegramUser.findUnique({
-          where: { id: telegramUserId },
-          select: { id: true, balance: true },
-        });
-        if (!user || Number(user.balance) < amount) {
-          throw new AppError('Saldo insuficiente.', 400);
-        }
-        const payment = await tx.payment.create({
-          data: {
-            telegramUserId,
-            productId: product.id,
-            amount,
-            qty,
-            status: PaymentStatus.APPROVED,
-            paymentMethod: 'BALANCE',
-            couponId: couponId ?? null,
-            approvedAt: new Date(),
-          },
-        });
-        await tx.telegramUser.update({
-          where: { id: telegramUserId },
-          data: { balance: { decrement: amount } },
-        });
-        await tx.walletTransaction.create({
-          data: {
-            telegramUserId,
-            type: WalletTransactionType.PURCHASE,
-            amount,
-            description: `Compra: ${product.name} x${qty}`,
-            paymentId: payment.id,
-          },
-        });
-        return { payment };
+    // Debita saldo e cria payment numa única transação — rápido (~300ms)
+    const result = await prisma.$transaction(async (tx) => {
+      const user = await tx.telegramUser.findUnique({
+        where: { id: telegramUserId },
+        select: { id: true, balance: true },
       });
+      if (!user || Number(user.balance) < amount) {
+        throw new AppError('Saldo insuficiente.', 400);
+      }
+      const payment = await tx.payment.create({
+        data: {
+          telegramUserId,
+          productId: product.id,
+          amount,
+          qty,
+          status: PaymentStatus.APPROVED,
+          paymentMethod: 'BALANCE',
+          couponId: couponId ?? null,
+          approvedAt: new Date(),
+        },
+      });
+      await tx.telegramUser.update({
+        where: { id: telegramUserId },
+        data: { balance: { decrement: amount } },
+      });
+      await tx.walletTransaction.create({
+        data: {
+          telegramUserId,
+          type: WalletTransactionType.PURCHASE,
+          amount,
+          description: `Compra: ${product.name} x${qty}`,
+          paymentId: payment.id,
+        },
+      });
+      return { payment };
+    });
 
-      paymentId = result.payment.id;
+    const paymentId = result.payment.id;
 
-      // FIX-POOL1: reservas sequenciais para não esgotar pool do Neon
-      const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
-      const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
-      const productFull = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
-      await deliverOrders(paymentId, orderIds, telegramUser, productFull);
+    // FIX-TIMEOUT1: reservas + entrega rodam em BACKGROUND via setImmediate
+    // O bot recebe resposta imediatamente; o usuário recebe a mensagem em seguida
+    setImmediate(async () => {
+      try {
+        const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
+        const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
+        const productFull  = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+        await deliverOrders(paymentId, orderIds, telegramUser, productFull);
+      } catch (err) {
+        logger.error(`[_payWithBalance] Erro na entrega background | pagamento=${paymentId}:`, err);
+        await stockService.releaseReservation(paymentId).catch(() => {});
+        // Notifica o usuário que houve problema
+        try {
+          const telegramUser = await prisma.telegramUser.findUnique({ where: { id: telegramUserId } });
+          if (telegramUser) {
+            const { telegramService } = await import('./telegramService');
+            await telegramService.sendDeliveryError(telegramUser.telegramId);
+          }
+        } catch { /* não bloqueia */ }
+      }
 
+      // Bônus de indicação (também em background)
       if (referralCode) {
         try {
           const referrer = await prisma.telegramUser.findFirst({
@@ -197,7 +211,7 @@ export const paymentService = {
                   type: WalletTransactionType.REFERRAL_REWARD,
                   amount: bonus,
                   description: `Bônus indicação: ${product.name} x${qty}`,
-                  paymentId: paymentId,
+                  paymentId,
                 },
               });
               await prisma.referral.update({
@@ -210,13 +224,11 @@ export const paymentService = {
           logger.warn('[_payWithBalance] Falha ao pagar bônus de indicação:', err);
         }
       }
-    } catch (err) {
-      if (paymentId) await stockService.releaseReservation(paymentId).catch(() => {});
-      throw err;
-    }
+    });
 
+    // Responde ao bot IMEDIATAMENTE, sem esperar reservas/entrega
     return {
-      paymentId: paymentId!,
+      paymentId,
       paidWithBalance: true,
       productName: product.name,
       deliveryContent: product.deliveryContent,
@@ -269,7 +281,7 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-      // FIX-POOL1: reservas sequenciais para não esgotar pool do Neon
+      // FIX-POOL1: reservas sequenciais
       await reserveStockSequential(product.id, telegramUserId, paymentId, qty);
 
       return {
@@ -360,7 +372,7 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-      // FIX-POOL1: reservas sequenciais para não esgotar pool do Neon
+      // FIX-POOL1: reservas sequenciais
       await reserveStockSequential(product.id, telegramUserId, paymentId, qty);
 
       return {
@@ -550,7 +562,6 @@ export const paymentService = {
     const telegramUser = payment.telegramUser;
     const qty: number = (payment as any).qty ?? 1;
 
-    let deliverySucceeded = false;
     try {
       await prisma.payment.update({
         where: { id: paymentId },
@@ -560,8 +571,6 @@ export const paymentService = {
       let existingOrders = payment.orders;
 
       if (existingOrders.length === 0) {
-        // PIX/MIXED: StockItems já foram reservados em _payWithPix/_payWithMixed.
-        // Aqui só criamos os orders em paralelo, SEM re-reservar.
         const orderIds = await createOrdersOnly(telegramUser.id, product, qty, paymentId);
         existingOrders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
       } else {
@@ -573,7 +582,6 @@ export const paymentService = {
 
       const orderIds = existingOrders.map((o) => o.id);
       await deliverOrders(paymentId, orderIds, telegramUser, product);
-      deliverySucceeded = true;
 
       statusCache.delete(paymentId);
     } catch (err) {
