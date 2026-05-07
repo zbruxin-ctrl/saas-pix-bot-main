@@ -22,6 +22,8 @@
 // FIX-DELIVERY-ITEMS: GET /:id/delivered-items retorna conteudo real dos StockItems entregues
 // FIX-BOT-SOURCE: botSource adicionado ao createPaymentSchema ('telegram' | 'whatsapp')
 //   Permite que a API saiba qual bot originou o pagamento e ajuste o comportamento de entrega.
+// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens (payment.quantity) estão DELIVERED.
+//   Antes: ready=true com 1 item — bot exibia apenas 1 item mesmo em pedidos com qty>1.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -57,7 +59,7 @@ const createDepositSchema = z.object({
   username: z.string().optional(),
 });
 
-// ─── Helpers ──────────────────────────────────────────────────
+// ─── Helpers ────────────────────────────────────────────────
 
 async function isMaintenanceActive(): Promise<{ active: boolean; message: string }> {
   const [mode, msg] = await Promise.all([
@@ -95,7 +97,7 @@ async function getPaymentIfOwner(
   return payment ?? null;
 }
 
-// ─── Rotas estáticas PRIMEIRO ──────────────────────────────────────────────────
+// ─── Rotas estáticas PRIMEIRO ───────────────────────────────────────────────────────────
 
 // GET /api/payments/bot-config?telegramId=xxx
 paymentsRouter.get(
@@ -367,7 +369,7 @@ paymentsRouter.get(
   }
 );
 
-// ─── Rotas dinâmicas DEPOIS das estáticas ─────────────────────────────────────────
+// ─── Rotas dinâmicas DEPOIS das estáticas ─────────────────────────────────────────────────────
 
 // POST /api/payments/:id/cancel
 paymentsRouter.post(
@@ -426,7 +428,9 @@ paymentsRouter.get(
 
 // GET /api/payments/:id/delivered-items?telegramId=xxx
 // FIX-DELIVERY-ITEMS: retorna o conteudo real de cada StockItem entregue para este pagamento.
-// Usado pelo WhatsApp bot para exibir os itens reais em vez do template _FIFO_ do produto.
+// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens esperados (payment.quantity)
+//   estão com status DELIVERED. Antes: ready=true com 1 item entregue — bot exibia
+//   apenas 1 item em pedidos com qty>1 (race condition de polling vs entrega paralela).
 paymentsRouter.get(
   '/:id/delivered-items',
   requireBotSecret,
@@ -445,25 +449,33 @@ paymentsRouter.get(
       return;
     }
 
-    // Busca todos os StockItems com status DELIVERED vinculados a orders deste pagamento
-    const items = await prisma.stockItem.findMany({
-      where: {
-        order: {
-          paymentId: id,
+    // FIX-DELIVERY-READY: busca payment.quantity junto com os itens entregues
+    // para garantir que só sinalizamos ready=true quando TODOS estão prontos.
+    const [payment, items] = await Promise.all([
+      prisma.payment.findUnique({
+        where: { id },
+        select: { quantity: true },
+      }),
+      prisma.stockItem.findMany({
+        where: {
+          order: { paymentId: id },
+          status: StockItemStatus.DELIVERED,
         },
-        status: StockItemStatus.DELIVERED,
-      },
-      select: {
-        content: true,
-      },
-      orderBy: { updatedAt: 'asc' },
-    });
+        select: { content: true },
+        orderBy: { updatedAt: 'asc' },
+      }),
+    ]);
+
+    // Quantidade esperada: payment.quantity (padrão 1 se não definida)
+    const expectedQty = payment?.quantity ?? 1;
+    const ready = items.length >= expectedQty;
 
     res.json({
       success: true,
       data: {
-        ready: items.length > 0,
-        items: items.map((i) => i.content),
+        ready,
+        // Só exibe os itens quando todos estão prontos para evitar entrega parcial
+        items: ready ? items.map((i) => i.content) : [],
       },
     });
   }
