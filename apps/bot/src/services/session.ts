@@ -2,12 +2,12 @@
  * Gerenciamento de sessões de usuário via Redis (Upstash HTTP).
  * Em dev sem Upstash, usa fallback em memória (InMemoryRedis no redis.ts).
  *
- * FEAT: usedCoupons — lista de cupões já utilizados pelo usuário (por código).
+ * FEAT: usedCoupons — lista de cupons já utilizados pelo usuário (por código).
  *       Garante que cada cupão possa ser usado apenas 1x por conta.
  * FIX #7: clearSession preserva usedCoupons da sessão atual quando não fornecido.
  * FIX #6: UserSession inclui referralCode (salvo no /start a partir do startPayload).
- * FEAT-PIX-CODE-MSG: pixCodeMessageId — message_id da mensagem do código copia e cola
- *   para que handleCancelPayment possa deletá-la junto com a mensagem do QR.
+ * FEAT-PIX-MSG-IDS: pixQrMessageId + pixCodeMessageId — message_ids da foto do QR
+ *   e do código copia e cola, para deletar ambas ao cancelar/expirar o PIX.
  */
 import { redis } from './redis';
 
@@ -17,6 +17,9 @@ export interface UserSession {
   paymentId?: string;
   pixExpiresAt?: string;
   pixQrCodeText?: string;
+  /** message_id da mensagem da foto do QR Code */
+  pixQrMessageId?: number;
+  /** message_id da mensagem do código copia e cola */
   pixCodeMessageId?: number;
   depositPaymentId?: string;
   depositMessageId?: number;
@@ -75,7 +78,6 @@ export async function saveSession(userId: number, session: UserSession): Promise
  * FIX #7: lê usedCoupons da sessão atual antes de limpar, para nunca perdê-los.
  */
 export async function clearSession(userId: number, keepFirstName?: string): Promise<void> {
-  // Lê a sessão atual para preservar usedCoupons e referralCode
   const current = await getSession(userId);
   await saveSession(userId, {
     step: 'idle',
