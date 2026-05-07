@@ -22,8 +22,9 @@
 // FIX-DELIVERY-ITEMS: GET /:id/delivered-items retorna conteudo real dos StockItems entregues
 // FIX-BOT-SOURCE: botSource adicionado ao createPaymentSchema ('telegram' | 'whatsapp')
 //   Permite que a API saiba qual bot originou o pagamento e ajuste o comportamento de entrega.
-// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens (payment.quantity) estão DELIVERED.
-//   Antes: ready=true com 1 item — bot exibia apenas 1 item mesmo em pedidos com qty>1.
+// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens (payment.qty) estão DELIVERED.
+//   Antes: ready=true com 1 item — bot exibia apenas 1 item em pedidos com qty>1.
+// FIX-BUILD: campo correto é `qty` (não `quantity`) no model Payment do Prisma.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -428,9 +429,10 @@ paymentsRouter.get(
 
 // GET /api/payments/:id/delivered-items?telegramId=xxx
 // FIX-DELIVERY-ITEMS: retorna o conteudo real de cada StockItem entregue para este pagamento.
-// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens esperados (payment.quantity)
+// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens esperados (payment.qty)
 //   estão com status DELIVERED. Antes: ready=true com 1 item entregue — bot exibia
 //   apenas 1 item em pedidos com qty>1 (race condition de polling vs entrega paralela).
+// FIX-BUILD: campo é `qty` (não `quantity`) no model Payment do Prisma.
 paymentsRouter.get(
   '/:id/delivered-items',
   requireBotSecret,
@@ -449,12 +451,13 @@ paymentsRouter.get(
       return;
     }
 
-    // FIX-DELIVERY-READY: busca payment.quantity junto com os itens entregues
+    // FIX-DELIVERY-READY: busca payment.qty junto com os itens entregues
     // para garantir que só sinalizamos ready=true quando TODOS estão prontos.
+    // FIX-BUILD: campo correto é `qty` (não `quantity`) — schema Payment usa `qty Int @default(1)`
     const [payment, items] = await Promise.all([
       prisma.payment.findUnique({
         where: { id },
-        select: { quantity: true },
+        select: { qty: true },
       }),
       prisma.stockItem.findMany({
         where: {
@@ -466,8 +469,8 @@ paymentsRouter.get(
       }),
     ]);
 
-    // Quantidade esperada: payment.quantity (padrão 1 se não definida)
-    const expectedQty = payment?.quantity ?? 1;
+    // Quantidade esperada: payment.qty (padrão 1 se não definida)
+    const expectedQty = payment?.qty ?? 1;
     const ready = items.length >= expectedQty;
 
     res.json({
