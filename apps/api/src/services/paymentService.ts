@@ -7,6 +7,8 @@
 //           releaseReservation só é chamado quando entrega falha ou em expiração
 // PERF-QTY7: reserveStock e createOrders paralelizados com Promise.all + createMany
 //            para evitar timeout em qty > 1 (cada reserveStock era ~200-500ms sequential)
+// FIX-POOL1: reserveStock de volta a sequencial para não esgotar pool de conexões do Neon
+//            (Promise.all com qty=6 abria 6 transações simultâneas → "Unable to start a transaction")
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -37,9 +39,24 @@ async function revertCoupon(paymentId: string): Promise<void> {
 }
 
 /**
- * Reserva N StockItems em PARALELO e cria N orders com createMany.
+ * Reserva N StockItems SEQUENCIALMENTE para não esgotar o pool de conexões do Neon.
+ * FIX-POOL1: Promise.all com qty=6 abria 6 transações simultâneas causando
+ *            "Unable to start a transaction in the given time".
+ */
+async function reserveStockSequential(
+  productId: string,
+  telegramUserId: string,
+  paymentId: string,
+  qty: number
+): Promise<void> {
+  for (let i = 0; i < qty; i++) {
+    await stockService.reserveStock(productId, telegramUserId, paymentId);
+  }
+}
+
+/**
+ * Reserva N StockItems e cria N orders.
  * Usado em pagamentos BALANCE (aprovação imediata).
- * PERF-QTY7: Promise.all elimina round-trips sequenciais ao banco.
  */
 async function reserveAndCreateOrders(
   telegramUserId: string,
@@ -47,20 +64,14 @@ async function reserveAndCreateOrders(
   qty: number,
   paymentId: string
 ): Promise<string[]> {
-  // Paraleliza todas as reservas simultaneamente
-  await Promise.all(
-    Array.from({ length: qty }, () =>
-      stockService.reserveStock(product.id, telegramUserId, paymentId)
-    )
-  );
+  await reserveStockSequential(product.id, telegramUserId, paymentId, qty);
   return createOrdersOnly(telegramUserId, product, qty, paymentId);
 }
 
 /**
- * Cria N orders de uma vez com createMany, SEM reservar StockItems.
+ * Cria N orders de uma vez com Promise.all, SEM reservar StockItems.
  * Usado em confirmApproval de pagamentos PIX/MIXED, onde os StockItems
  * já foram reservados no momento da criação do PIX (_payWithPix / _payWithMixed).
- * PERF-QTY7: createMany substitui loop sequencial de prisma.order.create.
  */
 async function createOrdersOnly(
   telegramUserId: string,
@@ -68,8 +79,6 @@ async function createOrdersOnly(
   qty: number,
   paymentId: string
 ): Promise<string[]> {
-  // createMany não retorna IDs no Postgres, então criamos em paralelo individualmente
-  // mas sem await sequencial — Promise.all garante concorrência
   const orders = await Promise.all(
     Array.from({ length: qty }, () =>
       prisma.order.create({
@@ -160,7 +169,7 @@ export const paymentService = {
 
       paymentId = result.payment.id;
 
-      // PERF-QTY7: reservas e orders em paralelo
+      // FIX-POOL1: reservas sequenciais para não esgotar pool do Neon
       const orderIds = await reserveAndCreateOrders(telegramUserId, product, qty, paymentId);
       const telegramUser = await prisma.telegramUser.findUniqueOrThrow({ where: { id: telegramUserId } });
       const productFull = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
@@ -260,13 +269,8 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-      // PIX: reserva os StockItems em PARALELO (orders serão criados em confirmApproval)
-      // PERF-QTY7: Promise.all elimina round-trips sequenciais
-      await Promise.all(
-        Array.from({ length: qty }, () =>
-          stockService.reserveStock(product.id, telegramUserId, paymentId!)
-        )
-      );
+      // FIX-POOL1: reservas sequenciais para não esgotar pool do Neon
+      await reserveStockSequential(product.id, telegramUserId, paymentId, qty);
 
       return {
         paymentId: payment.id,
@@ -356,13 +360,8 @@ export const paymentService = {
       });
 
       paymentId = payment.id;
-      // MIXED: reserva os StockItems em PARALELO
-      // PERF-QTY7: Promise.all elimina round-trips sequenciais
-      await Promise.all(
-        Array.from({ length: qty }, () =>
-          stockService.reserveStock(product.id, telegramUserId, paymentId!)
-        )
-      );
+      // FIX-POOL1: reservas sequenciais para não esgotar pool do Neon
+      await reserveStockSequential(product.id, telegramUserId, paymentId, qty);
 
       return {
         paymentId: payment.id,
@@ -562,7 +561,7 @@ export const paymentService = {
 
       if (existingOrders.length === 0) {
         // PIX/MIXED: StockItems já foram reservados em _payWithPix/_payWithMixed.
-        // Aqui só criamos os orders em PARALELO, SEM re-reservar.
+        // Aqui só criamos os orders em paralelo, SEM re-reservar.
         const orderIds = await createOrdersOnly(telegramUser.id, product, qty, paymentId);
         existingOrders = await prisma.order.findMany({ where: { id: { in: orderIds } } });
       } else {
