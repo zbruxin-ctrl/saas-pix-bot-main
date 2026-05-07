@@ -19,6 +19,9 @@
 // AUDIT #18: Axios com httpsAgent keepAlive:true
 // FEAT-SUPPORT: getBotConfig inclui supportPhone lido do painel admin
 // FIX-WELCOME: getBotConfig inclui welcomeMessage lido do painel admin
+// FIX-CANCEL-CLIENT: cancelPayment captura ApiHttpError 400/403 e retorna
+//   { cancelled: false, message } em vez de relançar — evita exibir mensagem
+//   genérica 'Erro ao cancelar pagamento.' no handler.
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import https from 'https';
 import { env } from '../config/env';
@@ -257,13 +260,23 @@ class ApiClient {
     paymentId: string,
     telegramId: string
   ): Promise<{ cancelled: boolean; message: string }> {
-    const { data } = await this.withRetry(() =>
-      this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
-        `/api/payments/${paymentId}/cancel`,
-        { telegramId }
-      )
-    );
-    return data.data!;
+    try {
+      const { data } = await this.withRetry(() =>
+        this.client.post<ApiResponse<{ cancelled: boolean; message: string }>>(
+          `/api/payments/${paymentId}/cancel`,
+          { telegramId }
+        )
+      );
+      return data.data!;
+    } catch (err) {
+      // FIX-CANCEL-CLIENT: erros HTTP esperados (400 = status inválido, 403 = ownership)
+      // são tratados aqui e retornam { cancelled: false, message } com o texto real da API.
+      // Apenas erros de rede/timeout são relançados (isRetryable já tentou 1x antes de chegar aqui).
+      if (err instanceof ApiHttpError && (err.statusCode === 400 || err.statusCode === 403)) {
+        return { cancelled: false, message: err.message };
+      }
+      throw err;
+    }
   }
 
   async getReferralInfo(telegramId: string): Promise<ReferralInfo> {
