@@ -19,6 +19,7 @@
 // FIX-WELCOME: /bot-config inclui welcomeMessage lido do painel admin (welcome_message)
 // FIX-ROUTES: createDepositPayment → createDeposit; cancelPayment result.reason → result.message
 // FIX-QTY-SCHEMA: quantity adicionado ao createPaymentSchema (era descartado pelo Zod)
+// FIX-DELIVERY-ITEMS: GET /:id/delivered-items retorna conteudo real dos StockItems entregues
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { StockItemStatus } from '@prisma/client';
@@ -411,5 +412,50 @@ paymentsRouter.get(
 
     const status = await paymentService.getPaymentStatus(id);
     res.json({ success: true, data: status });
+  }
+);
+
+// GET /api/payments/:id/delivered-items?telegramId=xxx
+// FIX-DELIVERY-ITEMS: retorna o conteudo real de cada StockItem entregue para este pagamento.
+// Usado pelo WhatsApp bot para exibir os itens reais em vez do template _FIFO_ do produto.
+paymentsRouter.get(
+  '/:id/delivered-items',
+  requireBotSecret,
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { telegramId } = req.query as { telegramId?: string };
+
+    if (!telegramId) {
+      res.status(400).json({ success: false, error: 'telegramId é obrigatório' });
+      return;
+    }
+
+    const owned = await getPaymentIfOwner(id, telegramId);
+    if (!owned) {
+      res.status(403).json({ success: false, error: 'Não autorizado.' });
+      return;
+    }
+
+    // Busca todos os StockItems com status DELIVERED vinculados a orders deste pagamento
+    const items = await prisma.stockItem.findMany({
+      where: {
+        order: {
+          paymentId: id,
+        },
+        status: StockItemStatus.DELIVERED,
+      },
+      select: {
+        content: true,
+      },
+      orderBy: { updatedAt: 'asc' },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        ready: items.length > 0,
+        items: items.map((i) => i.content),
+      },
+    });
   }
 );
