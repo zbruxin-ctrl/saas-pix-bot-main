@@ -62,7 +62,10 @@ app.use(cors({
 app.use(compression());
 app.use(cookieParser(env.COOKIE_SECRET));
 app.use(morgan('combined', { stream: { write: (msg) => logger.info(msg.trim()) } }));
+
+// raw body parser para ambos os prefixos do webhooksRouter
 app.use('/api/webhooks', express.raw({ type: 'application/json', limit: '1mb' }));
+app.use('/webhooks',     express.raw({ type: 'application/json', limit: '1mb' }));
 
 app.use('/telegram-webhook', express.json({ limit: '1mb' }));
 app.use('/telegram-webhook', telegramRouter);
@@ -177,12 +180,13 @@ app.post('/internal/register-bot', (req, res) => {
   res.json({ ok: true });
 });
 
-app.use('/api/auth', authRouter);
-app.use('/api/payments', paymentsRouter);
-app.use('/api/webhooks', webhooksRouter);
-app.use('/api/admin', adminRouter);
-app.use('/api/pricing', pricingRouter);
-app.use('/api/coupons', couponsRouter);
+app.use('/api/auth',      authRouter);
+app.use('/api/payments',  paymentsRouter);
+app.use('/api/webhooks',  webhooksRouter);
+app.use('/webhooks',      webhooksRouter);  // alias sem /api — usado pelo MercadoPago
+app.use('/api/admin',     adminRouter);
+app.use('/api/pricing',   pricingRouter);
+app.use('/api/coupons',   couponsRouter);
 app.use('/api/referrals', referralsRouter);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
