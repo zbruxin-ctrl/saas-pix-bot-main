@@ -7,12 +7,10 @@
  *
  * FIX-QTY-BOT: quantity (session.pendingQty) agora é passado no createPayment.
  * FIX-DELIVERY-BOT: bot não monta mais mensagem de entrega para BALANCE/PIX.
- *   A API (deliveryService) já entregou o conteúdo direto ao usuário.
- *   O bot apenas exibe confirmação simples sem repetir o conteúdo.
- * FIX-CANCEL-EDIT: handleCancelPayment edita a mensagem do QR Code (remove botões)
- *   em vez de só enviar nova mensagem.
- * FIX-CANCEL-CODE-MSG: salva pixCodeMessageId na session e deleta a mensagem do
- *   código copia e cola ao cancelar/expirar o PIX.
+ * FIX-CANCEL-DELETE: ao cancelar/expirar PIX, deleta as 2 mensagens (QR foto +
+ *   código copia e cola) e envia nova mensagem de status.
+ *   editMessageText não funciona em mensagens de foto (replyWithPhoto) —
+ *   a solução correta é deletar + reply.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -54,11 +52,11 @@ async function editOrReply(
 }
 
 /**
- * Tenta deletar uma mensagem pelo message_id. Silencia erros (mensagem já deletada, etc).
+ * Tenta deletar uma mensagem pelo message_id. Silencia erros.
  */
 async function tryDeleteMessage(ctx: Context, messageId: number): Promise<void> {
   try {
-    const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat.id;
+    const chatId = ctx.chat?.id ?? (ctx.callbackQuery?.message as { chat?: { id?: number } } | undefined)?.chat?.id;
     if (chatId) await ctx.telegram.deleteMessage(chatId, messageId);
   } catch {
     // silencia: mensagem pode já ter sido deletada ou ser muito antiga (>48h)
@@ -297,8 +295,10 @@ export async function executePayment(
       ? `\nSaldo usado: R\\$ ${String(payment.balanceUsed.toFixed(2)).replace('.', '\\.')}\n*PIX:* R\\$ ${String((payment.pixAmount ?? payment.amount ?? 0).toFixed(2)).replace('.', '\\.')}`
       : '';
 
+    // Salva message_id do QR e do código copia e cola para deletar ao cancelar/expirar
+    let pixQrMessageId: number | undefined;
     if (qrImage) {
-      await ctx.replyWithPhoto(
+      const qrMsg = await ctx.replyWithPhoto(
         { url: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrText)}` },
         {
           caption:
@@ -312,8 +312,9 @@ export async function executePayment(
           ]).reply_markup,
         }
       );
+      pixQrMessageId = qrMsg.message_id;
     } else {
-      await ctx.reply(
+      const qrMsg = await ctx.reply(
         `💳 <b>PIX gerado!</b>\n\nTotal: R$ ${(payment.amount ?? 0).toFixed(2)}\n\nCopie o código abaixo:`,
         {
           parse_mode: 'HTML',
@@ -323,12 +324,14 @@ export async function executePayment(
           ]).reply_markup,
         }
       );
+      pixQrMessageId = qrMsg.message_id;
     }
 
-    // FIX-CANCEL-CODE-MSG: salva o message_id do código copia e cola
-    // para poder deletá-lo ao cancelar/expirar o PIX.
     const codeMsg = await ctx.reply(`<code>${qrText}</code>`, { parse_mode: 'HTML' });
+
+    // Persiste ambos os message_ids na session
     const updatedSession = await getSession(userId);
+    updatedSession.pixQrMessageId   = pixQrMessageId;
     updatedSession.pixCodeMessageId = codeMsg.message_id;
     await saveSession(userId, updatedSession);
 
@@ -400,8 +403,9 @@ export async function handleCancelPayment(
     const userId    = ctx.from!.id;
     const firstName = ctx.from!.first_name;
 
-    // FIX-CANCEL-CODE-MSG: lê message_id do código antes de limpar a sessão
-    const session = await getSession(userId);
+    // Lê os message_ids ANTES de limpar a session
+    const session          = await getSession(userId);
+    const pixQrMessageId   = session.pixQrMessageId;
     const pixCodeMessageId = session.pixCodeMessageId;
 
     const result = await apiClient.cancelPayment(paymentId, String(userId));
@@ -410,11 +414,12 @@ export async function handleCancelPayment(
     await clearSession(userId, firstName);
 
     if (result.cancelled) {
-      // Deleta a mensagem do código copia e cola
-      if (pixCodeMessageId) await tryDeleteMessage(ctx, pixCodeMessageId);
-      // Edita a mensagem do QR (remove botões)
-      await editOrReply(
-        ctx,
+      // Deleta QR (foto) + código copia e cola
+      await Promise.all([
+        pixQrMessageId   ? tryDeleteMessage(ctx, pixQrMessageId)   : Promise.resolve(),
+        pixCodeMessageId ? tryDeleteMessage(ctx, pixCodeMessageId) : Promise.resolve(),
+      ]);
+      await ctx.reply(
         `❌ <b>PIX cancelado.</b>\n\nUse /produtos para fazer um novo pedido.`,
         {
           parse_mode: 'HTML',
@@ -424,8 +429,7 @@ export async function handleCancelPayment(
         }
       );
     } else {
-      await editOrReply(
-        ctx,
+      await ctx.reply(
         `⚠️ ${escapeHtml(result.message ?? 'Não foi possível cancelar o pagamento.')}`,
         { parse_mode: 'HTML' }
       );
@@ -451,15 +455,19 @@ export async function schedulePIXExpiry(
 
   const timer = setTimeout(async () => {
     try {
-      const session = await getSession(userId);
+      const session          = await getSession(userId);
       if (session.paymentId !== paymentId) return;
       const firstName        = session.firstName ?? '';
+      const pixQrMessageId   = session.pixQrMessageId;
       const pixCodeMessageId = session.pixCodeMessageId;
       cancelPIXTimer(userId);
       await clearPixExpiry(userId);
       await clearSession(userId, firstName);
-      // Deleta o código copia e cola ao expirar também
-      if (pixCodeMessageId) await tryDeleteMessage(ctx, pixCodeMessageId);
+      // Deleta QR + código ao expirar também
+      await Promise.all([
+        pixQrMessageId   ? tryDeleteMessage(ctx, pixQrMessageId)   : Promise.resolve(),
+        pixCodeMessageId ? tryDeleteMessage(ctx, pixCodeMessageId) : Promise.resolve(),
+      ]);
       await ctx.reply(
         `⏰ <b>PIX expirado!</b>\n\nSeu PIX expirou. Use /produtos para gerar um novo pedido.`,
         {
