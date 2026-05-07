@@ -22,11 +22,6 @@
 //   aguardar todos os StockItems serem reservados antes de montar a mensagem.
 //   Corrige race condition com setImmediate do _payWithBalance onde getReservedItemsContent
 //   retornava menos itens que o qty comprado (ex: 2 de 5), causando mensagem incompleta.
-// PERF-BATCH: deliverAllAsOne processa ordens em batches de BATCH_SIZE=2 em paralelo.
-//   Antes (FIX-POOL2): loop 100% sequencial — qty=5 → ~50s.
-//   Agora: batches de 2 → qty=5 → ~18s, qty=10 → ~35s.
-//   BATCH_SIZE=2 é seguro no Neon Free (pool 5 conexões): cada batch abre
-//   2×(order.update + deliveryLog.create) + 2×markDelivered = 4 queries simultâneas.
 import { DeliveryType, TelegramUser, Product } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { telegramService } from './telegramService';
@@ -38,15 +33,6 @@ const BASE_RETRY_MS = 3000;
 const MAX_RETRY_MS = 15000;
 const DELIVERY_TIMEOUT_MS = 30_000;
 const TELEGRAM_CAPTION_LIMIT = 1024;
-
-/**
- * PERF-BATCH: quantas ordens processar em paralelo dentro de deliverAllAsOne.
- * 2 é o sweet-spot para o Neon Free (pool de 5 conexões):
- *   cada item abre 1 $transaction (order+log) + 1 markDelivered ($transaction interna) = 2 tx
- *   BATCH_SIZE=2 → 4 transações simultâneas → margem segura abaixo de 5.
- * Aumente para 3 apenas se migrar para um plano Neon com pool ≥ 10.
- */
-const BATCH_SIZE = 2;
 
 type MediaEntry = {
   url: string;
@@ -417,9 +403,6 @@ class DeliveryService {
    *   Bot WhatsApp busca os itens via GET /delivered-items (polling).
    * FIX-QTY-TIMING: aguarda todos os StockItems serem reservados antes de montar
    *   a mensagem, evitando race condition com setImmediate do _payWithBalance.
-   * PERF-BATCH: processa ordens em batches de BATCH_SIZE em paralelo.
-   *   Cada batch roda Promise.all com BATCH_SIZE itens, depois aguarda antes do próximo.
-   *   Reduz ~50s (sequencial) para ~18s (batches de 2) para qty=5 no Neon Free.
    */
   async deliverAllAsOne(
     paymentId: string,
@@ -469,42 +452,30 @@ class DeliveryService {
       );
     }
 
-    // PERF-BATCH: processa ordens em batches de BATCH_SIZE em paralelo.
-    // Cada item do batch abre 1 $transaction (order+log) + 1 markDelivered = 2 tx simultâneas.
-    // BATCH_SIZE=2 → 4 tx simultâneas por batch → seguro no pool do Neon Free (max 5 conexões).
-    // Antes: loop sequencial — qty=5 → ~50s. Agora: batches de 2 → qty=5 → ~18s.
-    for (let i = 0; i < orderIds.length; i += BATCH_SIZE) {
-      const batch = orderIds.slice(i, i + BATCH_SIZE);
-      await Promise.all(
-        batch.map(async (orderId, batchIndex) => {
-          const globalIndex = i + batchIndex;
-          await prisma.$transaction([
-            prisma.order.update({
-              where: { id: orderId },
-              data: { status: 'DELIVERED', deliveredAt: new Date() },
-            }),
-            prisma.deliveryLog.create({
-              data: {
-                orderId,
-                attempt: 1,
-                status: 'SUCCESS',
-                message: botSource === 'whatsapp'
-                  ? `Entrega via WhatsApp bot (${orderIds.length} unidades) — conteúdo via GET /delivered-items`
-                  : `Entrega agrupada (${orderIds.length} unidades)`,
-              },
-            }),
-          ]);
-          if (contents[globalIndex]) {
-            await stockService.markDelivered(paymentId, orderId);
-          }
-        })
-      );
+    // FIX-POOL2: registra cada order SEQUENCIALMENTE para não esgotar pool do Neon.
+    // Esta etapa SEMPRE ocorre, independente do botSource ou resultado do envio.
+    for (let i = 0; i < orderIds.length; i++) {
+      const orderId = orderIds[i];
+      await prisma.$transaction([
+        prisma.order.update({
+          where: { id: orderId },
+          data: { status: 'DELIVERED', deliveredAt: new Date() },
+        }),
+        prisma.deliveryLog.create({
+          data: {
+            orderId,
+            attempt: 1,
+            status: 'SUCCESS',
+            message: botSource === 'whatsapp'
+              ? `Entrega via WhatsApp bot (${orderIds.length} unidades) — conteúdo via GET /delivered-items`
+              : `Entrega agrupada (${orderIds.length} unidades)`,
+          },
+        }),
+      ]);
+      if (contents[i]) {
+        await stockService.markDelivered(paymentId, orderId);
+      }
     }
-
-    logger.info(
-      `[deliverAllAsOne] pagamento=${paymentId} — ${orderIds.length} ordem(ns) marcadas DELIVERED ` +
-      `em batches de ${BATCH_SIZE} (botSource=${botSource})`
-    );
   }
 }
 
