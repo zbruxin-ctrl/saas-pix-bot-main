@@ -7,10 +7,9 @@
  *
  * FIX-QTY-BOT: quantity (session.pendingQty) agora é passado no createPayment.
  * FIX-DELIVERY-BOT: bot não monta mais mensagem de entrega para BALANCE/PIX.
- * FIX-CANCEL-DELETE: ao cancelar/expirar PIX, deleta as 2 mensagens (QR foto +
- *   código copia e cola) e envia nova mensagem de status.
- * FIX-CANCEL-NOT-PENDING: quando API retorna 'Apenas pagamentos pendentes podem
- *   ser cancelados', deleta as mensagens, limpa a sessão e exibe mensagem amigável.
+ * FIX-CANCEL-DELETE: ao cancelar/expirar/aprovar PIX, deleta as 2 mensagens
+ *   (QR foto + código copia e cola) antes de enviar mensagem de status.
+ * FIX-CANCEL-NOT-PENDING: mensagem amigável quando pagamento já foi processado.
  */
 import { Context, Markup } from 'telegraf';
 import { apiClient } from '../services/apiClient';
@@ -369,9 +368,18 @@ export async function handleCheckPayment(
     const status    = await apiClient.getPaymentStatus(paymentId, String(userId));
 
     if (status.status === 'APPROVED') {
+      // Lê os message_ids ANTES de limpar a sessão
+      const session          = await getSession(userId);
+      const pixQrMessageId   = session.pixQrMessageId;
+      const pixCodeMessageId = session.pixCodeMessageId;
+
       cancelPIXTimer(userId);
       await clearPixExpiry(userId);
       await clearSession(userId, firstName);
+
+      // Deleta QR + código copia e cola
+      await deletePixMessages(ctx, pixQrMessageId, pixCodeMessageId);
+
       await ctx.reply(
         `✅ <b>Pagamento confirmado!</b>\n\n` +
         `📦 <b>${escapeHtml(status.productName ?? 'seu produto')}</b>\n\n` +
@@ -382,9 +390,22 @@ export async function handleCheckPayment(
     }
 
     if (status.status === 'EXPIRED' || status.status === 'CANCELLED') {
+      // Lê os ids e deleta mesmo em caso de expirado/cancelado via polling
+      const session          = await getSession(userId);
+      const pixQrMessageId   = session.pixQrMessageId;
+      const pixCodeMessageId = session.pixCodeMessageId;
+      cancelPIXTimer(userId);
+      await clearPixExpiry(userId);
+      await clearSession(userId, firstName);
+      await deletePixMessages(ctx, pixQrMessageId, pixCodeMessageId);
       await ctx.reply(
         `⏰ Este PIX expirou ou foi cancelado. Use /produtos para fazer um novo pedido.`,
-        { parse_mode: 'HTML' }
+        {
+          parse_mode: 'HTML',
+          reply_markup: Markup.inlineKeyboard([
+            [Markup.button.callback('🛒 Ver Produtos', 'show_products')],
+          ]).reply_markup,
+        }
       );
       return;
     }
@@ -439,7 +460,6 @@ export async function handleCancelPayment(
     await clearPixExpiry(userId);
     await clearSession(userId, firstName);
 
-    // Deleta QR + código independente do resultado
     await deletePixMessages(ctx, pixQrMessageId, pixCodeMessageId);
 
     if (result.cancelled) {
@@ -453,7 +473,6 @@ export async function handleCancelPayment(
         }
       );
     } else if (isAlreadyProcessed(result.message ?? '')) {
-      // Pagamento já foi aprovado ou expirado — mensagem amigável
       await ctx.reply(
         `ℹ️ <b>Este PIX já foi processado</b> (aprovado ou expirado) e não pode mais ser cancelado.\n\n` +
         `Use /produtos para fazer um novo pedido.`,
