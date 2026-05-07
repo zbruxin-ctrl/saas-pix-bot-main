@@ -21,6 +21,8 @@
 //   por tentativa. Antes era só o telegramUserId fixo: o MP detectava como duplicado
 //   e retornava o mesmo mercadoPagoId do PIX anterior (mesmo cancelado), causando
 //   P2002 unique constraint e o bot reutilizando um payment CANCELLED.
+// FIX-STATUS: confirmApproval agora atualiza status=APPROVED + approvedAt antes da
+//   entrega, garantindo que o painel admin reflita o pagamento como aprovado.
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -672,6 +674,7 @@ export const paymentService = {
         qty: true,
         paymentMethod: true,
         botSource: true,
+        status: true,
       },
     });
 
@@ -679,6 +682,20 @@ export const paymentService = {
       logger.warn(`[confirmApproval] Pagamento ${paymentId} não encontrado ou sem produto.`);
       return;
     }
+
+    // Idempotência: se já foi aprovado anteriormente, não reprocessa
+    if (payment.status === PaymentStatus.APPROVED) {
+      logger.info(`[confirmApproval] Pagamento ${paymentId} já está APPROVED. Ignorando.`);
+      return;
+    }
+
+    // FIX-STATUS: atualiza status para APPROVED ANTES de entregar
+    await prisma.payment.update({
+      where: { id: paymentId },
+      data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
+    });
+    // Invalida cache de status para que o bot veja APPROVED imediatamente
+    statusCache.delete(paymentId);
 
     const telegramUser = await prisma.telegramUser.findUniqueOrThrow({
       where: { id: payment.telegramUserId },
