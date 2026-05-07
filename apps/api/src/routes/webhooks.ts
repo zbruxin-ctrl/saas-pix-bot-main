@@ -16,6 +16,7 @@
 //   ±5 minutos da hora atual — proteção anti-replay attack.
 // VARREDURA2-FIX #5: fallback de busca de pagamento usa metadata.externalReference
 //   em vez de payment.id, corrigindo caso onde mercadoPagoId não estava salvo.
+// FIX-BUILD: processApprovedPayment renomeado para confirmApproval no paymentService.
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { Prisma, WebhookEventStatus } from '@prisma/client';
@@ -39,7 +40,7 @@ const isWebhookSignatureEnabled =
 
 if (!isWebhookSignatureEnabled && env.NODE_ENV === 'production') {
   logger.error(
-    '🚨 [CRÍTICO] MERCADO_PAGO_WEBHOOK_SECRET não configurado ou inválido. ' +
+    '\uD83D\uDEA8 [CRÍTICO] MERCADO_PAGO_WEBHOOK_SECRET não configurado ou inválido. ' +
     'Validação HMAC DESABILITADA — configure a variável no Railway imediatamente.'
   );
 }
@@ -181,9 +182,6 @@ async function processWebhookAsync(
     }
 
     // VARREDURA2-FIX #5: corrige fallback de busca do pagamento interno.
-    // Antes: findUnique({ where: { id: mpPayment.external_reference } }) buscava pelo
-    // campo `id` da tabela Payment usando o externalReference (UUID), que nunca coincide.
-    // Agora: busca por metadata.externalReference, que é onde o UUID é gravado.
     let internalPayment = await prisma.payment.findUnique({ where: { mercadoPagoId: externalId } });
 
     if (!internalPayment && mpPayment.external_reference) {
@@ -215,7 +213,8 @@ async function processWebhookAsync(
       data: { paymentId: internalPayment.id },
     });
 
-    await paymentService.processApprovedPayment(internalPayment.id);
+    // FIX-BUILD: método renomeado de processApprovedPayment para confirmApproval
+    await paymentService.confirmApproval(internalPayment.id);
 
     await prisma.webhookEvent.update({
       where: { id: webhookEventId },
@@ -252,7 +251,6 @@ function validateWebhookSignature(req: Request, body: string): boolean {
     const signature = v1Part.split('=')[1];
 
     // AUDIT #10: valida que o timestamp está dentro de ±5 minutos.
-    // Evita replay attack: webhook legítimo interceptado e reenviado indefinidamente.
     const tsMs = parseInt(ts, 10) * 1000;
     if (isNaN(tsMs) || Math.abs(Date.now() - tsMs) > 5 * 60 * 1000) {
       logger.warn('Webhook rejeitado: timestamp expirado ou inválido (possível replay attack)', { ts });

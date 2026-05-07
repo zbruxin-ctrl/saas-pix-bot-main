@@ -1,7 +1,9 @@
 // Job agendado: expira pagamentos pendentes cujo PIX já passou do prazo
 // FIX B4/L2/M10: usa pixExpiresAt < now (campo correto do PIX) ao invés de createdAt < cutoff
 //   Isso garante que apenas PIX realmente vencidos sejam expirados.
-//   Lógica extraída para paymentService.findExpiredPayments() (M10).
+// FIX-BUILD: findExpiredPaymentIds e cancelExpiredPayment não existem no paymentService;
+//   substituidos por query direta no prisma e cancelPayment respectivamente.
+import { PaymentStatus } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { paymentService } from '../services/paymentService';
 import { stockService } from '../services/stockService';
@@ -18,12 +20,20 @@ async function runExpireJob(): Promise<void> {
     // FIX B4: busca por pixExpiresAt < now — não por createdAt
     // Isso respeita o prazo real do QR Code (definido pelo Mercado Pago, geralmente 30min)
     // e evita expirar pagamentos criados há 31min mas cujo PIX ainda é válido.
-    const expiredPayments = await paymentService.findExpiredPaymentIds(now);
+    const expiredPayments = await prisma.payment.findMany({
+      where: {
+        status: PaymentStatus.PENDING,
+        pixExpiresAt: { lt: now },
+      },
+      select: { id: true },
+    });
 
-    if (expiredPayments.length > 0) {
-      logger.info(`[ExpireJob] ${expiredPayments.length} pagamentos a expirar`);
+    const expiredIds = expiredPayments.map((p) => p.id);
+
+    if (expiredIds.length > 0) {
+      logger.info(`[ExpireJob] ${expiredIds.length} pagamentos a expirar`);
       await Promise.allSettled(
-        expiredPayments.map((id) => paymentService.cancelExpiredPayment(id))
+        expiredIds.map((id) => paymentService.cancelPayment(id))
       );
     }
 
