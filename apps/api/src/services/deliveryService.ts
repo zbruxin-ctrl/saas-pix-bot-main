@@ -18,6 +18,10 @@
 // FIX-BOT-SOURCE: deliver e deliverAllAsOne recebem botSource ('telegram' | 'whatsapp').
 //   'whatsapp' → pula envio Telegram completamente (zero requests ao bot Telegram).
 //   'telegram' / undefined → comportamento padrão (tenta enviar, fallback texto puro).
+// FIX-QTY-TIMING: deliverAllAsOne faz polling de até 5 tentativas (500ms intervalo) para
+//   aguardar todos os StockItems serem reservados antes de montar a mensagem.
+//   Corrige race condition com setImmediate do _payWithBalance onde getReservedItemsContent
+//   retornava menos itens que o qty comprado (ex: 2 de 5), causando mensagem incompleta.
 import { DeliveryType, TelegramUser, Product } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { telegramService } from './telegramService';
@@ -160,6 +164,35 @@ async function getOrderMedias(orderId: string): Promise<MediaEntry[]> {
     mediaType: r.mediaType as 'IMAGE' | 'VIDEO' | 'FILE',
     caption: r.caption ?? undefined,
   }));
+}
+
+/**
+ * FIX-QTY-TIMING: aguarda até qty StockItems estarem reservados para o paymentId.
+ * Faz polling com até maxAttempts tentativas espaçadas por intervalMs.
+ * Necessário porque _payWithBalance reserva os itens em background (setImmediate),
+ * então deliverAllAsOne pode ser chamado antes de todos os itens estarem RESERVED.
+ */
+async function waitForReservedItems(
+  paymentId: string,
+  qty: number,
+  maxAttempts = 5,
+  intervalMs = 500
+): Promise<string[]> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const contents = await stockService.getReservedItemsContent(paymentId);
+    if (contents.length >= qty) {
+      return contents;
+    }
+    if (attempt < maxAttempts) {
+      logger.warn(
+        `[waitForReservedItems] pagamento=${paymentId} — tentativa ${attempt}/${maxAttempts}: ` +
+        `${contents.length}/${qty} itens reservados. Aguardando ${intervalMs}ms...`
+      );
+      await sleep(intervalMs);
+    }
+  }
+  // Retorna o que tiver após esgotar tentativas (fallback será aplicado no caller)
+  return stockService.getReservedItemsContent(paymentId);
 }
 
 class DeliveryService {
@@ -368,6 +401,8 @@ class DeliveryService {
    * FIX-BOT-SOURCE: se botSource = 'whatsapp', pula o envio Telegram completamente.
    *   O banco é SEMPRE atualizado (DELIVERED + markDelivered), independente da origem.
    *   Bot WhatsApp busca os itens via GET /delivered-items (polling).
+   * FIX-QTY-TIMING: aguarda todos os StockItems serem reservados antes de montar
+   *   a mensagem, evitando race condition com setImmediate do _payWithBalance.
    */
   async deliverAllAsOne(
     paymentId: string,
@@ -376,11 +411,22 @@ class DeliveryService {
     orderIds: string[],
     botSource: 'telegram' | 'whatsapp' = 'telegram'
   ): Promise<void> {
-    let contents = await stockService.getReservedItemsContent(paymentId);
+    // FIX-QTY-TIMING: aguarda até orderIds.length itens estarem reservados
+    let contents = await waitForReservedItems(paymentId, orderIds.length);
 
     if (contents.length === 0) {
       const fallback = product.deliveryContent ?? '';
       contents = Array(orderIds.length).fill(fallback) as string[];
+    } else if (contents.length < orderIds.length) {
+      // Preenche os itens que faltam com fallback após esgotar tentativas
+      const fallback = product.deliveryContent ?? '';
+      logger.warn(
+        `[deliverAllAsOne] pagamento=${paymentId} — apenas ${contents.length}/${orderIds.length} itens ` +
+        `encontrados após polling. Completando com fallback.`
+      );
+      while (contents.length < orderIds.length) {
+        contents.push(fallback);
+      }
     }
 
     // FIX-BOT-SOURCE: WhatsApp — não envia nada ao Telegram, só marca no banco
