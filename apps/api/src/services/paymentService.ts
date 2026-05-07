@@ -15,14 +15,12 @@
 // FIX-POOL2: createOrdersOnly agora também é sequencial (Promise.all causava
 //            'Unable to start a transaction in the given time' no Neon em qty > 1)
 // FIX-POOL3: delay de 1s no início do setImmediate do _payWithBalance.
-//   O setImmediate disparava reserveAndCreateOrders imediatamente após
-//   a transação principal, competindo com o polling do bot (GET /delivered-items
-//   a cada 5s) pelo pool do Neon e causando timeout de transação.
-//   Com 1s de espera o pool fecha a conexão anterior antes de iniciar as
-//   N transações sequenciais de reserva + order + deliver.
 // FIX-UNIQUE-MPID: captura P2002 em _payWithPix/_payWithMixed/createDeposit e
-//   lança AppError 409 em vez de crashar. O MP pode retornar o mesmo ID quando
-//   detecta pagamentos duplicados (retry automático do bot ou double-tap do user).
+//   lança AppError 409 em vez de crashar.
+// FIX-EXT-REF: externalReference agora é `${telegramUserId}_${Date.now()}` — único
+//   por tentativa. Antes era só o telegramUserId fixo: o MP detectava como duplicado
+//   e retornava o mesmo mercadoPagoId do PIX anterior (mesmo cancelado), causando
+//   P2002 unique constraint e o bot reutilizando um payment CANCELLED.
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
@@ -96,10 +94,6 @@ async function reserveAndCreateOrders(
 /**
  * Cria N orders SEQUENCIALMENTE, SEM reservar StockItems.
  * Usado em confirmApproval de pagamentos PIX/MIXED e entrega BALANCE background.
- *
- * FIX-POOL2: era Promise.all — abria N conexões simultâneas no Neon causando
- * "Unable to start a transaction in the given time" em qty > 1.
- * Agora usa loop for...of idêntico ao reserveStockSequential.
  */
 async function createOrdersOnly(
   telegramUserId: string,
@@ -125,7 +119,6 @@ async function createOrdersOnly(
 
 /**
  * FIX-BOT-SOURCE: lê botSource do banco para o paymentId informado.
- * Retorna 'telegram' como fallback seguro para pagamentos antigos (sem botSource).
  */
 async function getBotSource(paymentId: string): Promise<'telegram' | 'whatsapp'> {
   const p = await prisma.payment.findUnique({
@@ -138,7 +131,6 @@ async function getBotSource(paymentId: string): Promise<'telegram' | 'whatsapp'>
 /**
  * qty = 1 → deliver() normal
  * qty > 1 → deliverAllAsOne()
- * FIX-BOT-SOURCE: repassa botSource para deliverAllAsOne (e deliver, para consistência)
  */
 async function deliverOrders(
   paymentId: string,
@@ -172,7 +164,6 @@ export const paymentService = {
   }> {
     const { telegramUserId, product, qty, amount, couponId, referralCode, botSource } = opts;
 
-    // Debita saldo e cria payment numa única transação — rápido (~300ms)
     const result = await prisma.$transaction(async (tx) => {
       const user = await tx.telegramUser.findUnique({
         where: { id: telegramUserId },
@@ -191,7 +182,6 @@ export const paymentService = {
           paymentMethod: 'BALANCE',
           couponId: couponId ?? null,
           approvedAt: new Date(),
-          // FIX-BOT-SOURCE: persiste a origem do bot
           botSource: botSource ?? null,
         },
       });
@@ -214,8 +204,6 @@ export const paymentService = {
     const paymentId = result.payment.id;
     const resolvedBotSource = botSource ?? 'telegram';
 
-    // FIX-TIMEOUT1: reservas + entrega rodam em BACKGROUND via setImmediate
-    // FIX-POOL3: aguarda 1s antes de iniciar para o pool fechar a transação acima
     setImmediate(async () => {
       try {
         await sleep(1_000);
@@ -226,7 +214,6 @@ export const paymentService = {
       } catch (err) {
         logger.error(`[_payWithBalance] Erro na entrega background | pagamento=${paymentId}:`, err);
         await stockService.releaseReservation(paymentId).catch(() => {});
-        // Notifica o usuário que houve problema — só para Telegram
         if (resolvedBotSource === 'telegram') {
           try {
             const telegramUser = await prisma.telegramUser.findUnique({ where: { id: telegramUserId } });
@@ -238,7 +225,6 @@ export const paymentService = {
         }
       }
 
-      // Bônus de indicação (também em background)
       if (referralCode) {
         try {
           const referrer = await prisma.telegramUser.findFirst({
@@ -276,7 +262,6 @@ export const paymentService = {
       }
     });
 
-    // Responde ao bot IMEDIATAMENTE, sem esperar reservas/entrega
     return {
       paymentId,
       paidWithBalance: true,
@@ -306,11 +291,16 @@ export const paymentService = {
     let paymentId: string | undefined;
     try {
       const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
+
+      // FIX-EXT-REF: referência única por tentativa — evita que o MP devolva o
+      // mesmo mercadoPagoId de um PIX anterior (cancelado ou expirado).
+      const externalReference = `${telegramUserId}_${Date.now()}`;
+
       const mpPayment = await mercadoPagoService.createPixPayment({
         transactionAmount: amount,
         description: qty > 1 ? `${product.name} x${qty}` : product.name,
         payerName,
-        externalReference: telegramUserId,
+        externalReference,
         notificationUrl: `${env.API_URL}/webhooks/mercadopago`,
       });
 
@@ -330,13 +320,10 @@ export const paymentService = {
             pixQrCodeText: mpPayment.point_of_interaction?.transaction_data?.qr_code ?? '',
             pixExpiresAt: expiresAt,
             couponId: couponId ?? null,
-            // FIX-BOT-SOURCE: persiste a origem do bot
             botSource: botSource ?? null,
           },
         });
       } catch (createErr) {
-        // FIX-UNIQUE-MPID: MP pode retornar o mesmo ID em pagamentos duplicados.
-        // Nesse caso, retornamos o pagamento já existente em vez de crashar.
         if (isUniqueConstraintError(createErr)) {
           logger.warn(`[_payWithPix] mercadoPagoId=${mpPayment.id} já existe — retornando payment existente`);
           const existing = await prisma.payment.findUnique({
@@ -419,11 +406,15 @@ export const paymentService = {
       });
 
       const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
+
+      // FIX-EXT-REF: referência única por tentativa
+      const externalReference = `${telegramUserId}_${Date.now()}`;
+
       const mpPayment = await mercadoPagoService.createPixPayment({
         transactionAmount: pixAmount,
         description: qty > 1 ? `${product.name} x${qty}` : product.name,
         payerName,
-        externalReference: telegramUserId,
+        externalReference,
         notificationUrl: `${env.API_URL}/webhooks/mercadopago`,
       });
 
@@ -445,12 +436,10 @@ export const paymentService = {
             pixQrCodeText: mpPayment.point_of_interaction?.transaction_data?.qr_code ?? '',
             pixExpiresAt: expiresAt,
             couponId: couponId ?? null,
-            // FIX-BOT-SOURCE: persiste a origem do bot
             botSource: botSource ?? null,
           },
         });
       } catch (createErr) {
-        // FIX-UNIQUE-MPID: MP pode retornar o mesmo ID em pagamentos duplicados.
         if (isUniqueConstraintError(createErr)) {
           logger.warn(`[_payWithMixed] mercadoPagoId=${mpPayment.id} já existe — retornando payment existente`);
           const existing = await prisma.payment.findUnique({
@@ -586,11 +575,15 @@ export const paymentService = {
     });
 
     const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
+
+    // FIX-EXT-REF: referência única por tentativa de depósito
+    const externalReference = `deposit_${telegramId}_${Date.now()}`;
+
     const mpPayment = await mercadoPagoService.createPixPayment({
       transactionAmount: amount,
       description: 'Depósito de saldo',
       payerName,
-      externalReference: `deposit_${telegramId}`,
+      externalReference,
       notificationUrl: `${env.API_URL}/webhooks/mercadopago`,
     });
 
@@ -611,7 +604,6 @@ export const paymentService = {
         },
       });
     } catch (createErr) {
-      // FIX-UNIQUE-MPID: MP pode retornar o mesmo ID em pagamentos duplicados.
       if (isUniqueConstraintError(createErr)) {
         logger.warn(`[createDeposit] mercadoPagoId=${mpPayment.id} já existe — retornando payment existente`);
         const existing = await prisma.payment.findUnique({
@@ -670,10 +662,6 @@ export const paymentService = {
     return { cancelled: true, message: 'Pagamento cancelado com sucesso.' };
   },
 
-  /**
-   * Chamado pelo webhook do MercadoPago quando um PIX é confirmado.
-   * FIX-BOT-SOURCE: lê botSource do payment e repassa para deliverOrders.
-   */
   async confirmApproval(paymentId: string): Promise<void> {
     const payment = await prisma.payment.findUnique({
       where: { id: paymentId },
@@ -707,11 +695,8 @@ export const paymentService = {
       let orderIds: string[];
 
       if (payment.paymentMethod === 'BALANCE') {
-        // BALANCE: reserva + cria orders (aprovação imediata, ainda não havia reserva)
         orderIds = await reserveAndCreateOrders(payment.telegramUserId, product, qty, paymentId);
       } else {
-        // PIX/MIXED: StockItems já foram reservados em _payWithPix/_payWithMixed;
-        // só cria as orders sem re-reservar
         orderIds = await createOrdersOnly(payment.telegramUserId, product, qty, paymentId);
       }
 
