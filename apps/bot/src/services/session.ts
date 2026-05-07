@@ -2,10 +2,12 @@
  * Gerenciamento de sessões de usuário via Redis (Upstash HTTP).
  * Em dev sem Upstash, usa fallback em memória (InMemoryRedis no redis.ts).
  *
- * FEAT: usedCoupons — lista de cupons já utilizados pelo usuário (por código).
+ * FEAT: usedCoupons — lista de cupões já utilizados pelo usuário (por código).
  *       Garante que cada cupão possa ser usado apenas 1x por conta.
  * FIX #7: clearSession preserva usedCoupons da sessão atual quando não fornecido.
  * FIX #6: UserSession inclui referralCode (salvo no /start a partir do startPayload).
+ * FEAT-PIX-CODE-MSG: pixCodeMessageId — message_id da mensagem do código copia e cola
+ *   para que handleCancelPayment possa deletá-la junto com a mensagem do QR.
  */
 import { redis } from './redis';
 
@@ -15,6 +17,7 @@ export interface UserSession {
   paymentId?: string;
   pixExpiresAt?: string;
   pixQrCodeText?: string;
+  pixCodeMessageId?: number;
   depositPaymentId?: string;
   depositMessageId?: number;
   mainMessageId?: number;
