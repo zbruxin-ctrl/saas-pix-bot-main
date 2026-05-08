@@ -23,11 +23,15 @@
 //   P2002 unique constraint e o bot reutilizando um payment CANCELLED.
 // FIX-STATUS: confirmApproval agora atualiza status=APPROVED + approvedAt antes da
 //   entrega, garantindo que o painel admin reflita o pagamento como aprovado.
+// FIX-DEPOSIT: confirmApproval agora trata pagamentos de depósito (productId=null).
+//   Antes retornava sem fazer nada quando productId era null, deixando o pagamento
+//   preso como PENDING e nunca creditando o saldo. Agora credita via walletService.deposit.
 import { PaymentStatus, OrderStatus, StockItemStatus, WalletTransactionType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { mercadoPagoService } from './mercadoPagoService';
 import { deliveryService } from './deliveryService';
 import { stockService } from './stockService';
+import { walletService } from './walletService';
 import * as couponService from './couponService';
 import { logger } from '../lib/logger';
 import { AppError } from '../lib/AppError';
@@ -294,8 +298,6 @@ export const paymentService = {
     try {
       const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
 
-      // FIX-EXT-REF: referência única por tentativa — evita que o MP devolva o
-      // mesmo mercadoPagoId de um PIX anterior (cancelado ou expirado).
       const externalReference = `${telegramUserId}_${Date.now()}`;
 
       const mpPayment = await mercadoPagoService.createPixPayment({
@@ -409,7 +411,6 @@ export const paymentService = {
 
       const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
 
-      // FIX-EXT-REF: referência única por tentativa
       const externalReference = `${telegramUserId}_${Date.now()}`;
 
       const mpPayment = await mercadoPagoService.createPixPayment({
@@ -578,7 +579,6 @@ export const paymentService = {
 
     const payerName = [firstName ?? 'Cliente', username ?? 'Telegram'].filter(Boolean).join(' ');
 
-    // FIX-EXT-REF: referência única por tentativa de depósito
     const externalReference = `deposit_${telegramId}_${Date.now()}`;
 
     const mpPayment = await mercadoPagoService.createPixPayment({
@@ -672,14 +672,15 @@ export const paymentService = {
         telegramUserId: true,
         productId: true,
         qty: true,
+        amount: true,
         paymentMethod: true,
         botSource: true,
         status: true,
       },
     });
 
-    if (!payment || !payment.productId) {
-      logger.warn(`[confirmApproval] Pagamento ${paymentId} não encontrado ou sem produto.`);
+    if (!payment) {
+      logger.warn(`[confirmApproval] Pagamento ${paymentId} não encontrado.`);
       return;
     }
 
@@ -689,12 +690,29 @@ export const paymentService = {
       return;
     }
 
+    // FIX-DEPOSIT: pagamento de depósito (sem produto) — credita saldo diretamente
+    if (!payment.productId) {
+      logger.info(`[confirmApproval] Pagamento ${paymentId} é um depósito — creditando R$ ${Number(payment.amount).toFixed(2)} para usuário ${payment.telegramUserId}`);
+      await prisma.payment.update({
+        where: { id: paymentId },
+        data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
+      });
+      statusCache.delete(paymentId);
+      await walletService.deposit(
+        payment.telegramUserId,
+        Number(payment.amount),
+        'Depósito via PIX',
+        paymentId
+      );
+      logger.info(`[confirmApproval] Depósito ${paymentId} creditado com sucesso.`);
+      return;
+    }
+
     // FIX-STATUS: atualiza status para APPROVED ANTES de entregar
     await prisma.payment.update({
       where: { id: paymentId },
       data: { status: PaymentStatus.APPROVED, approvedAt: new Date() },
     });
-    // Invalida cache de status para que o bot veja APPROVED imediatamente
     statusCache.delete(paymentId);
 
     const telegramUser = await prisma.telegramUser.findUniqueOrThrow({
