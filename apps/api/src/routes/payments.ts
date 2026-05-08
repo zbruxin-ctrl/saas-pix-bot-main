@@ -27,15 +27,20 @@
 // FIX-BUILD: campo correto é `qty` (não `quantity`) no model Payment do Prisma.
 // FIX-CANCEL-ERROR-FIELD: POST /:id/cancel usava campo `message` em respostas de erro 400/403.
 //   O interceptor Axios do bot só lê `response.data.error` — resultado: a mensagem real
-//   se perdia e o bot mostrava genérico 'Erro ao cancelar pagamento.'.
+//   se perdia e o bot mostrava genérico 'Erro ao cancelar pagamento.'
 //   Corrigido: todas as respostas de erro do endpoint agora usam o campo `error`.
 // FIX-CANCEL-DATA: POST /:id/cancel retornava { success:true, message } em caso de sucesso.
 //   O apiClient lê data.data!, que era undefined — result.cancelled ficava undefined (falsy)
 //   → bot caia no catch → '❌ Erro ao cancelar pagamento.' mesmo com HTTP 200.
 //   Corrigido: sucesso agora retorna { success:true, data:{ cancelled:true, message } }.
+// FIX-WA-DELIVERY: GET /:id/delivered-items agora inclui `confirmationMessage` e `medias`
+//   do produto na resposta. O bot do WhatsApp usava apenas `items` (conteúdo bruto dos
+//   StockItems), ignorando a mensagem personalizada e as mídias configuradas no produto.
+//   confirmationMessage: string pronta para envio (resolve {{produto}} e {{conteudo}}).
+//   medias: array de { url, mediaType, caption } para o bot enviar na sequência.
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
-import { StockItemStatus } from '@prisma/client';
+import { StockItemStatus, DeliveryType } from '@prisma/client';
 import { paymentService } from '../services/paymentService';
 import { paymentRateLimit } from '../middleware/rateLimit';
 import { requireBotSecret } from '../middleware/auth';
@@ -104,6 +109,57 @@ async function getPaymentIfOwner(
     select: { id: true },
   });
   return payment ?? null;
+}
+
+// ─── FIX-WA-DELIVERY: helpers para montar confirmationMessage e medias ─────────
+
+type MediaEntry = { url: string; mediaType: 'IMAGE' | 'VIDEO' | 'FILE'; caption?: string };
+
+function buildConfirmationMessageForWhatsApp(
+  product: { name: string; deliveryType: DeliveryType; metadata: unknown },
+  contents: string[]
+): string {
+  const meta = product.metadata as Record<string, unknown> | null;
+  const custom = meta?.confirmationMessage as string | undefined;
+  const content = contents.join('\n');
+
+  if (custom && custom.trim()) {
+    return custom
+      .replace(/\{\{produto\}\}/g, product.name)
+      .replace(/\{\{conteudo\}\}/g, content);
+  }
+
+  if (contents.length > 1) {
+    const items = contents.map((c) => `\n${c}`).join('');
+    return (
+      `✅ *Compra realizada com sucesso!*\n` +
+      `📦 *${product.name}* (${contents.length}x)` +
+      items +
+      `\n\n⚠️ _Os links são de uso único e não realizamos trocas._`
+    );
+  }
+
+  switch (product.deliveryType) {
+    case DeliveryType.LINK:
+      return (
+        `🎉 *Pagamento confirmado!*\n\n` +
+        `📦 *Produto:* ${product.name}\n\n` +
+        `🔗 Acesse através do link abaixo:\n${content}\n\n` +
+        `⚠️ _Guarde este link em local seguro._`
+      );
+    default:
+      return (
+        `🎉 *Pagamento confirmado!*\n\n` +
+        `📦 *Produto:* ${product.name}\n\n` +
+        `${content}`
+      );
+  }
+}
+
+function getProductMedias(metadata: unknown): MediaEntry[] {
+  const meta = metadata as Record<string, unknown> | null;
+  if (!meta?.medias || !Array.isArray(meta.medias)) return [];
+  return meta.medias as MediaEntry[];
 }
 
 // ─── Rotas estáticas PRIMEIRO ───────────────────────────────────────────────────────────
@@ -381,12 +437,6 @@ paymentsRouter.get(
 // ─── Rotas dinâmicas DEPOIS das estáticas ─────────────────────────────────────────────────────
 
 // POST /api/payments/:id/cancel
-// FIX-CANCEL-ERROR-FIELD: respostas de erro usam campo `error` (padrão da API),
-//   não `message`. O interceptor Axios do bot lê só `response.data.error`.
-// FIX-CANCEL-DATA: sucesso agora retorna { success:true, data:{ cancelled:true, message } }
-//   em vez de { success:true, message }. O apiClient.cancelPayment lê data.data! —
-//   antes data.data era undefined → result.cancelled === undefined (falsy) → catch →
-//   '❌ Erro ao cancelar pagamento.' mesmo com HTTP 200.
 paymentsRouter.post(
   '/:id/cancel',
   requireBotSecret,
@@ -412,7 +462,6 @@ paymentsRouter.post(
       return;
     }
     logger.info(`Pagamento ${id} cancelado via bot (telegramId: ${telegramId})`);
-    // FIX-CANCEL-DATA: usa `data` para ser consistente com ApiResponse<T>
     res.json({ success: true, data: { cancelled: true, message: result.message } });
   }
 );
@@ -444,10 +493,11 @@ paymentsRouter.get(
 
 // GET /api/payments/:id/delivered-items?telegramId=xxx
 // FIX-DELIVERY-ITEMS: retorna o conteudo real de cada StockItem entregue para este pagamento.
-// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens esperados (payment.qty)
-//   estão com status DELIVERED. Antes: ready=true com 1 item entregue — bot exibia
-//   apenas 1 item em pedidos com qty>1 (race condition de polling vs entrega paralela).
+// FIX-DELIVERY-READY: ready=true somente quando TODOS os itens esperados (payment.qty) estão DELIVERED.
 // FIX-BUILD: campo é `qty` (não `quantity`) no model Payment do Prisma.
+// FIX-WA-DELIVERY: inclui `confirmationMessage` (mensagem personalizada pronta para envio)
+//   e `medias` (array de { url, mediaType, caption }) para que o bot do WhatsApp envie
+//   a mensagem formatada e os arquivos de mídia do produto, e não apenas o conteúdo bruto.
 paymentsRouter.get(
   '/:id/delivered-items',
   requireBotSecret,
@@ -466,13 +516,19 @@ paymentsRouter.get(
       return;
     }
 
-    // FIX-DELIVERY-READY: busca payment.qty junto com os itens entregues
-    // para garantir que só sinalizamos ready=true quando TODOS estão prontos.
-    // FIX-BUILD: campo correto é `qty` (não `quantity`) — schema Payment usa `qty Int @default(1)`
     const [payment, items] = await Promise.all([
       prisma.payment.findUnique({
         where: { id },
-        select: { qty: true },
+        select: {
+          qty: true,
+          product: {
+            select: {
+              name: true,
+              deliveryType: true,
+              metadata: true,
+            },
+          },
+        },
       }),
       prisma.stockItem.findMany({
         where: {
@@ -484,16 +540,27 @@ paymentsRouter.get(
       }),
     ]);
 
-    // Quantidade esperada: payment.qty (padrão 1 se não definida)
     const expectedQty = payment?.qty ?? 1;
     const ready = items.length >= expectedQty;
+    const contents = ready ? items.map((i) => i.content) : [];
+
+    // FIX-WA-DELIVERY: monta confirmationMessage e medias para o bot do WhatsApp
+    let confirmationMessage: string | null = null;
+    let medias: MediaEntry[] = [];
+
+    if (ready && payment?.product) {
+      confirmationMessage = buildConfirmationMessageForWhatsApp(payment.product, contents);
+      medias = getProductMedias(payment.product.metadata);
+    }
 
     res.json({
       success: true,
       data: {
         ready,
-        // Só exibe os itens quando todos estão prontos para evitar entrega parcial
-        items: ready ? items.map((i) => i.content) : [],
+        items: contents,
+        // FIX-WA-DELIVERY: novos campos — null quando ainda não pronto
+        confirmationMessage,
+        medias,
       },
     });
   }
