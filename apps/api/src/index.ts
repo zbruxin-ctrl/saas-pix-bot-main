@@ -19,9 +19,10 @@ import { telegramRouter } from './routes/telegram';
 import { pricingRouter } from './routes/pricing';
 import { couponsRouter } from './routes/coupons';
 import { referralsRouter } from './routes/referrals';
+import { kycRouter } from './routes/kyc';
 import { startExpireJob, stopExpireJob } from './jobs/expirePayments';
 
-// build: 2026-04-29
+// build: 2026-05-09
 const app = express();
 app.set('trust proxy', 1);
 
@@ -188,6 +189,7 @@ app.use('/api/admin',     adminRouter);
 app.use('/api/pricing',   pricingRouter);
 app.use('/api/coupons',   couponsRouter);
 app.use('/api/referrals', referralsRouter);
+app.use('/api/kyc',       kycRouter);       // KYC webhooks: Socure + Veriff
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 

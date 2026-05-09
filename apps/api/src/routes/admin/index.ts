@@ -3,6 +3,7 @@
 // WALLET: registra adminWalletRouter em /wallet
 // FEAT: registra broadcastRouter e adminSettingsRouter
 // FEAT: registra adminCouponsRouter e adminReferralsRouter
+// FEAT: registra adminKycRouter em /kyc
 import { Router, Response } from 'express';
 import { requireAuth, requireRole, AuthenticatedRequest } from '../../middleware/auth';
 import { adminProductsRouter } from './adminProducts';
@@ -15,6 +16,7 @@ import { broadcastRouter } from './broadcast';
 import { adminSettingsRouter } from './settings';
 import { adminCouponsRouter } from './coupons';
 import { adminReferralsRouter } from './referrals';
+import { adminKycRouter } from './kyc';
 
 const router = Router();
 
@@ -37,5 +39,6 @@ router.use('/broadcast',  broadcastRouter);                               // req
 router.use('/settings',   adminSettingsRouter);                           // requireRole interno (GET: ADMIN|SUPERADMIN, PUT: SUPERADMIN)
 router.use('/coupons',    adminCouponsRouter);                            // requireRole interno (ADMIN|SUPERADMIN)
 router.use('/referrals',  adminReferralsRouter);                          // requireRole interno (ADMIN|SUPERADMIN)
+router.use('/kyc',        adminKycRouter);                                // requireRole interno (ADMIN|SUPERADMIN)
 
 export default router;
